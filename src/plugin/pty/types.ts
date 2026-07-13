@@ -1,29 +1,13 @@
-import type { IPty } from 'bun-pty'
-import type { RingBuffer } from './buffer.ts'
+import type { ExitReason } from '../../daemon/types.ts'
 
-export type PTYStatus = 'running' | 'exited' | 'killing' | 'killed'
-
-export interface PTYSession {
-  id: string
-  title: string
-  description?: string
-  command: string
-  args: string[]
-  workdir: string
-  env?: Record<string, string>
-  status: PTYStatus
-  exitCode?: number
-  exitSignal?: number | string
-  pid: number
-  createdAt: Date
-  parentSessionId: string
-  parentAgent?: string
-  notifyOnExit: boolean
-  timeoutSeconds?: number
-  timedOut: boolean
-  buffer: RingBuffer
-  process: IPty | null
-}
+export type PTYStatus =
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'exited'
+  | 'timed_out'
+  | 'lost'
+  | 'spawn_failed'
 
 export interface PTYSessionInfo {
   id: string
@@ -33,14 +17,19 @@ export interface PTYSessionInfo {
   args: string[]
   workdir: string
   status: PTYStatus
-  notifyOnExit: boolean
   timeoutSeconds?: number
   timedOut: boolean
+  terminationRequested: boolean
+  terminationConfirmed: boolean
   exitCode?: number
   exitSignal?: number | string
+  exitReason?: ExitReason
   pid: number
   createdAt: string
   lineCount: number
+  outputSequence?: number
+  firstRetainedSequence?: number
+  outputTruncated?: boolean
 }
 
 export interface SpawnOptions {
@@ -52,19 +41,19 @@ export interface SpawnOptions {
   description?: string
   parentSessionId: string
   parentAgent?: string
-  notifyOnExit?: boolean
   timeoutSeconds?: number
 }
 
 export interface ReadResult {
   lines: string[]
+  sequences: number[]
   totalLines: number
   offset: number
   hasMore: boolean
 }
 
 export interface SearchResult {
-  matches: Array<{ lineNumber: number; text: string }>
+  matches: Array<{ lineNumber: number; sequence: number; text: string }>
   totalMatches: number
   totalLines: number
   offset: number

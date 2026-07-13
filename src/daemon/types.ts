@@ -3,7 +3,7 @@ export const DAEMON_PROTOCOL_VERSION = 1
 export type ExitReason =
   | { kind: 'code'; code: number }
   | { kind: 'signal'; signal: string }
-  | { kind: 'timeout' }
+  | { kind: 'timeout'; message?: string }
   | { kind: 'spawn_error'; message: string }
   | { kind: 'unknown' }
 
@@ -32,6 +32,8 @@ export interface SessionRecord {
   parentAgent?: string
   timeoutSeconds?: number
   timedOut: boolean
+  terminationRequested: boolean
+  terminationConfirmed: boolean
   exitCode?: number
   exitSignal?: number | string
   exitReason?: ExitReason

@@ -76,7 +76,7 @@ async function handlePatternRead(
   if (result.matches.length === 0) {
     return appendSessionReminders(
       [
-        `<pty_output id="${id}" status="${session.status}" pattern="${pattern}">`,
+        `<pty_output id="${id}" status="${session.status}" output_sequence="${session.outputSequence ?? 0}" retained_from="${session.firstRetainedSequence ?? 0}" truncated="${session.outputTruncated ?? false}" pattern="${pattern}">`,
         `No lines matched the pattern '${pattern}'.`,
         `Total lines in buffer: ${result.totalLines}`,
         `</pty_output>`,
@@ -86,7 +86,7 @@ async function handlePatternRead(
   }
 
   const formattedLines = result.matches.map((match) =>
-    formatLine(match.text, match.lineNumber, MAX_LINE_LENGTH)
+    formatLine(match.text, match.lineNumber, MAX_LINE_LENGTH, match.sequence)
   )
 
   const paginationMessage = `(${result.matches.length} of ${result.totalMatches} matches shown. Use offset=${offset + result.matches.length} to see more.)`
@@ -134,7 +134,7 @@ async function handlePlainRead(
   }
 
   const formattedLines = result.lines.map((line, index) =>
-    formatLine(line, result.offset + index + 1, MAX_LINE_LENGTH)
+    formatLine(line, result.offset + index + 1, MAX_LINE_LENGTH, result.sequences[index])
   )
 
   const paginationMessage = `(Buffer has more lines. Use offset=${result.offset + result.lines.length} to read beyond line ${result.offset + result.lines.length})`

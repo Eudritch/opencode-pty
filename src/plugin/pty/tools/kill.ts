@@ -1,6 +1,5 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
-import { buildSessionNotFoundError } from '../utils.ts'
 import DESCRIPTION from './kill.txt'
 
 export const ptyKill = tool({
@@ -13,29 +12,33 @@ export const ptyKill = tool({
       .describe('If true, removes the session and frees the buffer (default: false)'),
   },
   async execute(args) {
-    const session = manager.get(args.id)
+    const session = await manager.get(args.id)
     if (!session) {
-      throw buildSessionNotFoundError(args.id)
+      throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
     }
 
-    const wasRunning = session.status === 'running'
     const cleanup = args.cleanup ?? false
-    const success = manager.kill(args.id, cleanup)
-
-    if (!success) {
-      throw new Error(`Failed to kill PTY session '${args.id}'.`)
-    }
-
-    const action = wasRunning ? 'Killed' : 'Cleaned up'
-    const cleanupNote = cleanup ? ' (session removed)' : ' (session retained for log access)'
+    const stop = await manager.stop(args.id)
+    const cleaned = cleanup && stop.terminationConfirmed ? await manager.cleanup(args.id) : false
+    const action = stop.terminationConfirmed
+      ? 'Termination confirmed'
+      : stop.requested
+        ? 'Termination requested'
+        : 'No stop request possible (session is lost or termination is unconfirmed)'
+    const cleanupNote = cleaned
+      ? ' (exited session removed)'
+      : cleanup
+        ? ' (record retained until termination is confirmed)'
+        : ' (session retained for log access)'
 
     return [
-      `<pty_killed>`,
+      `<pty_stop>`,
       `${action}: ${args.id}${cleanupNote}`,
+      `Termination confirmed: ${stop.terminationConfirmed ? 'yes' : 'no'}`,
       `Title: ${session.title}`,
       `Command: ${session.command} ${session.args.join(' ')}`,
       `Final line count: ${session.lineCount}`,
-      `</pty_killed>`,
+      `</pty_stop>`,
     ].join('\n')
   },
 })

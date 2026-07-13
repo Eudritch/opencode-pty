@@ -4,14 +4,46 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
-import { SessionSupervisor } from '../src/daemon/supervisor.ts'
+import { ProcessError, SessionSupervisor } from '../src/daemon/supervisor.ts'
+import type { SessionRecord } from '../src/daemon/types.ts'
 import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
+import { formatLine } from '../src/plugin/pty/formatters.ts'
 
 const roots: string[] = []
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
+
+function record(
+  root: string,
+  id: string,
+  status: SessionRecord['status'] = 'running'
+): SessionRecord {
+  const now = new Date().toISOString()
+  return {
+    id,
+    title: id,
+    command: 'test',
+    args: [],
+    workdir: root,
+    status,
+    pid: 1,
+    createdAt: now,
+    updatedAt: now,
+    parentSessionId: 'parent',
+    timedOut: false,
+    terminationRequested: false,
+    terminationConfirmed:
+      status === 'exited' || status === 'timed_out' || status === 'spawn_failed',
+    nextSequence: 0,
+    firstRetainedSequence: 0,
+    outputBytes: 0,
+    outputTruncated: false,
+    lineCount: 0,
+    outputHasPartialLine: false,
+  }
+}
 
 test('daemon authenticates RPC and retains PTY output', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-'))
@@ -128,25 +160,7 @@ test('daemon storage protects private paths on POSIX', async () => {
     protocolVersion: 1,
     token: 'x',
   })
-  await storage.writeSession({
-    id: 'pty_test',
-    title: 'test',
-    command: 'test',
-    args: [],
-    workdir: root,
-    status: 'exited',
-    pid: 1,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    parentSessionId: 'test',
-    timedOut: false,
-    nextSequence: 0,
-    firstRetainedSequence: 0,
-    outputBytes: 0,
-    outputTruncated: false,
-    lineCount: 0,
-    outputHasPartialLine: false,
-  })
+  await storage.writeSession(record(root, 'pty_test', 'exited'))
   await storage.appendOutput('pty_test', 'output')
   if (process.platform !== 'win32') {
     expect((await stat(root)).mode & 0o777).toBe(0o700)
@@ -164,25 +178,7 @@ test('lost sessions cannot be cleaned up', async () => {
   roots.push(root)
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
-  await storage.writeSession({
-    id: 'pty_lost',
-    title: 'lost',
-    command: 'test',
-    args: [],
-    workdir: root,
-    status: 'lost',
-    pid: 1,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    parentSessionId: 'test',
-    timedOut: false,
-    nextSequence: 0,
-    firstRetainedSequence: 0,
-    outputBytes: 0,
-    outputTruncated: false,
-    lineCount: 0,
-    outputHasPartialLine: false,
-  })
+  await storage.writeSession(record(root, 'pty_lost', 'lost'))
   await supervisor.initialize()
 
   expect(await supervisor.cleanup('pty_lost')).toBeFalse()
@@ -214,6 +210,160 @@ test('daemon classifies storage failures', async () => {
   }
 })
 
+test('daemon classifies PTY failures as process failures', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-process-error-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = {
+    initialize: async () => {},
+    flush: async () => {},
+    spawn: async () => {
+      throw new ProcessError('spawn failed')
+    },
+  } as unknown as SessionSupervisor
+  const server = new DaemonServer(storage, supervisor, 'test-token')
+  const descriptor = await server.start()
+  try {
+    const response = await fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'spawn',
+        version: 1,
+        operation: 'spawn',
+        payload: { command: 'test', parentSessionId: 'parent' },
+      }),
+    })
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('process')
+  } finally {
+    await server.stop()
+  }
+})
+
+test('supervisor preserves timeout diagnostics, stop state, cleanup state, and output cursors', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-supervisor-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await storage.initialize()
+  const timedOut = record(root, 'pty_timeout')
+  const stopped = record(root, 'pty_stop')
+  const terminal = record(root, 'pty_terminal', 'exited')
+  const output = record(root, 'pty_output', 'exited')
+  const writable = record(root, 'pty_write')
+  const parent = record(root, 'pty_parent')
+  parent.parentSessionId = 'parent-cleanup'
+  output.nextSequence = 8
+  output.outputBytes = 8
+  output.lineCount = 2
+  await supervisor.initialize()
+  const state = supervisor as unknown as {
+    active: Map<
+      string,
+      { record: SessionRecord; process: { kill(): void; write(data: string): void } }
+    >
+    records: Map<string, SessionRecord>
+    timeout(id: string): Promise<void>
+  }
+  for (const entry of [timedOut, stopped, terminal, output, writable, parent]) {
+    state.records.set(entry.id, entry)
+    await storage.writeSession(entry)
+  }
+  await storage.appendOutput('pty_output', 'one\nhit\n')
+  state.active.set('pty_timeout', {
+    record: timedOut,
+    process: {
+      kill: () => {
+        throw new Error('permission denied')
+      },
+      write: () => {},
+    },
+  })
+  await state.timeout('pty_timeout')
+  expect(await supervisor.get('pty_timeout')).toMatchObject({
+    status: 'timed_out',
+    timedOut: true,
+    terminationRequested: false,
+    exitReason: { kind: 'timeout', message: 'Failed to stop PTY: permission denied' },
+  })
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect((await recovered.get('pty_timeout'))?.status).toBe('timed_out')
+
+  let kills = 0
+  state.active.set('pty_stop', {
+    record: stopped,
+    process: {
+      kill: () => {
+        kills += 1
+      },
+      write: () => {},
+    },
+  })
+  expect(await supervisor.stop('pty_stop')).toMatchObject({
+    requested: true,
+    terminationConfirmed: false,
+  })
+  expect(kills).toBe(1)
+  expect(await recovered.stop('pty_timeout')).toMatchObject({
+    requested: false,
+    terminationConfirmed: false,
+  })
+
+  let written = ''
+  state.active.set('pty_write', {
+    record: writable,
+    process: {
+      kill: () => {},
+      write: (data) => {
+        written = data
+      },
+    },
+  })
+  expect(await supervisor.write('pty_write', 'A😀')).toEqual({
+    acceptedBytes: 5,
+    acceptedCharacters: 2,
+  })
+  expect(written).toBe('A😀')
+  state.active.set('pty_write', {
+    record: writable,
+    process: {
+      kill: () => {},
+      write: () => {
+        throw new Error('closed')
+      },
+    },
+  })
+  await expect(supervisor.write('pty_write', 'x')).rejects.toBeInstanceOf(ProcessError)
+
+  state.active.set('pty_parent', {
+    record: parent,
+    process: {
+      kill: () => {
+        kills += 1
+      },
+      write: () => {},
+    },
+  })
+  await supervisor.cleanupByParentSession('parent-cleanup')
+  expect(kills).toBe(2)
+
+  const read = await supervisor.read('pty_output')
+  const search = await supervisor.search('pty_output', 'hit')
+  expect(read.sequences).toEqual([0, 4])
+  expect(search.matches).toEqual([{ lineNumber: 2, sequence: 4, text: 'hit' }])
+  expect(formatLine('hit', 2, 2000, 4)).toBe('00002@4| hit')
+
+  const deleteSession = storage.deleteSession.bind(storage)
+  storage.deleteSession = async () => {
+    throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
+  }
+  await expect(supervisor.cleanup('pty_terminal')).rejects.toThrow('disk full')
+  expect(await supervisor.get('pty_terminal')).not.toBeNull()
+  storage.deleteSession = deleteSession
+  expect(await supervisor.cleanup('pty_terminal')).toBeTrue()
+})
+
 test('plugin client starts its daemon from the configured data directory', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-client-'))
   roots.push(root)
@@ -222,6 +372,13 @@ test('plugin client starts its daemon from the configured data directory', async
   const storage = new DaemonStorage(root)
   let pid: number | undefined
   try {
+    await storage.initialize()
+    await storage.writeDescriptor({
+      pid: process.pid,
+      endpoint: 'http://127.0.0.1:1',
+      protocolVersion: 1,
+      token: 'stale-token',
+    })
     const client = new DaemonClient()
     const session = await client.spawn({
       command: process.execPath,
@@ -237,6 +394,11 @@ test('plugin client starts its daemon from the configured data directory', async
     expect(output).toContain('client daemon output')
     pid = (await storage.readDescriptor())?.pid
     expect(pid).toBeNumber()
+    expect((await storage.readDescriptor())?.token).not.toBe('stale-token')
+    const recreated = new DaemonClient()
+    const read = await recreated.read(session.id)
+    expect(read.sequences[0]).toBe(0)
+    expect(read.lines.join('\n')).toContain('client daemon output')
   } finally {
     if (pid) process.kill(pid)
     await Bun.sleep(100)

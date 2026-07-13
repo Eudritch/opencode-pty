@@ -6,7 +6,7 @@ import {
   type RpcResponse,
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
-import type { SessionSupervisor } from './supervisor.ts'
+import { ProcessError, type SessionSupervisor } from './supervisor.ts'
 
 const MAX_REQUEST_BYTES = 1024 * 1024
 const MAX_ID_LENGTH = 128
@@ -98,11 +98,13 @@ export class DaemonServer implements Disposable {
           ? 'validation'
           : this.isStorageError(error)
             ? 'storage'
-            : message.includes('not found')
-              ? 'not_found'
-              : message.includes('closed')
-                ? 'session_closed'
-                : 'internal'
+            : error instanceof ProcessError
+              ? 'process'
+              : message.includes('not found')
+                ? 'not_found'
+                : message.includes('closed')
+                  ? 'session_closed'
+                  : 'internal'
       return this.failure(rpcRequest.id, code, message, code === 'not_found' ? 404 : 400)
     }
   }
