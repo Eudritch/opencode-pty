@@ -1,20 +1,9 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
 import { DEFAULT_READ_LIMIT, MAX_LINE_LENGTH } from '../../../shared/constants.ts'
-import { buildSessionNotFoundError } from '../utils.ts'
 import { formatLine } from '../formatters.ts'
 import type { PTYSessionInfo } from '../types.ts'
 import DESCRIPTION from './read.txt'
-
-const NOTIFY_ON_EXIT_REMINDER = [
-  `<system_reminder>`,
-  `This session was started with \`notifyOnExit=true\`.`,
-  `Completion signal is the future \`<pty_exited>\` message, not repeated \`pty_read\` calls.`,
-  `If you only need to know whether the command finished, stop polling and wait for \`<pty_exited>\`.`,
-  `Do not use sleep plus \`pty_read\` loops to check completion.`,
-  `Use \`pty_read\` only when you need live output now, the user explicitly asks for logs, or the exit notification reports a non-zero status and you need to investigate.`,
-  `</system_reminder>`,
-].join('\n')
 
 function buildTimeoutReminder(session: PTYSessionInfo): string {
   return [
@@ -40,27 +29,20 @@ function formatPtyOutput(
   id: string,
   status: string,
   pattern: string | undefined,
+  session: PTYSessionInfo,
   formattedLines: string[],
   hasMore: boolean,
   paginationMessage: string,
   endMessage: string
 ): string {
   const output = [
-    `<pty_output id="${id}" status="${status}"${pattern ? ` pattern="${pattern}"` : ''}>`,
+    `<pty_output id="${id}" status="${status}" output_sequence="${session.outputSequence ?? 0}" retained_from="${session.firstRetainedSequence ?? 0}" truncated="${session.outputTruncated ?? false}"${pattern ? ` pattern="${pattern}"` : ''}>`,
     ...formattedLines,
     '',
     hasMore ? paginationMessage : endMessage,
     `</pty_output>`,
   ]
   return output.join('\n')
-}
-
-function appendNotifyOnExitReminder(output: string, session: PTYSessionInfo): string {
-  if (!session.notifyOnExit || session.status !== 'running') {
-    return output
-  }
-
-  return `${output}\n\n${NOTIFY_ON_EXIT_REMINDER}`
 }
 
 function appendTimeoutReminder(output: string, session: PTYSessionInfo): string {
@@ -72,43 +54,23 @@ function appendTimeoutReminder(output: string, session: PTYSessionInfo): string 
 }
 
 function appendSessionReminders(output: string, session: PTYSessionInfo): string {
-  return appendTimeoutReminder(appendNotifyOnExitReminder(output, session), session)
-}
-
-/**
- * Validates and creates a RegExp from pattern string
- */
-function validateAndCreateRegex(pattern: string, ignoreCase?: boolean): RegExp {
-  if (!validateRegex(pattern)) {
-    throw new Error(
-      `Potentially dangerous regex pattern rejected: '${pattern}'. Please use a safer pattern.`
-    )
-  }
-
-  try {
-    return new RegExp(pattern, ignoreCase ? 'i' : '')
-  } catch (e) {
-    const error = e instanceof Error ? e.message : String(e)
-    throw new Error(`Invalid regex pattern '${pattern}': ${error}`)
-  }
+  return appendTimeoutReminder(output, session)
 }
 
 /**
  * Handles pattern-based reading and formatting
  */
-function handlePatternRead(
+async function handlePatternRead(
   id: string,
   pattern: string,
   ignoreCase: boolean | undefined,
   session: PTYSessionInfo,
   offset: number,
   limit: number
-): string {
-  const regex = validateAndCreateRegex(pattern, ignoreCase)
-
-  const result = manager.search(id, regex, offset, limit)
+): Promise<string> {
+  const result = await manager.search(id, pattern, ignoreCase, offset, limit)
   if (!result) {
-    throw buildSessionNotFoundError(id)
+    throw new Error(`PTY session '${id}' not found. Use pty_list to see active sessions.`)
   }
 
   if (result.matches.length === 0) {
@@ -135,6 +97,7 @@ function handlePatternRead(
       id,
       session.status,
       pattern,
+      session,
       formattedLines,
       result.hasMore,
       paginationMessage,
@@ -147,15 +110,15 @@ function handlePatternRead(
 /**
  * Handles plain reading and formatting
  */
-function handlePlainRead(
+async function handlePlainRead(
   args: ReadArgs,
   session: PTYSessionInfo,
   offset: number,
   limit: number
-): string {
-  const result = manager.read(args.id, offset, limit)
+): Promise<string> {
+  const result = await manager.read(args.id, offset, limit)
   if (!result) {
-    throw buildSessionNotFoundError(args.id)
+    throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
   }
 
   if (result.lines.length === 0) {
@@ -182,6 +145,7 @@ function handlePlainRead(
       args.id,
       session.status,
       undefined,
+      session,
       formattedLines,
       result.hasMore,
       paginationMessage,
@@ -189,25 +153,6 @@ function handlePlainRead(
     ),
     session
   )
-}
-
-/**
- * Formats a single line with line number and truncation
- */
-function validateRegex(pattern: string): boolean {
-  try {
-    new RegExp(pattern)
-    // Check for potentially dangerous patterns that can cause exponential backtracking
-    // This is a basic check - more sophisticated validation could be added
-    const dangerousPatterns = [
-      /\(\?:.*\)\*.*\(\?:.*\)\*/, // nested optional groups with repetition
-      /.*\(\.\*\?\)\{2,\}.*/, // overlapping non-greedy quantifiers
-      /.*\(.*\|.*\)\{3,\}.*/, // complex alternation with repetition
-    ]
-    return !dangerousPatterns.some((dangerous) => dangerous.test(pattern))
-  } catch {
-    return false
-  }
 }
 
 export const ptyRead = tool({
@@ -230,7 +175,7 @@ export const ptyRead = tool({
       .string()
       .optional()
       .describe(
-        'Regex pattern to filter lines. When set, only matching lines are returned, then offset/limit apply to the matches.'
+        'Literal text to filter lines. When set, only matching lines are returned, then offset/limit apply to the matches.'
       ),
     ignoreCase: tool.schema
       .boolean()
@@ -238,18 +183,18 @@ export const ptyRead = tool({
       .describe('Case-insensitive pattern matching (default: false)'),
   },
   async execute(args) {
-    const session = manager.get(args.id)
+    const session = await manager.get(args.id)
     if (!session) {
-      throw buildSessionNotFoundError(args.id)
+      throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
     }
 
     const offset = args.offset ?? 0
     const limit = args.limit ?? DEFAULT_READ_LIMIT
 
     if (args.pattern) {
-      return handlePatternRead(args.id, args.pattern, args.ignoreCase, session, offset, limit)
+      return await handlePatternRead(args.id, args.pattern, args.ignoreCase, session, offset, limit)
     } else {
-      return handlePlainRead(args, session, offset, limit)
+      return await handlePlainRead(args, session, offset, limit)
     }
   },
 })
