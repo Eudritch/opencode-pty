@@ -1,22 +1,17 @@
-import {
-  appendFile,
-  mkdir,
-  open,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  stat,
-  writeFile,
-  chmod,
-} from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, rm, stat, chmod } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { DaemonDescriptor, SessionRecord } from './types.ts'
+import {
+  OUTPUT_JOURNAL_VERSION,
+  type DaemonDescriptor,
+  type OutputChunk,
+  type SessionRecord,
+} from './types.ts'
 
 const DESCRIPTOR_FILE = 'daemon.json'
 const SESSIONS_DIRECTORY = 'sessions'
 const METADATA_FILE = 'session.json'
-const OUTPUT_FILE = 'output.log'
+const LEGACY_OUTPUT_FILE = 'output.log'
+const OUTPUT_DIRECTORY = 'output'
 const START_LOCK_FILE = 'daemon-start.lock'
 const STALE_START_LOCK_MS = 10000
 
@@ -50,8 +45,12 @@ export class DaemonStorage {
     return join(this.sessionDirectory(id), METADATA_FILE)
   }
 
-  private outputPath(id: string): string {
-    return join(this.sessionDirectory(id), OUTPUT_FILE)
+  private outputDirectory(id: string): string {
+    return join(this.sessionDirectory(id), OUTPUT_DIRECTORY)
+  }
+
+  private legacyOutputPath(id: string): string {
+    return join(this.sessionDirectory(id), LEGACY_OUTPUT_FILE)
   }
 
   async initialize(): Promise<void> {
@@ -107,24 +106,73 @@ export class DaemonStorage {
     await this.writeAtomic(this.metadataPath(record.id), JSON.stringify(record))
   }
 
-  async appendOutput(id: string, data: string): Promise<void> {
-    const path = this.outputPath(id)
-    await appendFile(path, data, { encoding: 'utf8', mode: 0o600 })
-    await this.privateFile(path)
+  async appendOutput(id: string, chunks: OutputChunk[]): Promise<void> {
+    if (chunks.length === 0) return
+    const directory = this.outputDirectory(id)
+    await this.privateDirectory(directory)
+    for (const chunk of chunks) {
+      await this.writeAtomic(
+        join(directory, `${chunk.startSequence.toString().padStart(20, '0')}.json`),
+        JSON.stringify(chunk)
+      )
+    }
   }
 
-  async replaceOutput(id: string, data: string): Promise<void> {
-    const path = this.outputPath(id)
-    await writeFile(path, data, { encoding: 'utf8', mode: 0o600 })
-    await this.privateFile(path)
+  async readOutputChunks(id: string): Promise<OutputChunk[]> {
+    try {
+      const directory = this.outputDirectory(id)
+      const entries = await readdir(directory)
+      const chunks = await Promise.all(
+        entries
+          .filter((entry) => entry.endsWith('.json'))
+          .sort()
+          .map(
+            async (entry) =>
+              JSON.parse(await readFile(join(directory, entry), 'utf8')) as OutputChunk
+          )
+      )
+      return chunks.sort((left, right) => left.startSequence - right.startSequence)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw error
+    }
   }
 
   async readOutput(id: string): Promise<string> {
-    try {
-      return await readFile(this.outputPath(id), 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''
-      throw error
+    return (await this.readOutputChunks(id)).map((chunk) => chunk.data).join('')
+  }
+
+  async trimOutput(
+    id: string,
+    maxBytes: number
+  ): Promise<{
+    outputBytes: number
+    firstRetainedSequence: number
+    outputTruncated: boolean
+  }> {
+    const chunks = await this.readOutputChunks(id)
+    let retainedBytes = chunks.reduce(
+      (total, chunk) => total + chunk.endSequence - chunk.startSequence,
+      0
+    )
+    let first = 0
+    let firstRetainedSequence = chunks[0]?.startSequence ?? 0
+    while (retainedBytes > maxBytes && first < chunks.length) {
+      const chunk = chunks[first]
+      if (!chunk) break
+      retainedBytes -= chunk.endSequence - chunk.startSequence
+      await rm(
+        join(this.outputDirectory(id), `${chunk.startSequence.toString().padStart(20, '0')}.json`)
+      )
+      firstRetainedSequence = chunk.endSequence
+      first += 1
+    }
+    const retained = chunks.slice(first)
+    firstRetainedSequence = retained[0]?.startSequence ?? firstRetainedSequence
+    return {
+      outputBytes: retainedBytes,
+      firstRetainedSequence,
+      outputTruncated: first > 0,
     }
   }
 
@@ -147,16 +195,66 @@ export class DaemonStorage {
 
   private async readSession(id: string): Promise<SessionRecord | null> {
     try {
-      return JSON.parse(await readFile(this.metadataPath(id), 'utf8')) as SessionRecord
+      const record = JSON.parse(await readFile(this.metadataPath(id), 'utf8')) as SessionRecord
+      return this.migrateSession(record)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     }
   }
 
+  private async migrateSession(record: SessionRecord): Promise<SessionRecord> {
+    const chunks = await this.readOutputChunks(record.id)
+    if (chunks.length === 0 && record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) {
+      let legacyOutput = ''
+      try {
+        legacyOutput = await readFile(this.legacyOutputPath(record.id), 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (legacyOutput) {
+        const startSequence = record.firstRetainedSequence ?? 0
+        await this.appendOutput(record.id, [
+          {
+            startSequence,
+            endSequence: startSequence + Buffer.byteLength(legacyOutput),
+            timestamp: record.updatedAt,
+            data: legacyOutput,
+          },
+        ])
+        await rm(this.legacyOutputPath(record.id), { force: true })
+      }
+    }
+    const journal = await this.readOutputChunks(record.id)
+    const output = journal.map((chunk) => chunk.data).join('')
+    const firstRetainedSequence = journal[0]?.startSequence ?? record.firstRetainedSequence ?? 0
+    const nextSequence = Math.max(
+      record.nextSequence ?? 0,
+      journal.at(-1)?.endSequence ?? firstRetainedSequence
+    )
+    const migrated: SessionRecord = {
+      ...record,
+      nextSequence,
+      firstRetainedSequence,
+      outputBytes: Buffer.byteLength(output),
+      outputTruncated: record.outputTruncated ?? firstRetainedSequence > 0,
+      lineCount: output ? output.split('\n').length - Number(output.endsWith('\n')) : 0,
+      outputHasPartialLine: Boolean(output) && !output.endsWith('\n'),
+      outputJournalVersion: OUTPUT_JOURNAL_VERSION,
+    }
+    if (record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) await this.writeSession(migrated)
+    return migrated
+  }
+
   private async writeAtomic(path: string, contents: string): Promise<void> {
     const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`
-    await writeFile(temporaryPath, contents, { encoding: 'utf8', mode: 0o600 })
+    const handle = await open(temporaryPath, 'w', 0o600)
+    try {
+      await handle.writeFile(contents, 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
     await rename(temporaryPath, path)
     await this.privateFile(path)
   }

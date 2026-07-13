@@ -20,6 +20,7 @@ interface ReadArgs {
   limit?: number
   pattern?: string
   ignoreCase?: boolean
+  sequence?: number
 }
 
 /**
@@ -66,9 +67,10 @@ async function handlePatternRead(
   ignoreCase: boolean | undefined,
   session: PTYSessionInfo,
   offset: number,
-  limit: number
+  limit: number,
+  sequence?: number
 ): Promise<string> {
-  const result = await manager.search(id, pattern, ignoreCase, offset, limit)
+  const result = await manager.search(id, pattern, ignoreCase, offset, limit, sequence)
   if (!result) {
     throw new Error(`PTY session '${id}' not found. Use pty_list to see active sessions.`)
   }
@@ -76,7 +78,7 @@ async function handlePatternRead(
   if (result.matches.length === 0) {
     return appendSessionReminders(
       [
-        `<pty_output id="${id}" status="${session.status}" output_sequence="${session.outputSequence ?? 0}" retained_from="${session.firstRetainedSequence ?? 0}" truncated="${session.outputTruncated ?? false}" pattern="${pattern}">`,
+        `<pty_output id="${id}" status="${session.status}" output_sequence="${result.nextSequence}" retained_from="${result.firstRetainedSequence}" truncated="${result.truncated}" pattern="${pattern}">`,
         `No lines matched the pattern '${pattern}'.`,
         `Total lines in buffer: ${result.totalLines}`,
         `</pty_output>`,
@@ -97,7 +99,12 @@ async function handlePatternRead(
       id,
       session.status,
       pattern,
-      session,
+      {
+        ...session,
+        outputSequence: result.nextSequence,
+        firstRetainedSequence: result.firstRetainedSequence,
+        outputTruncated: result.truncated,
+      },
       formattedLines,
       result.hasMore,
       paginationMessage,
@@ -114,9 +121,10 @@ async function handlePlainRead(
   args: ReadArgs,
   session: PTYSessionInfo,
   offset: number,
-  limit: number
+  limit: number,
+  sequence?: number
 ): Promise<string> {
-  const result = await manager.read(args.id, offset, limit)
+  const result = await manager.read(args.id, offset, limit, sequence)
   if (!result) {
     throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
   }
@@ -124,7 +132,7 @@ async function handlePlainRead(
   if (result.lines.length === 0) {
     return appendSessionReminders(
       [
-        `<pty_output id="${args.id}" status="${session.status}">`,
+        `<pty_output id="${args.id}" status="${session.status}" output_sequence="${result.nextSequence}" retained_from="${result.firstRetainedSequence}" truncated="${result.truncated}">`,
         `(No output available - buffer is empty)`,
         `Total lines: ${result.totalLines}`,
         `</pty_output>`,
@@ -145,7 +153,12 @@ async function handlePlainRead(
       args.id,
       session.status,
       undefined,
-      session,
+      {
+        ...session,
+        outputSequence: result.nextSequence,
+        firstRetainedSequence: result.firstRetainedSequence,
+        outputTruncated: result.truncated,
+      },
       formattedLines,
       result.hasMore,
       paginationMessage,
@@ -181,6 +194,10 @@ export const ptyRead = tool({
       .boolean()
       .optional()
       .describe('Case-insensitive pattern matching (default: false)'),
+    sequence: tool.schema
+      .number()
+      .optional()
+      .describe('Only return lines at or after this durable UTF-8 byte sequence position.'),
   },
   async execute(args) {
     const session = await manager.get(args.id)
@@ -192,9 +209,17 @@ export const ptyRead = tool({
     const limit = args.limit ?? DEFAULT_READ_LIMIT
 
     if (args.pattern) {
-      return await handlePatternRead(args.id, args.pattern, args.ignoreCase, session, offset, limit)
+      return await handlePatternRead(
+        args.id,
+        args.pattern,
+        args.ignoreCase,
+        session,
+        offset,
+        limit,
+        args.sequence
+      )
     } else {
-      return await handlePlainRead(args, session, offset, limit)
+      return await handlePlainRead(args, session, offset, limit, args.sequence)
     }
   },
 })

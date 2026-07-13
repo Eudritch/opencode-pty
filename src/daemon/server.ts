@@ -125,22 +125,24 @@ export class DaemonServer implements Disposable {
       }
       case 'read': {
         const payload = this.objectPayload(request.payload)
-        this.onlyFields(payload, ['id', 'offset', 'limit'])
+        this.onlyFields(payload, ['id', 'offset', 'limit', 'sequence'])
         return this.supervisor.read(
           this.requiredString(payload, 'id'),
           this.optionalNonnegativeInteger(payload, 'offset'),
-          this.optionalNonnegativeInteger(payload, 'limit')
+          this.optionalNonnegativeInteger(payload, 'limit'),
+          this.optionalSequence(payload, 'sequence')
         )
       }
       case 'search': {
         const payload = this.objectPayload(request.payload)
-        this.onlyFields(payload, ['id', 'pattern', 'ignoreCase', 'offset', 'limit'])
+        this.onlyFields(payload, ['id', 'pattern', 'ignoreCase', 'offset', 'limit', 'sequence'])
         return this.supervisor.search(
           this.requiredString(payload, 'id'),
           this.requiredString(payload, 'pattern'),
           this.optionalBoolean(payload, 'ignoreCase') ?? false,
           this.optionalNonnegativeInteger(payload, 'offset'),
-          this.optionalNonnegativeInteger(payload, 'limit')
+          this.optionalNonnegativeInteger(payload, 'limit'),
+          this.optionalSequence(payload, 'sequence')
         )
       }
       case 'list':
@@ -233,6 +235,15 @@ export class DaemonServer implements Disposable {
     }
     if ((value as number) > MAX_PAGE_SIZE) {
       throw new ValidationError(`RPC field '${key}' exceeds the size limit.`)
+    }
+    return value as number
+  }
+
+  private optionalSequence(payload: Record<string, unknown>, key: string): number | undefined {
+    const value = payload[key]
+    if (value === undefined) return undefined
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+      throw new ValidationError(`RPC field '${key}' must be a non-negative safe integer.`)
     }
     return value as number
   }

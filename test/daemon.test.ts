@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
@@ -42,6 +42,7 @@ function record(
     outputTruncated: false,
     lineCount: 0,
     outputHasPartialLine: false,
+    outputJournalVersion: 2,
   }
 }
 
@@ -161,7 +162,9 @@ test('daemon storage protects private paths on POSIX', async () => {
     token: 'x',
   })
   await storage.writeSession(record(root, 'pty_test', 'exited'))
-  await storage.appendOutput('pty_test', 'output')
+  await storage.appendOutput('pty_test', [
+    { startSequence: 0, endSequence: 6, timestamp: new Date().toISOString(), data: 'output' },
+  ])
   if (process.platform !== 'win32') {
     expect((await stat(root)).mode & 0o777).toBe(0o700)
     expect((await stat(join(root, 'daemon.json'))).mode & 0o777).toBe(0o600)
@@ -169,7 +172,10 @@ test('daemon storage protects private paths on POSIX', async () => {
     expect((await stat(join(root, 'sessions', 'pty_test', 'session.json'))).mode & 0o777).toBe(
       0o600
     )
-    expect((await stat(join(root, 'sessions', 'pty_test', 'output.log'))).mode & 0o777).toBe(0o600)
+    expect(
+      (await stat(join(root, 'sessions', 'pty_test', 'output', '00000000000000000000.json'))).mode &
+        0o777
+    ).toBe(0o600)
   }
 })
 
@@ -183,6 +189,82 @@ test('lost sessions cannot be cleaned up', async () => {
 
   expect(await supervisor.cleanup('pty_lost')).toBeFalse()
   expect(await storage.loadSessions()).toHaveLength(1)
+})
+
+test('journal orders chunks, retains complete UTF-8 chunks, and paginates by stable sequence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-journal-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_journal', 'exited')
+  session.nextSequence = 11
+  session.outputBytes = 11
+  session.lineCount = 3
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 7, endSequence: 11, timestamp: '2026-01-01T00:00:02.000Z', data: 'end\n' },
+    { startSequence: 0, endSequence: 2, timestamp: '2026-01-01T00:00:00.000Z', data: 'a\n' },
+    { startSequence: 2, endSequence: 7, timestamp: '2026-01-01T00:00:01.000Z', data: '😀\n' },
+  ])
+
+  expect(await storage.readOutput(session.id)).toBe('a\n😀\nend\n')
+  expect(await storage.trimOutput(session.id, 9)).toEqual({
+    outputBytes: 9,
+    firstRetainedSequence: 2,
+    outputTruncated: true,
+  })
+  expect(await storage.readOutput(session.id)).toBe('😀\nend\n')
+
+  session.firstRetainedSequence = 2
+  session.outputBytes = 9
+  session.outputTruncated = true
+  session.lineCount = 2
+  await storage.writeSession(session)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  expect(await supervisor.read(session.id, 0, 1)).toMatchObject({
+    lines: ['😀'],
+    sequences: [2],
+    totalLines: 2,
+    hasMore: true,
+    firstRetainedSequence: 2,
+    nextSequence: 11,
+    truncated: true,
+  })
+  expect(await supervisor.read(session.id, 0, 1, 6)).toMatchObject({
+    lines: ['end'],
+    sequences: [7],
+    totalLines: 1,
+    hasMore: false,
+  })
+  expect(await supervisor.search(session.id, 'end')).toMatchObject({
+    matches: [{ lineNumber: 2, sequence: 7, text: 'end' }],
+    firstRetainedSequence: 2,
+    nextSequence: 11,
+  })
+})
+
+test('restart migrates v1 output and marks active sessions lost without losing it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_v1')
+  session.nextSequence = 10
+  session.outputBytes = 10
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await writeFile(
+    join(root, 'sessions', session.id, 'session.json'),
+    JSON.stringify(
+      Object.fromEntries(Object.entries(session).filter(([key]) => key !== 'outputJournalVersion'))
+    )
+  )
+  await writeFile(join(root, 'sessions', session.id, 'output.log'), 'lost 😀\n', 'utf8')
+
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect(await recovered.get(session.id)).toMatchObject({ status: 'lost', outputSequence: 10 })
+  expect(await recovered.rawOutput(session.id)).toEqual({ raw: 'lost 😀\n', byteLength: 10 })
+  expect(await recovered.read(session.id)).toMatchObject({ lines: ['lost 😀'], sequences: [0] })
 })
 
 test('daemon classifies storage failures', async () => {
@@ -269,7 +351,9 @@ test('supervisor preserves timeout diagnostics, stop state, cleanup state, and o
     state.records.set(entry.id, entry)
     await storage.writeSession(entry)
   }
-  await storage.appendOutput('pty_output', 'one\nhit\n')
+  await storage.appendOutput('pty_output', [
+    { startSequence: 0, endSequence: 8, timestamp: new Date().toISOString(), data: 'one\nhit\n' },
+  ])
   state.active.set('pty_timeout', {
     record: timedOut,
     process: {

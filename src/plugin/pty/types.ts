@@ -50,6 +50,9 @@ export interface ReadResult {
   totalLines: number
   offset: number
   hasMore: boolean
+  firstRetainedSequence: number
+  nextSequence: number
+  truncated: boolean
 }
 
 export interface SearchResult {
@@ -58,4 +61,7 @@ export interface SearchResult {
   totalLines: number
   offset: number
   hasMore: boolean
+  firstRetainedSequence: number
+  nextSequence: number
+  truncated: boolean
 }

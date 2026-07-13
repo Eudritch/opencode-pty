@@ -8,13 +8,15 @@ Usage:
 - `limit`: Number of lines to read (defaults to 500)
 - `pattern`: Literal text to filter lines (optional)
 - `ignoreCase`: Case-insensitive pattern matching (default: false)
+- `sequence`: Durable UTF-8 byte position to resume from (optional)
 
 Returns:
 - Numbered lines of output (similar to cat -n format)
 - Total line count in the buffer
 - Indicator if more lines are available
+- Stable byte sequence positions and retained/truncation metadata
 
-Older output is discarded when the byte limit is reached.
+Older complete journal chunks are discarded when the byte limit is reached; the response states the earliest retained byte sequence.
 
 Pattern Filtering:
 - When `pattern` is set, lines are FILTERED FIRST using literal text, then offset/limit apply to the MATCHES

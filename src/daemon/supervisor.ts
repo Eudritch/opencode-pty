@@ -1,6 +1,12 @@
 import { spawn, type IPty } from 'bun-pty'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
-import type { ExitReason, SessionRecord, StopResult, WriteResult } from './types.ts'
+import {
+  OUTPUT_JOURNAL_VERSION,
+  type ExitReason,
+  type SessionRecord,
+  type StopResult,
+  type WriteResult,
+} from './types.ts'
 import type { DaemonStorage } from './storage.ts'
 
 const configuredOutputLimit = Number.parseInt(process.env.PTY_MAX_OUTPUT_BYTES ?? '1000000', 10)
@@ -8,6 +14,7 @@ const DEFAULT_MAX_OUTPUT_BYTES =
   Number.isSafeInteger(configuredOutputLimit) && configuredOutputLimit > 0
     ? configuredOutputLimit
     : 1000000
+const OUTPUT_CHUNK_BYTES = 64 * 1024
 
 interface ActiveSession {
   record: SessionRecord
@@ -49,6 +56,34 @@ function searchLines(
     const haystack = ignoreCase ? text.toLowerCase() : text
     return Boolean(text) && haystack.includes(needle)
   })
+}
+
+function outputChunks(data: string, startSequence: number, maxBytes: number) {
+  const chunks: Array<{
+    startSequence: number
+    endSequence: number
+    timestamp: string
+    data: string
+  }> = []
+  const chunkBytes = Math.max(1, Math.min(OUTPUT_CHUNK_BYTES, maxBytes))
+  let text = ''
+  let bytes = 0
+  let sequence = startSequence
+  const timestamp = new Date().toISOString()
+  for (const character of data) {
+    const characterBytes = Buffer.byteLength(character)
+    if (text && bytes + characterBytes > chunkBytes) {
+      chunks.push({ startSequence: sequence, endSequence: sequence + bytes, timestamp, data: text })
+      sequence += bytes
+      text = ''
+      bytes = 0
+    }
+    text += character
+    bytes += characterBytes
+  }
+  if (text)
+    chunks.push({ startSequence: sequence, endSequence: sequence + bytes, timestamp, data: text })
+  return chunks
 }
 
 export class SessionSupervisor {
@@ -125,6 +160,7 @@ export class SessionSupervisor {
       outputTruncated: false,
       lineCount: 0,
       outputHasPartialLine: false,
+      outputJournalVersion: OUTPUT_JOURNAL_VERSION,
     }
     this.records.set(id, record)
     await this.storage.writeSession(record)
@@ -182,10 +218,12 @@ export class SessionSupervisor {
     }
   }
 
-  async read(id: string, offset = 0, limit?: number): Promise<ReadResult> {
+  async read(id: string, offset = 0, limit?: number, sequence?: number): Promise<ReadResult> {
     const record = this.recordFor(id)
     const output = await this.outputFor(id)
-    const lines = outputLines(output, record.firstRetainedSequence)
+    const lines = outputLines(output, record.firstRetainedSequence).filter(
+      (line) => sequence === undefined || line.sequence >= sequence
+    )
     const start = Math.max(0, offset)
     const page = limit === undefined ? lines.slice(start) : lines.slice(start, start + limit)
     return {
@@ -194,6 +232,9 @@ export class SessionSupervisor {
       totalLines: lines.length,
       offset: start,
       hasMore: start + page.length < lines.length,
+      firstRetainedSequence: record.firstRetainedSequence,
+      nextSequence: record.nextSequence,
+      truncated: record.outputTruncated,
     }
   }
 
@@ -202,11 +243,14 @@ export class SessionSupervisor {
     pattern: string,
     ignoreCase = false,
     offset = 0,
-    limit?: number
+    limit?: number,
+    sequence?: number
   ): Promise<SearchResult> {
     const record = this.recordFor(id)
     const output = await this.outputFor(id)
-    const matches = searchLines(output, pattern, ignoreCase, record.firstRetainedSequence)
+    const matches = searchLines(output, pattern, ignoreCase, record.firstRetainedSequence).filter(
+      (match) => sequence === undefined || match.sequence >= sequence
+    )
     const start = Math.max(0, offset)
     const page = limit === undefined ? matches.slice(start) : matches.slice(start, start + limit)
     return {
@@ -215,6 +259,9 @@ export class SessionSupervisor {
       totalLines: lineCount(output),
       offset: start,
       hasMore: start + page.length < matches.length,
+      firstRetainedSequence: record.firstRetainedSequence,
+      nextSequence: record.nextSequence,
+      truncated: record.outputTruncated,
     }
   }
 
@@ -318,6 +365,7 @@ export class SessionSupervisor {
     this.enqueuePersist(async () => {
       const next = { ...active.record }
       const byteLength = Buffer.byteLength(data)
+      const chunks = outputChunks(data, next.nextSequence, this.maxOutputBytes)
       next.nextSequence += byteLength
       next.outputBytes += byteLength
       const newlines = data.split('\n').length - 1
@@ -328,7 +376,7 @@ export class SessionSupervisor {
       }
       next.outputHasPartialLine = !data.endsWith('\n')
       next.updatedAt = new Date().toISOString()
-      await this.storage.appendOutput(next.id, data)
+      await this.storage.appendOutput(next.id, chunks)
       await this.trimOutput(next)
       await this.storage.writeSession(next)
       active.record.nextSequence = next.nextSequence
@@ -369,22 +417,13 @@ export class SessionSupervisor {
 
   private async trimOutput(record: SessionRecord): Promise<void> {
     if (record.outputBytes <= this.maxOutputBytes) return
-    // ponytail: one output file; use segmented journals when retention needs to avoid rewrite cost.
+    const retained = await this.storage.trimOutput(record.id, this.maxOutputBytes)
     const output = await this.storage.readOutput(record.id)
-    const bytes = Buffer.from(output)
-    let start = Math.max(0, bytes.length - this.maxOutputBytes)
-    while (start < bytes.length) {
-      const byte = bytes[start]
-      if (byte === undefined || (byte & 0xc0) !== 0x80) break
-      start += 1
-    }
-    const retained = bytes.subarray(start).toString('utf8')
-    record.outputBytes = Buffer.byteLength(retained)
-    record.lineCount = lineCount(retained)
-    record.outputHasPartialLine = Boolean(retained) && !retained.endsWith('\n')
-    record.firstRetainedSequence = record.nextSequence - record.outputBytes
-    record.outputTruncated = true
-    await this.storage.replaceOutput(record.id, retained)
+    record.outputBytes = retained.outputBytes
+    record.firstRetainedSequence = retained.firstRetainedSequence
+    record.outputTruncated ||= retained.outputTruncated
+    record.lineCount = lineCount(output)
+    record.outputHasPartialLine = Boolean(output) && !output.endsWith('\n')
   }
 
   private enqueuePersist(task: () => Promise<void>): void {

@@ -54,8 +54,8 @@ export class DaemonClient {
     return this.call('write', { id, data })
   }
 
-  async read(id: string, offset?: number, limit?: number): Promise<ReadResult> {
-    return this.call('read', { id, offset, limit })
+  async read(id: string, offset?: number, limit?: number, sequence?: number): Promise<ReadResult> {
+    return this.call('read', { id, offset, limit, sequence })
   }
 
   async search(
@@ -63,9 +63,10 @@ export class DaemonClient {
     pattern: string,
     ignoreCase = false,
     offset?: number,
-    limit?: number
+    limit?: number,
+    sequence?: number
   ): Promise<SearchResult> {
-    return this.call('search', { id, pattern, ignoreCase, offset, limit })
+    return this.call('search', { id, pattern, ignoreCase, offset, limit, sequence })
   }
 
   async list(): Promise<PTYSessionInfo[]> {

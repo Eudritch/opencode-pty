@@ -1,5 +1,7 @@
 export const DAEMON_PROTOCOL_VERSION = 1
 
+export const OUTPUT_JOURNAL_VERSION = 2
+
 export type ExitReason =
   | { kind: 'code'; code: number }
   | { kind: 'signal'; signal: string }
@@ -43,6 +45,14 @@ export interface SessionRecord {
   outputTruncated: boolean
   lineCount: number
   outputHasPartialLine: boolean
+  outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
+}
+
+export interface OutputChunk {
+  startSequence: number
+  endSequence: number
+  timestamp: string
+  data: string
 }
 
 export interface DaemonDescriptor {
