@@ -243,6 +243,83 @@ test('journal orders chunks, retains complete UTF-8 chunks, and paginates by sta
   })
 })
 
+test('journal recovery reconciles a stale retention cursor from retained chunks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-reconcile-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_reconcile', 'exited')
+  session.nextSequence = 11
+  session.outputBytes = 11
+  session.lineCount = 3
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 7, endSequence: 11, timestamp: new Date().toISOString(), data: 'end\n' },
+  ])
+
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect(await recovered.read(session.id)).toMatchObject({
+    lines: ['end'],
+    sequences: [7],
+    firstRetainedSequence: 7,
+    nextSequence: 11,
+    truncated: true,
+  })
+  expect((await storage.loadSessions())[0]).toMatchObject({
+    firstRetainedSequence: 7,
+    outputBytes: 4,
+    outputTruncated: true,
+  })
+})
+
+test('journal recovery marks output truncated when retention removes every chunk', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-empty-retention-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_empty_retention', 'exited')
+  session.nextSequence = 4
+  session.outputBytes = 4
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 4, timestamp: new Date().toISOString(), data: 'one\n' },
+  ])
+  await storage.trimOutput(session.id, 0)
+
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect(await recovered.read(session.id)).toMatchObject({
+    lines: [],
+    firstRetainedSequence: 4,
+    nextSequence: 4,
+    truncated: true,
+  })
+})
+
+test('journal recovery completes retention recorded before chunk deletion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-pending-retention-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_pending_retention', 'exited')
+  session.nextSequence = 4
+  session.firstRetainedSequence = 4
+  session.outputTruncated = true
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 4, timestamp: new Date().toISOString(), data: 'one\n' },
+  ])
+
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect(await recovered.read(session.id)).toMatchObject({
+    lines: [],
+    firstRetainedSequence: 4,
+    nextSequence: 4,
+    truncated: true,
+  })
+  expect(await storage.readOutput(session.id)).toBe('')
+})
+
 test('restart migrates v1 output and marks active sessions lost without losing it', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-'))
   roots.push(root)
@@ -265,6 +342,38 @@ test('restart migrates v1 output and marks active sessions lost without losing i
   expect(await recovered.get(session.id)).toMatchObject({ status: 'lost', outputSequence: 10 })
   expect(await recovered.rawOutput(session.id)).toEqual({ raw: 'lost 😀\n', byteLength: 10 })
   expect(await recovered.read(session.id)).toMatchObject({ lines: ['lost 😀'], sequences: [0] })
+})
+
+test('v1 migration keeps output.log until journal metadata is durable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-recovery-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_v1_recovery', 'exited')
+  session.nextSequence = 7
+  session.outputBytes = 7
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await writeFile(
+    join(root, 'sessions', session.id, 'session.json'),
+    JSON.stringify(
+      Object.fromEntries(Object.entries(session).filter(([key]) => key !== 'outputJournalVersion'))
+    )
+  )
+  const legacyPath = join(root, 'sessions', session.id, 'output.log')
+  await writeFile(legacyPath, 'legacy\n', 'utf8')
+
+  const writeSession = storage.writeSession.bind(storage)
+  storage.writeSession = async () => {
+    throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
+  }
+  await expect(storage.loadSessions()).rejects.toThrow('disk full')
+  expect(await Bun.file(legacyPath).exists()).toBeTrue()
+  storage.writeSession = writeSession
+
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect(await recovered.rawOutput(session.id)).toEqual({ raw: 'legacy\n', byteLength: 7 })
+  expect(await Bun.file(legacyPath).exists()).toBeFalse()
 })
 
 test('daemon classifies storage failures', async () => {
@@ -486,6 +595,42 @@ test('plugin client starts its daemon from the configured data directory', async
   } finally {
     if (pid) process.kill(pid)
     await Bun.sleep(100)
+    process.env.PTY_DAEMON_DIR = previousDirectory
+  }
+})
+
+test('daemon client returns RPC sequence cursor and truncation metadata', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-client-read-'))
+  roots.push(root)
+  const previousDirectory = process.env.PTY_DAEMON_DIR
+  process.env.PTY_DAEMON_DIR = root
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_client_read', 'exited')
+  session.nextSequence = 11
+  session.firstRetainedSequence = 2
+  session.outputBytes = 9
+  session.outputTruncated = true
+  session.lineCount = 2
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 2, endSequence: 7, timestamp: new Date().toISOString(), data: '😀\n' },
+    { startSequence: 7, endSequence: 11, timestamp: new Date().toISOString(), data: 'end\n' },
+  ])
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  await server.start()
+  try {
+    expect(await new DaemonClient().read(session.id, 0, 1, 7)).toEqual({
+      lines: ['end'],
+      sequences: [7],
+      totalLines: 1,
+      offset: 0,
+      hasMore: false,
+      firstRetainedSequence: 2,
+      nextSequence: 11,
+      truncated: true,
+    })
+  } finally {
+    await server.stop()
     process.env.PTY_DAEMON_DIR = previousDirectory
   }
 })

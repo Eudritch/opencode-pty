@@ -1,5 +1,5 @@
-import { mkdir, open, readFile, readdir, rename, rm, stat, chmod } from 'node:fs/promises'
-import { join } from 'node:path'
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import {
   OUTPUT_JOURNAL_VERSION,
   type DaemonDescriptor,
@@ -150,26 +150,43 @@ export class DaemonStorage {
     firstRetainedSequence: number
     outputTruncated: boolean
   }> {
-    const chunks = await this.readOutputChunks(id)
-    let retainedBytes = chunks.reduce(
+    const { chunks, ...retained } = await this.retainedOutput(id, maxBytes)
+    for (const chunk of chunks) {
+      await rm(
+        join(this.outputDirectory(id), `${chunk.startSequence.toString().padStart(20, '0')}.json`)
+      )
+    }
+    if (chunks.length > 0) await this.syncDirectory(this.outputDirectory(id))
+    return retained
+  }
+
+  async retainedOutput(
+    id: string,
+    maxBytes: number
+  ): Promise<{
+    chunks: OutputChunk[]
+    outputBytes: number
+    firstRetainedSequence: number
+    outputTruncated: boolean
+  }> {
+    const allChunks = await this.readOutputChunks(id)
+    let retainedBytes = allChunks.reduce(
       (total, chunk) => total + chunk.endSequence - chunk.startSequence,
       0
     )
     let first = 0
-    let firstRetainedSequence = chunks[0]?.startSequence ?? 0
-    while (retainedBytes > maxBytes && first < chunks.length) {
-      const chunk = chunks[first]
+    let firstRetainedSequence = allChunks[0]?.startSequence ?? 0
+    while (retainedBytes > maxBytes && first < allChunks.length) {
+      const chunk = allChunks[first]
       if (!chunk) break
       retainedBytes -= chunk.endSequence - chunk.startSequence
-      await rm(
-        join(this.outputDirectory(id), `${chunk.startSequence.toString().padStart(20, '0')}.json`)
-      )
       firstRetainedSequence = chunk.endSequence
       first += 1
     }
-    const retained = chunks.slice(first)
+    const retained = allChunks.slice(first)
     firstRetainedSequence = retained[0]?.startSequence ?? firstRetainedSequence
     return {
+      chunks: allChunks.slice(0, first),
       outputBytes: retainedBytes,
       firstRetainedSequence,
       outputTruncated: first > 0,
@@ -204,8 +221,8 @@ export class DaemonStorage {
   }
 
   private async migrateSession(record: SessionRecord): Promise<SessionRecord> {
-    const chunks = await this.readOutputChunks(record.id)
-    if (chunks.length === 0 && record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) {
+    let chunks = await this.readOutputChunks(record.id)
+    if (record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION && chunks.length === 0) {
       let legacyOutput = ''
       try {
         legacyOutput = await readFile(this.legacyOutputPath(record.id), 'utf8')
@@ -222,28 +239,56 @@ export class DaemonStorage {
             data: legacyOutput,
           },
         ])
-        await rm(this.legacyOutputPath(record.id), { force: true })
+        chunks = await this.readOutputChunks(record.id)
       }
     }
-    const journal = await this.readOutputChunks(record.id)
-    const output = journal.map((chunk) => chunk.data).join('')
-    const firstRetainedSequence = journal[0]?.startSequence ?? record.firstRetainedSequence ?? 0
+    if (record.outputJournalVersion === OUTPUT_JOURNAL_VERSION && record.outputTruncated) {
+      await this.discardOutputBefore(record.id, record.firstRetainedSequence)
+      chunks = await this.readOutputChunks(record.id)
+    }
+    const migrated = this.reconcileSession(record, chunks)
+    if (
+      record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION ||
+      !this.sameJournalState(record, migrated)
+    ) {
+      await this.writeSession(migrated)
+    }
+    if (record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) {
+      // The v1 source is disposable only after its journal and metadata are durable.
+      await rm(this.legacyOutputPath(record.id), { force: true })
+    }
+    return migrated
+  }
+
+  private reconcileSession(record: SessionRecord, chunks: OutputChunk[]): SessionRecord {
+    const output = chunks.map((chunk) => chunk.data).join('')
+    const firstRetainedSequence = chunks[0]?.startSequence ?? record.nextSequence ?? 0
     const nextSequence = Math.max(
       record.nextSequence ?? 0,
-      journal.at(-1)?.endSequence ?? firstRetainedSequence
+      chunks.at(-1)?.endSequence ?? firstRetainedSequence
     )
-    const migrated: SessionRecord = {
+    return {
       ...record,
       nextSequence,
       firstRetainedSequence,
       outputBytes: Buffer.byteLength(output),
-      outputTruncated: record.outputTruncated ?? firstRetainedSequence > 0,
+      outputTruncated: firstRetainedSequence > 0,
       lineCount: output ? output.split('\n').length - Number(output.endsWith('\n')) : 0,
       outputHasPartialLine: Boolean(output) && !output.endsWith('\n'),
       outputJournalVersion: OUTPUT_JOURNAL_VERSION,
     }
-    if (record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) await this.writeSession(migrated)
-    return migrated
+  }
+
+  private sameJournalState(left: SessionRecord, right: SessionRecord): boolean {
+    return (
+      left.nextSequence === right.nextSequence &&
+      left.firstRetainedSequence === right.firstRetainedSequence &&
+      left.outputBytes === right.outputBytes &&
+      left.outputTruncated === right.outputTruncated &&
+      left.lineCount === right.lineCount &&
+      left.outputHasPartialLine === right.outputHasPartialLine &&
+      left.outputJournalVersion === right.outputJournalVersion
+    )
   }
 
   private async writeAtomic(path: string, contents: string): Promise<void> {
@@ -257,6 +302,29 @@ export class DaemonStorage {
     }
     await rename(temporaryPath, path)
     await this.privateFile(path)
+    await this.syncDirectory(dirname(path))
+  }
+
+  private async syncDirectory(path: string): Promise<void> {
+    if (process.platform === 'win32') return
+    const handle = await open(path, 'r')
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  }
+
+  private async discardOutputBefore(id: string, sequence: number): Promise<void> {
+    const chunks = (await this.readOutputChunks(id)).filter(
+      (chunk) => chunk.endSequence <= sequence
+    )
+    for (const chunk of chunks) {
+      await rm(
+        join(this.outputDirectory(id), `${chunk.startSequence.toString().padStart(20, '0')}.json`)
+      )
+    }
+    if (chunks.length > 0) await this.syncDirectory(this.outputDirectory(id))
   }
 
   private async privateDirectory(path: string): Promise<void> {

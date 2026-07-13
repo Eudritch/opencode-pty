@@ -417,11 +417,13 @@ export class SessionSupervisor {
 
   private async trimOutput(record: SessionRecord): Promise<void> {
     if (record.outputBytes <= this.maxOutputBytes) return
-    const retained = await this.storage.trimOutput(record.id, this.maxOutputBytes)
-    const output = await this.storage.readOutput(record.id)
+    const retained = await this.storage.retainedOutput(record.id, this.maxOutputBytes)
     record.outputBytes = retained.outputBytes
     record.firstRetainedSequence = retained.firstRetainedSequence
     record.outputTruncated ||= retained.outputTruncated
+    await this.storage.writeSession(record)
+    await this.storage.trimOutput(record.id, this.maxOutputBytes)
+    const output = await this.storage.readOutput(record.id)
     record.lineCount = lineCount(output)
     record.outputHasPartialLine = Boolean(output) && !output.endsWith('\n')
   }
