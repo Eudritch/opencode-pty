@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
-import { DaemonStorage } from '../src/daemon/storage.ts'
+import { DaemonStorage, processStartIdentity } from '../src/daemon/storage.ts'
 import { WorkerClient as NativeWorkerClient } from '../src/daemon/worker-client.ts'
 import {
   effectiveMaxOutputBytes,
@@ -536,13 +536,63 @@ test('start locks retain live owners and recover exactly one dead owner', async 
   await storage.releaseStartLock(live)
   await writeFile(
     join(root, 'daemon-start.lock'),
-    JSON.stringify({ token: 'dead', pid: 2147483647 })
+    JSON.stringify({ token: 'dead', pid: 2147483647, processIdentity: 'dead' })
   )
   const recovered = await Promise.all([storage.acquireStartLock(), storage.acquireStartLock()])
   expect(recovered.filter(Boolean)).toHaveLength(1)
   const recoveredToken = recovered.find(Boolean)
   if (!recoveredToken) throw new Error('Expected recovered start lock.')
   await storage.releaseStartLock(recoveredToken)
+})
+
+test('start lock recovery removes crash remnants but retains a valid live lock', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-remnants-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  for (const value of ['', '{', JSON.stringify({ token: 'old', pid: process.pid })]) {
+    await storage.initialize()
+    await writeFile(join(root, 'daemon-start.lock'), value)
+    const token = await storage.acquireStartLock()
+    expect(token).toEqual(expect.any(String))
+    if (!token) throw new Error('Expected recovered start lock.')
+    await storage.releaseStartLock(token)
+  }
+  const live = await storage.acquireStartLock()
+  expect(live).toEqual(expect.any(String))
+  expect(await storage.acquireStartLock()).toBeNull()
+  if (live) await storage.releaseStartLock(live)
+})
+
+test('start locks reject reused PIDs with a different process identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-identity-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const identity = await processStartIdentity(process.pid)
+  if (!identity) return
+  await storage.initialize()
+  await writeFile(
+    join(root, 'daemon-start.lock'),
+    JSON.stringify({ token: 'old', pid: process.pid, processIdentity: `${identity}-old` })
+  )
+  const token = await storage.acquireStartLock()
+  expect(token).toEqual(expect.any(String))
+  if (token) await storage.releaseStartLock(token)
+})
+
+test('descriptor ownership rejects a reused PID with a different process identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-descriptor-identity-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const identity = await processStartIdentity(process.pid)
+  if (!identity) return
+  await storage.writeDescriptor({
+    pid: process.pid,
+    processIdentity: `${identity}-old`,
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: DAEMON_PROTOCOL_VERSION,
+    token: 'old-token',
+  })
+  expect(await storage.descriptorOwnerAlive()).toBeFalse()
 })
 
 test('daemon stop leaves a replacement descriptor intact', async () => {
@@ -553,6 +603,7 @@ test('daemon stop leaves a replacement descriptor intact', async () => {
   await server.start()
   await storage.writeDescriptor({
     pid: process.pid,
+    processIdentity: 'replacement',
     endpoint: 'http://127.0.0.1:1',
     protocolVersion: DAEMON_PROTOCOL_VERSION,
     token: 'replacement-token',
@@ -2095,6 +2146,7 @@ test('cleanup retains a terminal record with unverified containment', async () =
 test('client preserves a healthy incompatible daemon descriptor', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-incompatible-'))
   roots.push(root)
+  const processIdentity = (await processStartIdentity(process.pid)) ?? 'unavailable'
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -2102,7 +2154,11 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
       Response.json({
         id: 'health',
         ok: true,
-        result: { protocolVersion: DAEMON_PROTOCOL_VERSION + 1, pid: process.pid },
+        result: {
+          protocolVersion: DAEMON_PROTOCOL_VERSION + 1,
+          pid: process.pid,
+          processIdentity,
+        },
       }),
   })
   const previousDirectory = process.env.PTY_DAEMON_DIR
@@ -2111,6 +2167,7 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
   await storage.initialize()
   await storage.writeDescriptor({
     pid: process.pid,
+    processIdentity,
     endpoint: server.url.origin,
     protocolVersion: DAEMON_PROTOCOL_VERSION + 1,
     token: 'test-token',
@@ -2174,6 +2231,7 @@ Set-Acl -LiteralPath $env:PTY_DAEMON_ACL_PATH -AclObject $acl`,
     await storage.initialize()
     await storage.writeDescriptor({
       pid: process.pid,
+      processIdentity: 'stale',
       endpoint: 'http://127.0.0.1:1',
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       token: 'x',
@@ -2582,6 +2640,7 @@ test('plugin client starts its daemon from the configured data directory', async
     await storage.initialize()
     await storage.writeDescriptor({
       pid: process.pid,
+      processIdentity: 'stale',
       endpoint: 'http://127.0.0.1:1',
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       token: 'stale-token',

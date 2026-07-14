@@ -82,11 +82,13 @@ function safeStartupStderrTail(
 function isSafeDescriptor(value: unknown): value is DaemonDescriptor {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const descriptor = value as Partial<DaemonDescriptor>
-  const { pid, protocolVersion, token, endpoint } = descriptor
+  const { pid, processIdentity, protocolVersion, token, endpoint } = descriptor
   if (
     typeof pid !== 'number' ||
     !Number.isSafeInteger(pid) ||
     pid < 1 ||
+    typeof processIdentity !== 'string' ||
+    !processIdentity ||
     typeof protocolVersion !== 'number' ||
     !Number.isSafeInteger(protocolVersion) ||
     protocolVersion < 1 ||
@@ -384,9 +386,18 @@ export class DaemonClient {
         }),
         signal: AbortSignal.timeout(250),
       })
-      const result = (await response.json()) as RpcResponse<{ protocolVersion: number }>
+      const result = (await response.json()) as RpcResponse<{
+        protocolVersion: number
+        pid: number
+        processIdentity: string
+      }>
       if (!result.ok) return result.error.code === 'protocol' ? 'incompatible' : 'unreachable'
       if (result.result.protocolVersion !== descriptor.protocolVersion) return 'incompatible'
+      if (
+        result.result.pid !== descriptor.pid ||
+        result.result.processIdentity !== descriptor.processIdentity
+      )
+        return 'unreachable'
       return descriptor.protocolVersion === DAEMON_PROTOCOL_VERSION ? 'healthy' : 'incompatible'
     } catch {
       return 'unreachable'

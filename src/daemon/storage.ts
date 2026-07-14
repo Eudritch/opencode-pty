@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
+import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
   type DaemonDescriptor,
@@ -25,6 +25,41 @@ class InvalidJournalError extends InvalidSessionError {}
 interface StartLock {
   token: string
   pid: number
+  processIdentity: string
+}
+
+export async function processStartIdentity(pid: number): Promise<string | null> {
+  if (!Number.isSafeInteger(pid) || pid < 1) return null
+  if (process.platform !== 'win32' && process.platform !== 'darwin') {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
+      const fields = stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .split(/\s+/)
+      return fields[19] ? `posix:${pid}:${fields[19]}` : null
+    } catch {
+      return null
+    }
+  }
+  const command =
+    process.platform === 'win32'
+      ? [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$process = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($process) { [Console]::Write("windows:${pid}:$($process.StartTime.ToFileTimeUtc())") }`,
+        ]
+      : ['ps', '-p', String(pid), '-o', 'lstart=']
+  try {
+    const child = Bun.spawn({ cmd: command, stdout: 'pipe', stderr: 'ignore' })
+    const output = (await new Response(child.stdout).text()).trim()
+    await child.exited
+    return output ? (process.platform === 'win32' ? output : `darwin:${pid}:${output}`) : null
+  } catch {
+    return null
+  }
 }
 
 const SESSION_STATUSES = new Set([
@@ -145,12 +180,13 @@ export class DaemonStorage {
     await this.writeAtomic(this.descriptorPath, JSON.stringify(descriptor))
   }
 
-  async removeDescriptor(token: string): Promise<void> {
+  async removeDescriptor(token: string, processIdentity: string): Promise<void> {
     const startLockToken = await this.acquireStartLock()
     if (!startLockToken) return
     try {
       const descriptor = await this.readDescriptor()
-      if (descriptor?.token === token) await rm(this.descriptorPath, { force: true })
+      if (descriptor?.token === token && descriptor.processIdentity === processIdentity)
+        await rm(this.descriptorPath, { force: true })
     } finally {
       await this.releaseStartLock(startLockToken)
     }
@@ -158,7 +194,11 @@ export class DaemonStorage {
 
   async descriptorOwnerAlive(): Promise<boolean> {
     const descriptor = await this.readDescriptor()
-    return descriptor ? this.processAlive(descriptor.pid) : false
+    if (!descriptor || !this.validDescriptor(descriptor)) return false
+    const identity = await processStartIdentity(descriptor.pid)
+    return identity
+      ? identity === descriptor.processIdentity
+      : this.authenticatedDescriptorHealthy(descriptor)
   }
 
   async ownershipSecret(): Promise<string> {
@@ -190,66 +230,70 @@ export class DaemonStorage {
 
   async acquireStartLock(): Promise<string | null> {
     await this.initialize()
-    const token = crypto.randomUUID()
-    try {
-      const handle = await open(this.startLockPath, 'wx', 0o600)
-      try {
-        await handle.writeFile(
-          JSON.stringify({ token, pid: process.pid } satisfies StartLock),
-          'utf8'
-        )
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-      await this.privateFile(this.startLockPath)
-      await this.syncDirectory(this.root)
-      return token
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      const lock = await this.readStartLock()
-      if (!lock || this.processAlive(lock.pid)) return null
-      if (!(await this.acquireStartLockRecovery())) return null
-      try {
-        const current = await this.readStartLock()
-        if (!current || this.processAlive(current.pid)) return null
-        await rm(this.startLockPath, { force: true })
-        await this.syncDirectory(this.root)
-        return this.acquireStartLock()
-      } finally {
-        await rm(this.startLockRecoveryPath, { force: true })
-      }
+    const lock = await this.newStartLock()
+    if (await this.writeExclusiveLock(this.startLockPath, lock)) {
+      return lock.token
     }
+    const current = await this.readStartLock()
+    if (current && (await this.startLockOwnerAlive(current))) return null
+    if (!(await this.acquireStartLockRecovery())) return null
+    try {
+      const replacement = await this.readStartLock()
+      if (replacement && (await this.startLockOwnerAlive(replacement))) return null
+      await rm(this.startLockPath, { force: true })
+      await this.syncDirectory(this.root)
+      const recoveredLock = await this.newStartLock()
+      if (await this.writeExclusiveLock(this.startLockPath, recoveredLock))
+        return recoveredLock.token
+      return null
+    } finally {
+      await rm(this.startLockRecoveryPath, { force: true })
+    }
+  }
+
+  private async newStartLock(): Promise<StartLock> {
+    const processIdentity = await processStartIdentity(process.pid)
+    if (!processIdentity) throw new Error('Unable to verify daemon process identity.')
+    return { token: crypto.randomUUID(), pid: process.pid, processIdentity }
   }
 
   async claimStartLock(token: string): Promise<boolean> {
     const lock = await this.readStartLock()
-    if (!lock || lock.token !== token) return false
-    await this.writeStartLock({ token, pid: process.pid })
+    const processIdentity = await processStartIdentity(process.pid)
+    if (!lock || lock.token !== token || lock.processIdentity !== processIdentity) return false
+    await this.writeStartLock({ token, pid: process.pid, processIdentity })
     return true
   }
 
   async releaseStartLock(token: string): Promise<void> {
     const lock = await this.readStartLock()
-    if (lock?.token === token && lock.pid === process.pid) {
+    const processIdentity = await processStartIdentity(process.pid)
+    if (
+      lock?.token === token &&
+      lock.pid === process.pid &&
+      lock.processIdentity === processIdentity
+    ) {
       await rm(this.startLockPath, { force: true })
       await this.syncDirectory(this.root)
     }
   }
 
-  private async readStartLock(): Promise<StartLock | null> {
+  private async readStartLock(path = this.startLockPath): Promise<StartLock | null> {
     try {
-      const value = JSON.parse(await readFile(this.startLockPath, 'utf8')) as Partial<StartLock>
-      const { token, pid } = value
+      const value = JSON.parse(await readFile(path, 'utf8')) as Partial<StartLock>
+      const { token, pid, processIdentity } = value
       return typeof token === 'string' &&
         token &&
         typeof pid === 'number' &&
         Number.isSafeInteger(pid) &&
-        pid > 0
+        pid > 0 &&
+        typeof processIdentity === 'string' &&
+        processIdentity
         ? (value as StartLock)
         : null
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if (error instanceof SyntaxError) return null
       throw error
     }
   }
@@ -259,38 +303,89 @@ export class DaemonStorage {
   }
 
   private async acquireStartLockRecovery(): Promise<boolean> {
+    const lock = await this.newStartLock()
+    if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
+      return true
+    }
+    const recovery = await this.readStartLock(this.startLockRecoveryPath)
+    if (recovery && (await this.startLockOwnerAlive(recovery))) return false
+    await rm(this.startLockRecoveryPath, { force: true })
+    return this.acquireStartLockRecovery()
+  }
+
+  private async writeExclusiveLock(path: string, lock: StartLock): Promise<boolean> {
+    const temporary = join(this.root, `.${START_LOCK_FILE}.${crypto.randomUUID()}`)
+    const handle = await open(temporary, 'wx', 0o600)
     try {
-      const handle = await open(this.startLockRecoveryPath, 'wx', 0o600)
-      try {
-        await handle.writeFile(String(process.pid), 'utf8')
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-      await this.privateFile(this.startLockRecoveryPath)
+      await handle.writeFile(JSON.stringify(lock), 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    try {
+      await this.privateFile(temporary)
+      await link(temporary, path)
+      await this.syncDirectory(this.root)
       return true
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        let pid: number | null = null
-        try {
-          pid = Number.parseInt(await readFile(this.startLockRecoveryPath, 'utf8'), 10)
-        } catch (readError) {
-          if ((readError as NodeJS.ErrnoException).code !== 'ENOENT') throw readError
-        }
-        if (pid && this.processAlive(pid)) return false
-        await rm(this.startLockRecoveryPath, { force: true })
-        return this.acquireStartLockRecovery()
-      }
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
       throw error
+    } finally {
+      await unlink(temporary).catch(() => undefined)
     }
   }
 
-  private processAlive(pid: number): boolean {
+  private async startLockOwnerAlive(lock: StartLock): Promise<boolean> {
+    const identity = await processStartIdentity(lock.pid)
+    return identity ? identity === lock.processIdentity : this.processExists(lock.pid)
+  }
+
+  private processExists(pid: number): boolean {
     try {
       process.kill(pid, 0)
       return true
     } catch (error) {
       return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+    }
+  }
+  private validDescriptor(value: DaemonDescriptor): boolean {
+    return (
+      Number.isSafeInteger(value.pid) &&
+      value.pid > 0 &&
+      typeof value.processIdentity === 'string' &&
+      Boolean(value.processIdentity) &&
+      typeof value.endpoint === 'string' &&
+      typeof value.token === 'string' &&
+      Boolean(value.token)
+    )
+  }
+
+  private async authenticatedDescriptorHealthy(descriptor: DaemonDescriptor): Promise<boolean> {
+    try {
+      const response = await fetch(`${descriptor.endpoint}/rpc`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${descriptor.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          id: crypto.randomUUID(),
+          version: descriptor.protocolVersion,
+          operation: 'health',
+        }),
+        signal: AbortSignal.timeout(250),
+      })
+      const result = (await response.json()) as {
+        ok?: boolean
+        result?: { pid?: unknown; processIdentity?: unknown }
+      }
+      return (
+        result.ok === true &&
+        result.result?.pid === descriptor.pid &&
+        result.result.processIdentity === descriptor.processIdentity
+      )
+    } catch {
+      return false
     }
   }
 

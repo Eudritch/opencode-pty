@@ -7,7 +7,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from './types.ts'
-import type { DaemonStorage } from './storage.ts'
+import { processStartIdentity, type DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
 import { effectiveMaxOutputBytes } from './supervisor.ts'
 import { realpathSync } from 'node:fs'
@@ -32,6 +32,7 @@ export class DaemonServer implements Disposable {
   private readonly inputUsage = new Map<string, { startedAt: number; bytes: number }>()
   private readonly pendingSessions = new Map<string, number>()
   private ownershipSecret = ''
+  private processIdentity = ''
 
   constructor(
     private readonly storage: DaemonStorage,
@@ -44,6 +45,8 @@ export class DaemonServer implements Disposable {
   async start(): Promise<DaemonDescriptor> {
     await this.supervisor.initialize()
     this.ownershipSecret = await this.storage.ownershipSecret()
+    this.processIdentity = (await processStartIdentity(process.pid)) ?? ''
+    if (!this.processIdentity) throw new Error('Unable to verify daemon process identity.')
     this.token ||= crypto.randomUUID().replaceAll('-', '')
     const startLockToken = this.startLockToken ?? (await this.storage.acquireStartLock())
     if (!startLockToken || !(await this.storage.claimStartLock(startLockToken))) {
@@ -60,6 +63,7 @@ export class DaemonServer implements Disposable {
     })
     const descriptor = {
       pid: process.pid,
+      processIdentity: this.processIdentity,
       endpoint: this.server.url.origin,
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       token: this.token,
@@ -80,7 +84,7 @@ export class DaemonServer implements Disposable {
     this.server?.stop()
     await this.supervisor.shutdown?.(false)
     await this.supervisor.flush()
-    await this.storage.removeDescriptor(this.token)
+    await this.storage.removeDescriptor(this.token, this.processIdentity)
   }
 
   [Symbol.dispose](): void {
@@ -183,7 +187,11 @@ export class DaemonServer implements Disposable {
   private async dispatch(request: RpcRequest): Promise<unknown> {
     if (request.operation === 'health') {
       this.onlyFields(this.objectPayload(request.payload ?? {}), [])
-      return { protocolVersion: DAEMON_PROTOCOL_VERSION, pid: process.pid }
+      return {
+        protocolVersion: DAEMON_PROTOCOL_VERSION,
+        pid: process.pid,
+        processIdentity: this.processIdentity,
+      }
     }
     if (request.operation === 'diagnostics') {
       const owner = this.owner(request)

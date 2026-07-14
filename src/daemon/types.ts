@@ -191,6 +191,7 @@ export interface OutputChunk {
 
 export interface DaemonDescriptor {
   pid: number
+  processIdentity: string
   endpoint: string
   protocolVersion: number
   token: string
