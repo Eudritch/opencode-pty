@@ -264,10 +264,14 @@ export class SessionSupervisor {
         record.status === 'stopping'
       ) {
         if (record.mode === 'exec' && record.worker) {
-          const worker = await NativeWorkerClient.reconnect(
-            join(this.storage.rootDirectory, 'sessions', record.id),
-            record.worker
-          )
+          let worker: WorkerClient | null = null
+          for (let attempt = 0; attempt < 30 && !worker; attempt += 1) {
+            worker = await NativeWorkerClient.reconnect(
+              join(this.storage.rootDirectory, 'sessions', record.id),
+              record.worker
+            )
+            if (!worker) await Bun.sleep(100)
+          }
           if (worker) {
             this.nativeWorkers.set(record.id, worker)
             this.records.set(record.id, record)
@@ -751,25 +755,46 @@ export class SessionSupervisor {
       stderrTruncated: result.stderrTruncated,
     }
     record.status =
-      result.status === 'running' ? 'running' : result.timedOut ? 'timed_out' : 'exited'
-    record.exitCode = result.exitCode
-    record.terminationConfirmed = result.status === 'exited'
-    record.exitReason = record.terminationConfirmed
-      ? this.exitReason(result.exitCode ?? null)
-      : { kind: 'unknown' }
+      result.status === 'lost'
+        ? 'lost'
+        : result.status === 'running'
+          ? 'running'
+          : result.exitReason === 'output_limit'
+            ? 'output_limited'
+            : result.timedOut
+              ? 'timed_out'
+              : 'exited'
+    record.exitCode = result.exitCode ?? undefined
+    record.exitSignal = result.exitSignal ?? undefined
+    record.terminationRequested = result.terminationRequested
+    record.terminationConfirmed = result.terminationConfirmed
+    if (result.storageFailure) record.exitReason = { kind: 'unknown' }
+    else if (result.exitReason === 'timeout') record.exitReason = { kind: 'timeout' }
+    else if (result.exitReason === 'output_limit') record.exitReason = { kind: 'output_limit' }
+    else if (result.exitReason === 'stopped') record.exitReason = { kind: 'stopped' }
+    else if (result.exitReason?.startsWith('signal:'))
+      record.exitReason = {
+        kind: 'signal',
+        signal: result.exitSignal ?? result.exitReason.slice(7),
+      }
+    else if (record.terminationConfirmed)
+      record.exitReason = this.exitReason(result.exitCode ?? null, result.exitSignal ?? undefined)
+    else record.exitReason = { kind: 'unknown' }
     record.exitedAt = result.exitedAt
     record.updatedAt = new Date().toISOString()
     await this.storage.writeSession(record)
-    if (record.terminationConfirmed) {
-      const worker = this.nativeWorkers.get(record.id)
-      this.nativeWorkers.delete(record.id)
-      void worker?.stop().catch(() => undefined)
+    if (result.storageFailure) {
+      const error = new Error(`Native worker output storage failed: ${result.storageFailure}`)
+      Object.assign(error, { code: 'ESTORAGE' })
+      throw error
     }
+    // Keep terminal workers reachable for snapshots until cleanup/final shutdown.
     return {
       session: { id: record.id, status: record.status, mode: 'exec', pid: record.pid },
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: record.exitCode,
+      exitSignal: record.exitSignal,
       timedOut: record.timedOut,
       outputLimited: record.outputTruncated,
       terminationConfirmed: record.terminationConfirmed,
@@ -917,6 +942,9 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     if (!record || !this.isTerminal(record)) return false
     await this.storage.deleteSession(id)
+    const worker = this.nativeWorkers.get(id)
+    this.nativeWorkers.delete(id)
+    void worker?.shutdown().catch(() => undefined)
     this.records.delete(id)
     return true
   }
@@ -934,7 +962,7 @@ export class SessionSupervisor {
             record.ownerProjectDirectory === projectDirectory &&
             record.ownerCapabilityHash === capabilityHash &&
             record.lifecycle === 'conversation' &&
-            this.active.has(record.id)
+            (this.active.has(record.id) || this.nativeWorkers.has(record.id))
         )
         .map((record) => this.stop(record.id))
     )
@@ -945,10 +973,11 @@ export class SessionSupervisor {
     await this.persistQueue
   }
 
-  async shutdown(): Promise<void> {
-    await Promise.all(
-      [...this.nativeWorkers.values()].map((worker) => worker.stop().catch(() => undefined))
-    )
+  async shutdown(final = false): Promise<void> {
+    if (final)
+      await Promise.all(
+        [...this.nativeWorkers.values()].map((worker) => worker.shutdown().catch(() => undefined))
+      )
   }
 
   private async timeout(id: string): Promise<void> {

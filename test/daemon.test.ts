@@ -1032,6 +1032,137 @@ test('native worker authenticates, owns exec output, and redacts its descriptor 
   }
 })
 
+test('native worker persists ISO journal output, survives daemon restart, and handles concurrent stop', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-integration-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  try {
+    await stat(workerPath)
+  } catch {
+    console.warn('Skipping native worker integration: Rust worker has not been built.')
+    return
+  }
+  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-owner', root)
+  const first = new DaemonServer(storage, new SessionSupervisor(storage), 'native-first')
+  let restarted: DaemonServer | undefined
+  try {
+    const id = 'exec_native_restart'
+    const started = await WorkerClient.start({
+      command: process.execPath,
+      args: ['-e', "console.log('native-journal'); setTimeout(() => {}, 10000)"],
+      workdir: root,
+      env: process.env as Record<string, string>,
+      redactionSecrets: [],
+      sessionDirectory: join(root, 'sessions', id),
+      timeoutSeconds: 8,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    const native = {
+      ...record(root, id),
+      mode: 'exec' as const,
+      pid: started.reference.pid,
+      worker: started.reference,
+    }
+    native.ownerCapabilityHash = context.capability
+    native.parentSessionId = context.parentSessionId
+    await storage.writeSession(native)
+    await first.start()
+    await first.stop()
+    restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-second')
+    const secondDescriptor = await restarted.start()
+    const waiting = started.client.wait(3000)
+    const stopped = await rpc(secondDescriptor, 'stop', { id }, context)
+    expect((await stopped.json()) as { result: { terminationConfirmed: boolean } }).toMatchObject({
+      result: { terminationConfirmed: true },
+    })
+    const details = await rpc(secondDescriptor, 'get', { id }, context)
+    expect(
+      (await details.json()) as { result: { status: string; terminationConfirmed: boolean } }
+    ).toMatchObject({ result: { status: 'exited', terminationConfirmed: true } })
+    await expect(waiting).resolves.toMatchObject({ status: 'exited', terminationConfirmed: true })
+    const chunks = await storage.readOutputChunks(id)
+    expect(chunks.map((chunk) => chunk.data).join('')).toContain('native-journal')
+    expect(chunks.every((chunk) => /^\d{4}-\d{2}-\d{2}T.*Z$/.test(chunk.timestamp))).toBeTrue()
+    await Bun.sleep(100)
+  } finally {
+    await restarted?.stop()
+    await first.stop().catch(() => undefined)
+    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+})
+
+test('native worker enforces timeout and output cap without the daemon', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-limits-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  try {
+    await stat(workerPath)
+  } catch {
+    console.warn('Skipping native worker integration: Rust worker has not been built.')
+    return
+  }
+  const previous = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  try {
+    const timeout = await WorkerClient.start({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 10000)'],
+      workdir: root,
+      env: process.env as Record<string, string>,
+      redactionSecrets: [],
+      sessionDirectory: join(root, 'sessions', 'timeout'),
+      timeoutSeconds: 1,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    await expect(timeout.client.wait(3000)).resolves.toMatchObject({
+      status: 'exited',
+      timedOut: true,
+      terminationConfirmed: true,
+      exitReason: 'timeout',
+    })
+    const limited = await WorkerClient.start({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('x'.repeat(4096)); setTimeout(() => {}, 10000)"],
+      workdir: root,
+      env: process.env as Record<string, string>,
+      redactionSecrets: [],
+      sessionDirectory: join(root, 'sessions', 'limited'),
+      timeoutSeconds: 8,
+      maxOutputBytes: 64,
+      mode: 'exec',
+    })
+    await expect(limited.client.wait(3000)).resolves.toMatchObject({
+      status: 'exited',
+      outputTruncated: true,
+      terminationConfirmed: true,
+      exitReason: 'output_limit',
+    })
+  } finally {
+    if (previous === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previous
+  }
+})
+
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
   expect(escapeXml(`ok\u0000\u001f\ud800😀`)).toBe('ok���😀')

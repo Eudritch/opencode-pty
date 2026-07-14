@@ -369,6 +369,7 @@ export class DaemonStorage {
         (value.kind === 'signal' && validText(value.signal)) ||
         ((value.kind === 'timeout' || value.kind === 'output_limit') &&
           (value.message === undefined || validText(value.message))) ||
+        value.kind === 'stopped' ||
         (value.kind === 'spawn_error' && validText(value.message)) ||
         value.kind === 'unknown'
       )

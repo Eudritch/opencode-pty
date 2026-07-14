@@ -136,7 +136,7 @@ export class WorkerClient {
   }
 
   async wait(timeoutMs: number): Promise<WorkerSnapshot> {
-    return this.call('wait', { timeoutMs })
+    return this.call('wait', { timeoutMs }, timeoutMs + 5000)
   }
 
   async write(data: string): Promise<{ acceptedBytes: number }> {
@@ -147,7 +147,15 @@ export class WorkerClient {
     return this.call('stop')
   }
 
-  private async call<T>(operation: string, payload: Record<string, unknown> = {}): Promise<T> {
+  async shutdown(): Promise<void> {
+    await this.call('shutdown')
+  }
+
+  private async call<T>(
+    operation: string,
+    payload: Record<string, unknown> = {},
+    timeoutMs = 5000
+  ): Promise<T> {
     const response = await fetch(`${this.descriptor.endpoint}/rpc`, {
       method: 'POST',
       headers: {
@@ -155,7 +163,7 @@ export class WorkerClient {
         'content-type': 'application/json',
       },
       body: JSON.stringify({ operation, ...payload }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     const body = (await response.json()) as { ok: boolean; result?: T; error?: { message: string } }
     if (!body.ok || body.result === undefined)
@@ -172,7 +180,7 @@ export class WorkerClient {
 }
 
 export interface WorkerSnapshot {
-  status: 'running' | 'exited'
+  status: 'running' | 'exited' | 'lost'
   pid: number
   stdout: string
   stderr: string
@@ -183,8 +191,19 @@ export interface WorkerSnapshot {
   nextSequence: number
   firstRetainedSequence: number
   outputTruncated: boolean
-  exitCode?: number
+  exitCode?: number | null
+  exitSignal?: string | null
+  exitReason?:
+    | 'code'
+    | `signal:${string}`
+    | 'timeout'
+    | 'output_limit'
+    | 'stopped'
+    | 'storage_failure'
   startedAt: string
   exitedAt?: string
   timedOut: boolean
+  terminationRequested: boolean
+  terminationConfirmed: boolean
+  storageFailure?: string
 }

@@ -6,6 +6,7 @@ export type ExitReason =
   | { kind: 'code'; code: number }
   | { kind: 'signal'; signal: string }
   | { kind: 'timeout'; message?: string }
+  | { kind: 'stopped' }
   | { kind: 'spawn_error'; message: string }
   | { kind: 'output_limit'; message?: string }
   | { kind: 'unknown' }
