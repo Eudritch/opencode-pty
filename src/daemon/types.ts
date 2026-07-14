@@ -1,4 +1,4 @@
-export const DAEMON_PROTOCOL_VERSION = 1
+export const DAEMON_PROTOCOL_VERSION = 2
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
@@ -7,6 +7,7 @@ export type ExitReason =
   | { kind: 'signal'; signal: string }
   | { kind: 'timeout'; message?: string }
   | { kind: 'spawn_error'; message: string }
+  | { kind: 'output_limit' }
   | { kind: 'unknown' }
 
 export type DaemonStatus =
@@ -17,6 +18,33 @@ export type DaemonStatus =
   | 'timed_out'
   | 'lost'
   | 'spawn_failed'
+  | 'output_limited'
+
+export type ExecutionMode = 'pty' | 'exec'
+
+export type WaitCondition = { kind: 'exit' } | { kind: 'output'; literal?: string; regex?: string }
+
+export interface WaitResult {
+  satisfied: boolean
+  reason: 'output' | 'exit' | 'deadline'
+  observedAt: string
+  matched?: string
+  exitCode?: number
+  exitSignal?: number | string
+  outputTruncated: boolean
+}
+
+export interface ExecResult {
+  session: { id: string; status: DaemonStatus; mode: 'exec'; pid: number }
+  stdout: string
+  stderr: string
+  exitCode?: number
+  exitSignal?: number | string
+  timedOut: boolean
+  outputLimited: boolean
+  startedAt: string
+  exitedAt: string
+}
 
 export interface SessionRecord {
   id: string
@@ -24,11 +52,17 @@ export interface SessionRecord {
   description?: string
   command: string
   args: string[]
+  mode: ExecutionMode
+  name?: string
+  idempotencyKey?: string
   workdir: string
   env?: Record<string, string>
   status: DaemonStatus
   pid: number
   createdAt: string
+  startedAt?: string
+  exitedAt?: string
+  lastOutputAt?: string
   updatedAt: string
   parentSessionId: string
   parentAgent?: string
@@ -46,6 +80,7 @@ export interface SessionRecord {
   lineCount: number
   outputHasPartialLine: boolean
   outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
+  lastWaitResult?: WaitResult
 }
 
 export interface OutputChunk {

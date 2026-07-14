@@ -2,8 +2,11 @@ import type { ReadResult, SearchResult, SpawnOptions, PTYSessionInfo } from './t
 import {
   DAEMON_PROTOCOL_VERSION,
   type DaemonDescriptor,
+  type ExecResult,
   type RpcResponse,
   type StopResult,
+  type WaitCondition,
+  type WaitResult,
   type WriteResult,
 } from '../../daemon/types.ts'
 import { DaemonStorage } from '../../daemon/storage.ts'
@@ -50,6 +53,27 @@ export class DaemonClient {
     return this.call('spawn', options)
   }
 
+  async exec(options: SpawnOptions & { maxOutputBytes?: number }): Promise<ExecResult> {
+    return this.call('exec', options, requestTimeout(options.timeoutSeconds ?? 0))
+  }
+
+  async wait(id: string, condition: WaitCondition, timeoutSeconds: number): Promise<WaitResult> {
+    return this.call('wait', { id, condition, timeoutSeconds }, requestTimeout(timeoutSeconds))
+  }
+
+  async sendWait(
+    id: string,
+    data: string,
+    condition: WaitCondition,
+    timeoutSeconds: number
+  ): Promise<WaitResult> {
+    return this.call(
+      'sendWait',
+      { id, data, condition, timeoutSeconds },
+      requestTimeout(timeoutSeconds)
+    )
+  }
+
   async write(id: string, data: string): Promise<WriteResult> {
     return this.call('write', { id, data })
   }
@@ -93,7 +117,11 @@ export class DaemonClient {
     await this.call('cleanupByParentSession', { parentSessionId })
   }
 
-  private async call<T>(operation: string, payload?: unknown): Promise<T> {
+  private async call<T>(
+    operation: string,
+    payload?: unknown,
+    timeout = START_TIMEOUT_MS
+  ): Promise<T> {
     const descriptor = await this.ensureDaemon()
     const response = await fetch(`${descriptor.endpoint}/rpc`, {
       method: 'POST',
@@ -107,7 +135,7 @@ export class DaemonClient {
         operation,
         payload,
       }),
-      signal: AbortSignal.timeout(START_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeout),
     })
     const result = (await response.json()) as RpcResponse<T>
     if (!result.ok) throw new Error(result.error.message)
@@ -218,4 +246,8 @@ export class DaemonClient {
       `PTY daemon protocol ${descriptor.protocolVersion} is incompatible with client protocol ${DAEMON_PROTOCOL_VERSION}.`
     )
   }
+}
+
+function requestTimeout(timeoutSeconds: number): number {
+  return timeoutSeconds * 1000 + START_TIMEOUT_MS
 }

@@ -1,18 +1,18 @@
-Terminates a PTY session and optionally cleans up its buffer.
+Requests termination of a PTY session and optionally removes a confirmed-exited record.
 
 Use this tool to:
-- Stop a running process (sends SIGTERM)
-- Clean up an exited session to free memory
+- Stop a running process
+- Clean up a confirmed-exited session
 - Remove a session from the list
 
 Usage:
 - `id`: The PTY session ID (from pty_spawn or pty_list)
-- `cleanup`: If true, removes the session and frees the buffer (default: false)
+- `cleanup`: If true, removes the record only after termination is confirmed (default: false)
 
 Behavior:
-- If the session is running, it will be killed (status becomes "killed")
-- If cleanup=false (default), the session remains in the list with its output buffer intact
-- If cleanup=true, the session is removed entirely and the buffer is freed
+- A stop request is not proof that the process has exited. Check `Termination confirmed` in the response.
+- If cleanup=false (default), the session remains in the list with its persisted output intact.
+- If cleanup=true, an unconfirmed session remains until a later cleanup call.
 - Keeping sessions without cleanup allows you to compare logs between runs
 
 Tips:

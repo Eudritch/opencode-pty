@@ -5,7 +5,7 @@
   "module": "dist/index.js",
   "version": "0.3.6",
   "description": "OpenCode plugin for interactive PTY management - run background processes, send input, read output with regex filtering",
-  "author": "shekohex",
+  "author": "Eudritch",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -21,53 +21,32 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shekohex/opencode-pty.git"
+    "url": "git+https://github.com/Eudritch/opencode-pty.git"
   },
   "bugs": {
-    "url": "https://github.com/shekohex/opencode-pty/issues"
+    "url": "https://github.com/Eudritch/opencode-pty/issues"
   },
-  "homepage": "https://github.com/shekohex/opencode-pty#readme",
+  "homepage": "https://github.com/Eudritch/opencode-pty#readme",
   "files": [
     "dist"
   ],
   "license": "MIT",
   "type": "module",
   "exports": {
-    "./server": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    },
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    },
-    "./*": {
-      "types": "./dist/src/*.d.ts",
-      "default": "./dist/src/*.js"
-    },
-    "./*/*": {
-      "types": "./dist/src/*/*.d.ts",
-      "default": "./dist/src/*/*.js"
-    },
-    "./*/*/*": {
-      "types": "./dist/src/*/*/*.d.ts",
-      "default": "./dist/src/*/*/*.js"
-    },
-    "./*/*/*/*": {
-      "types": "./dist/src/*/*/*/*.d.ts",
-      "default": "./dist/src/*/*/*/*.js"
     }
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "unittest": "bun test",
-    "test:e2e": "PW_DISABLE_TS_ESM=1 NODE_ENV=test bun --bun playwright test",
-    "test:all": "bun unittest && bun test:e2e",
+    "test:all": "bun unittest",
     "build:plugin": "tsc -p tsconfig.build.json && bun x copyfiles -u 0 \"src/**/*.txt\" dist",
-    "build:dev": "bun clean && bun build:plugin && vite build --mode development",
-    "build:prod": "bun clean && bun build:plugin && vite build --mode production",
+    "build:dev": "bun clean && bun build:plugin",
+    "build:prod": "bun clean && bun build:plugin",
     "prepack": "bun build:prod",
-    "clean": "rm -rf dist playwright-report test-results",
+    "clean": "rm -rf dist",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",
     "format": "biome format .",
@@ -75,22 +54,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.3.13",
-    "@playwright/test": "1.57.0",
     "@types/bun": "^1.3.8",
-    "@types/jsdom": "^27.0.0",
-    "@types/react": "^18.3.27",
-    "@types/react-dom": "^18.3.7",
-    "@vitejs/plugin-react": "^4.7.0",
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/addon-serialize": "^0.14.0",
-    "@xterm/xterm": "^6.0.0",
-    "happy-dom": "^20.5.0",
-    "jsdom": "^27.4.0",
-    "playwright-core": "1.57.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "typescript": "^5.9.3",
-    "vite": "^7.3.1"
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -101,7 +66,6 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.3.13",
     "@opencode-ai/sdk": "^1.3.13",
-    "bun-pty": "^0.4.10",
-    "open": "^11.0.0"
+    "bun-pty": "^0.4.10"
   }
 }

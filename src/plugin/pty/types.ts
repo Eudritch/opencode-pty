@@ -1,4 +1,4 @@
-import type { ExitReason } from '../../daemon/types.ts'
+import type { ExecutionMode, ExitReason, WaitResult } from '../../daemon/types.ts'
 
 export type PTYStatus =
   | 'starting'
@@ -8,6 +8,7 @@ export type PTYStatus =
   | 'timed_out'
   | 'lost'
   | 'spawn_failed'
+  | 'output_limited'
 
 export interface PTYSessionInfo {
   id: string
@@ -15,6 +16,9 @@ export interface PTYSessionInfo {
   description?: string
   command: string
   args: string[]
+  mode: ExecutionMode
+  name?: string
+  idempotencyKey?: string
   workdir: string
   status: PTYStatus
   timeoutSeconds?: number
@@ -26,10 +30,13 @@ export interface PTYSessionInfo {
   exitReason?: ExitReason
   pid: number
   createdAt: string
+  startedAt?: string
+  exitedAt?: string
   lineCount: number
   outputSequence?: number
   firstRetainedSequence?: number
   outputTruncated?: boolean
+  lastWaitResult?: WaitResult
 }
 
 export interface SpawnOptions {
@@ -42,6 +49,8 @@ export interface SpawnOptions {
   parentSessionId: string
   parentAgent?: string
   timeoutSeconds?: number
+  name?: string
+  idempotencyKey?: string
 }
 
 export interface ReadResult {

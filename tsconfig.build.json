@@ -12,5 +12,5 @@
     "rewriteRelativeImportExtensions": true
   },
   "include": ["index.ts", "src/**/*.ts"],
-  "exclude": ["src/web/client/**", "**/*.test.ts", "**/*.spec.ts"]
+  "exclude": ["**/*.test.ts", "**/*.spec.ts"]
 }

@@ -116,12 +116,33 @@ export class DaemonServer implements Disposable {
         return { protocolVersion: DAEMON_PROTOCOL_VERSION, pid: process.pid }
       case 'spawn':
         return this.supervisor.spawn(this.spawnPayload(request.payload))
+      case 'exec':
+        return this.supervisor.exec(this.execPayload(request.payload))
       case 'write': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'data'])
         const id = this.requiredString(payload, 'id')
         const data = this.requiredString(payload, 'data')
         return this.supervisor.write(id, data)
+      }
+      case 'wait': {
+        const payload = this.objectPayload(request.payload)
+        this.onlyFields(payload, ['id', 'condition', 'timeoutSeconds'])
+        return this.supervisor.wait(
+          this.requiredString(payload, 'id'),
+          this.waitCondition(payload.condition),
+          this.requiredPositiveInteger(payload, 'timeoutSeconds')
+        )
+      }
+      case 'sendWait': {
+        const payload = this.objectPayload(request.payload)
+        this.onlyFields(payload, ['id', 'data', 'condition', 'timeoutSeconds'])
+        return this.supervisor.sendWait(
+          this.requiredString(payload, 'id'),
+          this.requiredString(payload, 'data'),
+          this.waitCondition(payload.condition),
+          this.requiredPositiveInteger(payload, 'timeoutSeconds')
+        )
       }
       case 'read': {
         const payload = this.objectPayload(request.payload)
@@ -239,6 +260,12 @@ export class DaemonServer implements Disposable {
     return value as number
   }
 
+  private requiredPositiveInteger(payload: Record<string, unknown>, key: string): number {
+    const value = this.optionalNonnegativeInteger(payload, key)
+    if (!value) throw new ValidationError(`RPC field '${key}' must be positive.`)
+    return value
+  }
+
   private optionalSequence(payload: Record<string, unknown>, key: string): number | undefined {
     const value = payload[key]
     if (value === undefined) return undefined
@@ -268,6 +295,8 @@ export class DaemonServer implements Disposable {
       'parentSessionId',
       'parentAgent',
       'timeoutSeconds',
+      'name',
+      'idempotencyKey',
     ])
     const args = value.args
     if (
@@ -318,7 +347,66 @@ export class DaemonServer implements Disposable {
       parentSessionId: this.requiredString(value, 'parentSessionId'),
       parentAgent: this.optionalString(value, 'parentAgent'),
       timeoutSeconds,
+      name: this.optionalString(value, 'name'),
+      idempotencyKey: this.optionalString(value, 'idempotencyKey'),
     }
+  }
+
+  private execPayload(payload: unknown): Parameters<SessionSupervisor['exec']>[0] {
+    const value = this.objectPayload(payload)
+    this.onlyFields(value, [
+      'command',
+      'args',
+      'description',
+      'workdir',
+      'env',
+      'title',
+      'parentSessionId',
+      'parentAgent',
+      'timeoutSeconds',
+      'maxOutputBytes',
+    ])
+    const { maxOutputBytes: ignoredMaxOutputBytes, ...spawnValue } = value
+    const spawn = this.spawnPayload(spawnValue)
+    const maxOutputBytes = this.optionalBoundedInteger(value, 'maxOutputBytes', MAX_REQUEST_BYTES)
+    if (maxOutputBytes === 0)
+      throw new ValidationError("RPC field 'maxOutputBytes' must be positive.")
+    return { ...spawn, maxOutputBytes }
+  }
+
+  private waitCondition(
+    value: unknown
+  ): { kind: 'exit' } | { kind: 'output'; literal?: string; regex?: string } {
+    const condition = this.objectPayload(value)
+    const kind = this.requiredString(condition, 'kind')
+    if (kind === 'exit') {
+      this.onlyFields(condition, ['kind'])
+      return { kind }
+    }
+    if (kind !== 'output')
+      throw new ValidationError("wait condition kind must be 'output' or 'exit'.")
+    this.onlyFields(condition, ['kind', 'literal', 'regex'])
+    const literal = this.optionalString(condition, 'literal')
+    const regex = this.optionalString(condition, 'regex')
+    if (Boolean(literal) === Boolean(regex)) {
+      throw new ValidationError('Output wait requires exactly one of literal or regex.')
+    }
+    return { kind, literal, regex }
+  }
+
+  private optionalBoundedInteger(
+    payload: Record<string, unknown>,
+    key: string,
+    maximum: number
+  ): number | undefined {
+    const value = payload[key]
+    if (value === undefined) return undefined
+    if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > maximum) {
+      throw new ValidationError(
+        `RPC field '${key}' must be a non-negative integer within the size limit.`
+      )
+    }
+    return value as number
   }
 
   private isStorageError(error: unknown): boolean {

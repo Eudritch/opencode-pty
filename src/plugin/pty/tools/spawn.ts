@@ -1,16 +1,7 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
-import { checkCommandPermission, checkWorkdirPermission } from '../permissions.ts'
+import { authorizeSpawn } from '../permissions.ts'
 import DESCRIPTION from './spawn.txt'
-
-const NOTIFY_ON_EXIT_INSTRUCTIONS = [
-  `<system_reminder>`,
-  `Completion signal for this session is the future \`<pty_exited>\` message.`,
-  `If you only need to know whether the command finished, do not call \`pty_read\`; wait for \`<pty_exited>\`.`,
-  `Never use sleep plus \`pty_read\` loops to check completion for this session.`,
-  `Call \`pty_read\` before exit only if you need live output now, the user explicitly asks for logs, or the exit notification reports a non-zero status and you need to investigate.`,
-  `</system_reminder>`,
-].join('\n')
 
 export const ptySpawn = tool({
   description: DESCRIPTION,
@@ -29,35 +20,43 @@ export const ptySpawn = tool({
     notifyOnExit: tool.schema
       .boolean()
       .optional()
-      .describe(
-        'If true, sends a notification to the session when the process exits (default: false)'
-      ),
+      .describe('Unsupported by the durable daemon; omit this option'),
     timeoutSeconds: tool.schema
       .number()
       .optional()
       .describe(
         'Optional per-session timeout in seconds. The PTY is killed automatically when this duration elapses.'
       ),
+    name: tool.schema
+      .string()
+      .optional()
+      .describe('Optional stable name, scoped to this OpenCode session and workdir'),
+    idempotencyKey: tool.schema
+      .string()
+      .optional()
+      .describe('Reuse the matching active named PTY; a changed command or spec is rejected'),
   },
   async execute(args, ctx) {
-    await checkCommandPermission(args.command, args.args ?? [])
-
-    if (args.workdir) {
-      await checkWorkdirPermission(args.workdir)
+    if (args.notifyOnExit) {
+      throw new Error(
+        'notifyOnExit is not supported by the durable daemon. Use pty_list or pty_read.'
+      )
     }
+    const workdir = await authorizeSpawn(args.command, args.args ?? [], args.workdir)
 
     const sessionId = ctx.sessionID
-    const info = manager.spawn({
+    const info = await manager.spawn({
       command: args.command,
       args: args.args,
-      workdir: args.workdir,
+      workdir,
       env: args.env,
       title: args.title,
       description: args.description,
       parentSessionId: sessionId,
       parentAgent: ctx.agent,
-      notifyOnExit: args.notifyOnExit,
       timeoutSeconds: args.timeoutSeconds,
+      name: args.name,
+      idempotencyKey: args.idempotencyKey,
     })
 
     const output = [
@@ -68,10 +67,9 @@ export const ptySpawn = tool({
       `Workdir: ${info.workdir}`,
       `PID: ${info.pid}`,
       `Status: ${info.status}`,
-      `NotifyOnExit: ${info.notifyOnExit}`,
       `TimeoutSeconds: ${info.timeoutSeconds ?? 'none'}`,
+      `Mode: ${info.mode}`,
       `</pty_spawned>`,
-      ...(info.notifyOnExit ? ['', NOTIFY_ON_EXIT_INSTRUCTIONS] : []),
     ].join('\n')
 
     return output

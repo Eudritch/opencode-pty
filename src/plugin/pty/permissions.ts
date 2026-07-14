@@ -1,5 +1,7 @@
 import type { PluginClient } from '../types.ts'
 import { allStructured } from './wildcard.ts'
+import { realpath } from 'node:fs/promises'
+import { relative } from 'node:path'
 
 type PermissionAction = 'allow' | 'ask' | 'deny'
 type BashPermissions = PermissionAction | Record<string, PermissionAction>
@@ -19,16 +21,16 @@ export function initPermissions(client: PluginClient, directory: string): void {
 
 async function getPermissionConfig(): Promise<PermissionConfig> {
   if (!_client) {
-    return {}
+    throw new Error('PTY spawn denied: permission configuration is unavailable.')
   }
   try {
     const response = await _client.config.get()
     if (response.error || !response.data) {
-      return {}
+      throw new Error('PTY spawn denied: permission configuration is unavailable.')
     }
     return (response.data as { permission?: PermissionConfig }).permission ?? {}
   } catch {
-    return {}
+    throw new Error('PTY spawn denied: permission configuration is unavailable.')
   }
 }
 
@@ -88,16 +90,21 @@ export async function checkCommandPermission(command: string, args: string[]): P
   }
 }
 
-export async function checkWorkdirPermission(workdir: string): Promise<void> {
+export async function checkWorkdirPermission(workdir?: string): Promise<string> {
   if (!_directory) {
-    return
+    throw new Error('PTY spawn denied: project directory is unavailable.')
   }
-
-  const normalizedWorkdir = workdir.replace(/\/$/, '')
-  const normalizedProject = _directory.replace(/\/$/, '')
-
-  if (normalizedWorkdir.startsWith(normalizedProject)) {
-    return
+  const requestedWorkdir = workdir ?? _directory
+  let resolvedPaths: [string, string]
+  try {
+    resolvedPaths = await Promise.all([realpath(requestedWorkdir), realpath(_directory)])
+  } catch {
+    return denyWithToast('PTY spawn denied: unable to verify the working directory.')
+  }
+  const [resolvedWorkdir, resolvedProject] = resolvedPaths
+  const pathToWorkdir = relative(resolvedProject, resolvedWorkdir)
+  if (pathToWorkdir === '' || (!pathToWorkdir.startsWith('..') && !pathToWorkdir.includes(':'))) {
+    return resolvedWorkdir
   }
 
   const config = await getPermissionConfig()
@@ -110,6 +117,19 @@ export async function checkWorkdirPermission(workdir: string): Promise<void> {
   }
 
   if (extDirPerm === 'ask') {
-    // TODO: Implement user prompt for external directory access
+    await denyWithToast(
+      `PTY spawn denied: Working directory "${workdir}" is outside project directory "${_directory}" and requires permission.`
+    )
   }
+  return resolvedWorkdir
+}
+
+// ponytail: one adapter keeps every daemon process launch behind the same policy boundary.
+export async function authorizeSpawn(
+  command: string,
+  args: string[],
+  workdir?: string
+): Promise<string> {
+  await checkCommandPermission(command, args)
+  return checkWorkdirPermission(workdir)
 }

@@ -1,11 +1,8 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
-import { checkCommandPermission } from '../permissions.ts'
-import { buildSessionNotFoundError } from '../utils.ts'
 import DESCRIPTION from './write.txt'
 
 const ETX = String.fromCharCode(3)
-const EOT = String.fromCharCode(4)
 
 /**
  * Parse escape sequences in a string to their actual byte values.
@@ -34,25 +31,6 @@ function parseEscapeSequences(input: string): string {
   })
 }
 
-function extractCommands(data: string): string[] {
-  const commands: string[] = []
-  const lines = data.split(/[\n\r]+/)
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (trimmed && !trimmed.startsWith(ETX) && !trimmed.startsWith(EOT)) {
-      commands.push(trimmed)
-    }
-  }
-  return commands
-}
-
-function parseCommand(commandLine: string): { command: string; args: string[] } {
-  const parts = commandLine.split(/\s+/).filter(Boolean)
-  const command = parts[0] ?? ''
-  const args = parts.slice(1)
-  return { command, args }
-}
-
 export const ptyWrite = tool({
   description: DESCRIPTION,
   args: {
@@ -60,9 +38,9 @@ export const ptyWrite = tool({
     data: tool.schema.string().describe('The input data to send to the PTY'),
   },
   async execute(args) {
-    const session = manager.get(args.id)
+    const session = await manager.get(args.id)
     if (!session) {
-      throw buildSessionNotFoundError(args.id)
+      throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
     }
 
     if (session.status !== 'running') {
@@ -72,25 +50,13 @@ export const ptyWrite = tool({
     // Parse escape sequences to actual bytes
     const parsedData = parseEscapeSequences(args.data)
 
-    const commands = extractCommands(parsedData)
-    for (const commandLine of commands) {
-      const { command, args: cmdArgs } = parseCommand(commandLine)
-      if (command) {
-        await checkCommandPermission(command, cmdArgs)
-      }
-    }
-
-    const success = manager.write(args.id, parsedData)
-    if (!success) {
-      throw new Error(`Failed to write to PTY '${args.id}'.`)
-    }
+    const result = await manager.write(args.id, parsedData)
 
     const preview = args.data.length > 50 ? `${args.data.slice(0, 50)}...` : args.data
     const displayPreview = preview
       .replace(new RegExp(ETX, 'g'), '^C')
-      .replace(new RegExp(EOT, 'g'), '^D')
       .replace(/\n/g, '\\n')
       .replace(/\r/g, '\\r')
-    return `Sent ${args.data.length} bytes to ${args.id}: "${displayPreview}"`
+    return `Accepted ${result.acceptedBytes} UTF-8 bytes (${result.acceptedCharacters} characters) for ${args.id}: "${displayPreview}"`
   },
 })

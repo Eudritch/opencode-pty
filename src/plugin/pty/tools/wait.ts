@@ -1,0 +1,45 @@
+import { tool } from '@opencode-ai/plugin'
+import { manager } from '../manager.ts'
+
+const waitArgs = {
+  id: tool.schema.string().describe('PTY session ID'),
+  timeoutSeconds: tool.schema.number().describe('Deadline in seconds, maximum 3600'),
+  literal: tool.schema.string().optional().describe('Wait for this literal output'),
+  regex: tool.schema
+    .string()
+    .optional()
+    .describe('Wait for a limited-safe regular expression in retained output'),
+  exit: tool.schema.boolean().optional().describe('Wait for process exit instead of output'),
+}
+
+function condition(args: { literal?: string; regex?: string; exit?: boolean }) {
+  if (args.exit) {
+    if (args.literal || args.regex)
+      throw new Error('exit cannot be combined with literal or regex.')
+    return { kind: 'exit' as const }
+  }
+  if (Boolean(args.literal) === Boolean(args.regex)) {
+    throw new Error('Provide exactly one of literal, regex, or exit=true.')
+  }
+  return { kind: 'output' as const, literal: args.literal, regex: args.regex }
+}
+
+function format(result: Awaited<ReturnType<typeof manager.wait>>): string {
+  return `<pty_wait satisfied="${result.satisfied}" reason="${result.reason}" matched="${result.matched ?? ''}" exit_code="${result.exitCode ?? 'unknown'}" output_truncated="${result.outputTruncated}"/>`
+}
+
+export const ptyWait = tool({
+  description: 'Wait daemon-side for PTY output or exit. This does not poll from the plugin.',
+  args: waitArgs,
+  async execute(args) {
+    return format(await manager.wait(args.id, condition(args), args.timeoutSeconds))
+  },
+})
+
+export const ptySendWait = tool({
+  description: 'Send input to a running PTY, then wait daemon-side for output or exit.',
+  args: { ...waitArgs, data: tool.schema.string().describe('Input to send unchanged to the PTY') },
+  async execute(args) {
+    return format(await manager.sendWait(args.id, args.data, condition(args), args.timeoutSeconds))
+  },
+})

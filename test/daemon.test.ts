@@ -5,9 +5,10 @@ import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
 import { ProcessError, SessionSupervisor } from '../src/daemon/supervisor.ts'
-import type { SessionRecord } from '../src/daemon/types.ts'
+import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
 import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine } from '../src/plugin/pty/formatters.ts'
+import { authorizeSpawn, initPermissions } from '../src/plugin/pty/permissions.ts'
 
 const roots: string[] = []
 
@@ -26,6 +27,7 @@ function record(
     title: id,
     command: 'test',
     args: [],
+    mode: 'pty',
     workdir: root,
     status,
     pid: 1,
@@ -56,7 +58,12 @@ test('daemon authenticates RPC and retains PTY output', async () => {
     fetch(`${descriptor.endpoint}/rpc`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ id: crypto.randomUUID(), version: 1, operation, payload }),
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation,
+        payload,
+      }),
     })
 
   try {
@@ -106,7 +113,12 @@ test('daemon validates RPC fields and uses literal searches', async () => {
     fetch(`${descriptor.endpoint}/rpc`, {
       method: 'POST',
       headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
-      body: JSON.stringify({ id: crypto.randomUUID(), version: 1, operation, payload }),
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation,
+        payload,
+      }),
     })
 
   try {
@@ -115,6 +127,149 @@ test('daemon validates RPC fields and uses literal searches', async () => {
   } finally {
     await server.stop()
   }
+})
+
+test('spawn permission adapter checks argv and returns a canonical workdir', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-'))
+  roots.push(root)
+  let configReads = 0
+  initPermissions(
+    {
+      config: {
+        get: async () => {
+          configReads += 1
+          return { data: { permission: { bash: { [process.execPath]: 'allow' } } } }
+        },
+      },
+      tui: { showToast: async () => {} },
+    } as never,
+    root
+  )
+
+  expect(await authorizeSpawn(process.execPath, ['-e', 'process.exit()'], root)).toBe(root)
+  expect(configReads).toBe(1)
+
+  initPermissions(
+    {
+      config: { get: async () => ({ data: { permission: { bash: 'deny' } } }) },
+      tui: { showToast: async () => {} },
+    } as never,
+    root
+  )
+  await expect(authorizeSpawn(process.execPath, [], root)).rejects.toThrow('disabled')
+})
+
+test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage, 32)
+  await supervisor.initialize()
+
+  const success = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', "console.log('out'); console.error('err')"],
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+  })
+  expect(success).toMatchObject({ stdout: 'out\n', stderr: 'err\n', exitCode: 0, timedOut: false })
+
+  const failure = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', "console.error('failed'); process.exit(7)"],
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+  })
+  expect(failure).toMatchObject({ stderr: 'failed\n', exitCode: 7, timedOut: false })
+
+  const timeout = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 5000)'],
+    parentSessionId: 'parent',
+    timeoutSeconds: 1,
+  })
+  expect(timeout.timedOut).toBeTrue()
+
+  const limited = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', "process.stdout.write('x'.repeat(100))"],
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+    maxOutputBytes: 8,
+  })
+  expect(limited).toMatchObject({ outputLimited: true, stdout: 'xxxxxxxx' })
+})
+
+test('PTY idempotency reuses only an active matching owner and spec', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const options = {
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 5000)'],
+    parentSessionId: 'owner',
+    workdir: root,
+    name: 'server',
+    idempotencyKey: 'deploy-1',
+  }
+  const first = await supervisor.spawn(options)
+  const reused = await supervisor.spawn(options)
+  expect(reused.id).toBe(first.id)
+  await expect(supervisor.spawn({ ...options, args: ['-e', 'process.exit()'] })).rejects.toThrow(
+    'different command or specification'
+  )
+  await supervisor.stop(first.id)
+  await Bun.sleep(25)
+  await supervisor.flush()
+})
+
+test('daemon waits for output, exit, and deadline without plugin polling', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-wait-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const session = await supervisor.spawn({
+    command: process.execPath,
+    args: [
+      '-e',
+      "setTimeout(() => console.log('ready'), 50); setTimeout(() => process.exit(3), 100)",
+    ],
+    parentSessionId: 'parent',
+    workdir: root,
+  })
+  await expect(
+    supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
+  ).resolves.toMatchObject({
+    satisfied: true,
+    reason: 'output',
+    matched: 'ready',
+  })
+  await expect(supervisor.wait(session.id, { kind: 'exit' }, 2)).resolves.toMatchObject({
+    satisfied: true,
+    reason: 'exit',
+    exitCode: 3,
+  })
+  const running = await supervisor.spawn({
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 5000)'],
+    parentSessionId: 'parent',
+    workdir: root,
+  })
+  await expect(
+    supervisor.wait(running.id, { kind: 'output', regex: 'never' }, 1)
+  ).resolves.toMatchObject({
+    satisfied: false,
+    reason: 'deadline',
+  })
+  await expect(
+    supervisor.wait(running.id, { kind: 'output', regex: '(never)+' }, 1)
+  ).rejects.toThrow('limited-safe')
+  await supervisor.stop(running.id)
+  await Bun.sleep(25)
+  await supervisor.flush()
 })
 
 test('client preserves a healthy incompatible daemon descriptor', async () => {
@@ -127,7 +282,7 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
       Response.json({
         id: 'health',
         ok: true,
-        result: { protocolVersion: 2, pid: process.pid },
+        result: { protocolVersion: DAEMON_PROTOCOL_VERSION + 1, pid: process.pid },
       }),
   })
   const previousDirectory = process.env.PTY_DAEMON_DIR
@@ -137,13 +292,13 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
   await storage.writeDescriptor({
     pid: process.pid,
     endpoint: server.url.origin,
-    protocolVersion: 2,
+    protocolVersion: DAEMON_PROTOCOL_VERSION + 1,
     token: 'test-token',
   })
 
   try {
     await expect(new DaemonClient().list()).rejects.toThrow('incompatible')
-    expect((await storage.readDescriptor())?.protocolVersion).toBe(2)
+    expect((await storage.readDescriptor())?.protocolVersion).toBe(DAEMON_PROTOCOL_VERSION + 1)
   } finally {
     server.stop(true)
     process.env.PTY_DAEMON_DIR = previousDirectory
@@ -158,7 +313,7 @@ test('daemon storage protects private paths on POSIX', async () => {
   await storage.writeDescriptor({
     pid: process.pid,
     endpoint: 'http://127.0.0.1:1',
-    protocolVersion: 1,
+    protocolVersion: DAEMON_PROTOCOL_VERSION,
     token: 'x',
   })
   await storage.writeSession(record(root, 'pty_test', 'exited'))
@@ -393,7 +548,7 @@ test('daemon classifies storage failures', async () => {
     const response = await fetch(`${descriptor.endpoint}/rpc`, {
       method: 'POST',
       headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'list', version: 1, operation: 'list' }),
+      body: JSON.stringify({ id: 'list', version: DAEMON_PROTOCOL_VERSION, operation: 'list' }),
     })
     expect(((await response.json()) as { error: { code: string } }).error.code).toBe('storage')
   } finally {
@@ -420,7 +575,7 @@ test('daemon classifies PTY failures as process failures', async () => {
       headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
       body: JSON.stringify({
         id: 'spawn',
-        version: 1,
+        version: DAEMON_PROTOCOL_VERSION,
         operation: 'spawn',
         payload: { command: 'test', parentSessionId: 'parent' },
       }),
@@ -569,7 +724,7 @@ test('plugin client starts its daemon from the configured data directory', async
     await storage.writeDescriptor({
       pid: process.pid,
       endpoint: 'http://127.0.0.1:1',
-      protocolVersion: 1,
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
       token: 'stale-token',
     })
     const client = new DaemonClient()
