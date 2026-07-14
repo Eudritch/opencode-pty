@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path'
 import {
   OUTPUT_JOURNAL_VERSION,
   type DaemonDescriptor,
+  type ExitReason,
   type OutputChunk,
   type SessionRecord,
 } from './types.ts'
@@ -19,6 +20,43 @@ const QUARANTINE_DIRECTORY = 'quarantine'
 const OUTPUT_SEGMENT_BYTES = 64 * 1024
 
 class InvalidSessionError extends Error {}
+class InvalidJournalError extends InvalidSessionError {}
+
+const SESSION_STATUSES = new Set([
+  'starting',
+  'running',
+  'stopping',
+  'exited',
+  'timed_out',
+  'lost',
+  'spawn_failed',
+  'output_limited',
+])
+
+function validText(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code < 0xd800 || code > 0xdfff) continue
+    if (code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1
+        continue
+      }
+    }
+    return false
+  }
+  return true
+}
+
+function validTimestamp(value: unknown): value is string {
+  return validText(value) && Number.isFinite(Date.parse(value))
+}
+
+function validNonnegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
 
 export function daemonDataDirectory(): string {
   if (process.env.PTY_DAEMON_DIR) return process.env.PTY_DAEMON_DIR
@@ -140,6 +178,8 @@ export class DaemonStorage {
   }
 
   async writeSession(record: SessionRecord): Promise<void> {
+    if (!this.validSession(record, record.id))
+      throw new Error('Refusing to persist invalid PTY session.')
     const directory = this.sessionDirectory(record.id)
     await this.privateDirectory(directory)
     await this.writeAtomic(this.metadataPath(record.id), JSON.stringify(record))
@@ -182,12 +222,15 @@ export class DaemonStorage {
         entries
           .filter((entry) => entry.endsWith('.json'))
           .sort()
-          .map(
-            async (entry) =>
-              JSON.parse(await readFile(join(directory, entry), 'utf8')) as OutputChunk
-          )
+          .map(async (entry) => this.readOutputChunk(join(directory, entry), entry))
       )
-      return chunks.sort((left, right) => left.startSequence - right.startSequence)
+      chunks.sort((left, right) => left.startSequence - right.startSequence)
+      for (let index = 1; index < chunks.length; index += 1) {
+        if (chunks[index - 1]?.endSequence !== chunks[index]?.startSequence) {
+          throw new InvalidJournalError('chunk sequence is discontinuous')
+        }
+      }
+      return chunks
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
       throw error
@@ -278,11 +321,16 @@ export class DaemonStorage {
         throw new InvalidSessionError()
       }
       if (!this.validSession(record, id)) throw new InvalidSessionError()
-      return this.migrateSession(record)
+      return await this.migrateSession(record)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       if (error instanceof InvalidSessionError) {
-        await this.quarantineSession(id)
+        await this.quarantineSession(
+          id,
+          error instanceof InvalidJournalError
+            ? `corrupt output journal: ${error.message}`
+            : 'malformed metadata'
+        )
         return null
       }
       throw error
@@ -290,42 +338,150 @@ export class DaemonStorage {
   }
 
   private validSession(record: unknown, id: string): record is SessionRecord {
-    return (
-      Boolean(record) &&
-      typeof record === 'object' &&
-      (record as { id?: unknown }).id === id &&
-      typeof (record as { title?: unknown }).title === 'string' &&
-      typeof (record as { command?: unknown }).command === 'string' &&
-      Array.isArray((record as { args?: unknown }).args) &&
-      (record as { args: unknown[] }).args.every((arg) => typeof arg === 'string') &&
-      [
-        'starting',
-        'running',
-        'stopping',
-        'exited',
-        'timed_out',
-        'lost',
-        'spawn_failed',
-        'output_limited',
-      ].includes((record as { status?: unknown }).status as string) &&
-      typeof (record as { workdir?: unknown }).workdir === 'string' &&
-      typeof (record as { pid?: unknown }).pid === 'number' &&
-      typeof (record as { createdAt?: unknown }).createdAt === 'string' &&
-      typeof (record as { updatedAt?: unknown }).updatedAt === 'string' &&
-      typeof (record as { parentSessionId?: unknown }).parentSessionId === 'string' &&
-      typeof (record as { timedOut?: unknown }).timedOut === 'boolean'
-    )
+    if (!record || typeof record !== 'object') return false
+    const value = record as Partial<SessionRecord>
+    const validOptionalText = (item: unknown) => item === undefined || validText(item)
+    const validOptionalTimestamp = (item: unknown) => item === undefined || validTimestamp(item)
+    const validOptionalInteger = (item: unknown) =>
+      item === undefined || validNonnegativeInteger(item)
+    const validExitReason = (reason: unknown): boolean => {
+      if (reason === undefined) return true
+      if (!reason || typeof reason !== 'object' || !validText((reason as ExitReason).kind))
+        return false
+      const value = reason as ExitReason
+      return (
+        (value.kind === 'code' && validNonnegativeInteger(value.code)) ||
+        (value.kind === 'signal' && validText(value.signal)) ||
+        ((value.kind === 'timeout' || value.kind === 'output_limit') &&
+          (value.message === undefined || validText(value.message))) ||
+        (value.kind === 'spawn_error' && validText(value.message)) ||
+        value.kind === 'unknown'
+      )
+    }
+    const validEnvironment = (environment: unknown): boolean => {
+      if (environment === undefined) return true
+      if (!environment || typeof environment !== 'object') return false
+      const value = environment as SessionRecord['environment']
+      return (
+        (value.kind === 'safe' || value.kind === 'inherit') &&
+        Array.isArray(value.keys) &&
+        value.keys.every(validText) &&
+        validText(value.fingerprint) &&
+        typeof value.sensitive === 'boolean'
+      )
+    }
+    const validExecOutput = (output: unknown): boolean => {
+      if (output === undefined) return true
+      if (!output || typeof output !== 'object') return false
+      const value = output as Record<string, unknown>
+      return (
+        validText(value.stdout) &&
+        validText(value.stderr) &&
+        validNonnegativeInteger(value.stdoutBytes) &&
+        validNonnegativeInteger(value.stderrBytes) &&
+        value.stdoutBytes >= Buffer.byteLength(value.stdout) &&
+        value.stderrBytes >= Buffer.byteLength(value.stderr) &&
+        typeof value.stdoutTruncated === 'boolean' &&
+        typeof value.stderrTruncated === 'boolean'
+      )
+    }
+    const validWait = (wait: unknown): boolean => {
+      if (wait === undefined) return true
+      if (!wait || typeof wait !== 'object') return false
+      const value = wait as Record<string, unknown>
+      return (
+        typeof value.satisfied === 'boolean' &&
+        (value.reason === 'output' || value.reason === 'exit' || value.reason === 'deadline') &&
+        validTimestamp(value.observedAt) &&
+        validOptionalText(value.matched) &&
+        validOptionalInteger(value.exitCode) &&
+        (value.exitSignal === undefined ||
+          validNonnegativeInteger(value.exitSignal) ||
+          validText(value.exitSignal)) &&
+        typeof value.outputTruncated === 'boolean'
+      )
+    }
+    if (
+      value.id !== id ||
+      !validText(value.title) ||
+      !validText(value.command) ||
+      !Array.isArray(value.args) ||
+      !value.args.every(validText) ||
+      !validOptionalText(value.description) ||
+      !validOptionalText(value.name) ||
+      !validOptionalText(value.idempotencyKey) ||
+      !validText(value.workdir) ||
+      !validOptionalText(value.ownerProjectDirectory) ||
+      !validOptionalText(value.ownerCapabilityHash) ||
+      !validOptionalText(value.parentSessionId) ||
+      !validOptionalText(value.parentAgent) ||
+      !SESSION_STATUSES.has(value.status ?? '') ||
+      !validNonnegativeInteger(value.pid) ||
+      !validTimestamp(value.createdAt) ||
+      !validTimestamp(value.updatedAt) ||
+      !validOptionalTimestamp(value.startedAt) ||
+      !validOptionalTimestamp(value.exitedAt) ||
+      !validOptionalTimestamp(value.lastOutputAt) ||
+      !validOptionalInteger(value.timeoutSeconds) ||
+      (value.timeoutSeconds !== undefined && value.timeoutSeconds === 0) ||
+      typeof value.timedOut !== 'boolean' ||
+      (value.terminationRequested !== undefined &&
+        typeof value.terminationRequested !== 'boolean') ||
+      (value.terminationConfirmed !== undefined &&
+        typeof value.terminationConfirmed !== 'boolean') ||
+      !validOptionalInteger(value.exitCode) ||
+      (value.exitSignal !== undefined &&
+        !validNonnegativeInteger(value.exitSignal) &&
+        !validText(value.exitSignal)) ||
+      !validExitReason(value.exitReason) ||
+      !validNonnegativeInteger(value.nextSequence) ||
+      !validNonnegativeInteger(value.firstRetainedSequence) ||
+      !validNonnegativeInteger(value.outputBytes) ||
+      typeof value.outputTruncated !== 'boolean' ||
+      !validNonnegativeInteger(value.lineCount) ||
+      typeof value.outputHasPartialLine !== 'boolean' ||
+      (value.outputJournalVersion !== undefined &&
+        value.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) ||
+      (value.mode !== undefined && value.mode !== 'pty' && value.mode !== 'exec') ||
+      (value.lifecycle !== undefined &&
+        value.lifecycle !== 'conversation' &&
+        value.lifecycle !== 'persistent') ||
+      !validEnvironment(value.environment) ||
+      !validExecOutput(value.execOutput) ||
+      !validWait(value.lastWaitResult)
+    ) {
+      return false
+    }
+    if (
+      Date.parse(value.createdAt) > Date.parse(value.updatedAt) ||
+      (value.startedAt !== undefined &&
+        Date.parse(value.startedAt) < Date.parse(value.createdAt)) ||
+      (value.exitedAt !== undefined && Date.parse(value.exitedAt) < Date.parse(value.createdAt)) ||
+      value.firstRetainedSequence > value.nextSequence ||
+      (!value.outputTruncated && value.firstRetainedSequence !== 0)
+    ) {
+      return false
+    }
+    if (value.mode === 'exec') {
+      return (
+        value.firstRetainedSequence === 0 &&
+        value.nextSequence === 0 &&
+        (value.execOutput === undefined ||
+          value.outputBytes === value.execOutput.stdoutBytes + value.execOutput.stderrBytes)
+      )
+    }
+    return value.outputBytes <= value.nextSequence - value.firstRetainedSequence
   }
 
-  private async quarantineSession(id: string): Promise<void> {
+  private async quarantineSession(id: string, reason: string): Promise<void> {
     try {
       await rename(
         this.sessionDirectory(id),
         join(this.root, QUARANTINE_DIRECTORY, `${id}-${Date.now()}-${crypto.randomUUID()}`)
       )
-      console.warn(`Skipped malformed PTY session ${JSON.stringify(id)}.`)
+      console.warn(`Skipped PTY session ${JSON.stringify(id)}: ${reason}.`)
     } catch {
-      console.warn(`Skipped malformed PTY session ${JSON.stringify(id)}; quarantine failed.`)
+      console.warn(`Skipped PTY session ${JSON.stringify(id)}: ${reason}; quarantine failed.`)
     }
   }
 
@@ -351,9 +507,23 @@ export class DaemonStorage {
         chunks = await this.readOutputChunks(record.id)
       }
     }
+    if (
+      record.mode !== 'exec' &&
+      chunks.length > 0 &&
+      chunks.at(-1)?.endSequence !== record.nextSequence
+    ) {
+      throw new InvalidJournalError('chunk cursor does not match session cursor')
+    }
     if (record.outputJournalVersion === OUTPUT_JOURNAL_VERSION && record.outputTruncated) {
       await this.discardOutputBefore(record.id, record.firstRetainedSequence)
       chunks = await this.readOutputChunks(record.id)
+    }
+    if (
+      record.mode !== 'exec' &&
+      chunks.length > 0 &&
+      chunks.at(-1)?.endSequence !== record.nextSequence
+    ) {
+      throw new InvalidJournalError('retained chunk cursor does not match session cursor')
     }
     const migrated = this.reconcileSession(record, chunks)
     if (
@@ -370,6 +540,9 @@ export class DaemonStorage {
   }
 
   private reconcileSession(record: SessionRecord, chunks: OutputChunk[]): SessionRecord {
+    if (record.mode === 'exec') {
+      return { ...record, outputJournalVersion: OUTPUT_JOURNAL_VERSION }
+    }
     const output = chunks.map((chunk) => chunk.data).join('')
     const firstRetainedSequence = chunks[0]?.startSequence ?? record.nextSequence ?? 0
     const nextSequence = Math.max(
@@ -398,6 +571,32 @@ export class DaemonStorage {
       left.outputHasPartialLine === right.outputHasPartialLine &&
       left.outputJournalVersion === right.outputJournalVersion
     )
+  }
+
+  private async readOutputChunk(path: string, entry: string): Promise<OutputChunk> {
+    if (!/^\d{20}\.json$/.test(entry)) throw new InvalidJournalError('chunk filename is invalid')
+    let value: unknown
+    try {
+      value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await readFile(path)))
+    } catch {
+      throw new InvalidJournalError('chunk is not valid UTF-8 JSON')
+    }
+    if (!value || typeof value !== 'object')
+      throw new InvalidJournalError('chunk schema is invalid')
+    const chunk = value as Partial<OutputChunk>
+    if (
+      !validNonnegativeInteger(chunk.startSequence) ||
+      !validNonnegativeInteger(chunk.endSequence) ||
+      chunk.endSequence < chunk.startSequence ||
+      !validTimestamp(chunk.timestamp) ||
+      !validText(chunk.data) ||
+      chunk.data.length === 0 ||
+      chunk.endSequence - chunk.startSequence !== Buffer.byteLength(chunk.data) ||
+      entry !== `${chunk.startSequence.toString().padStart(20, '0')}.json`
+    ) {
+      throw new InvalidJournalError('chunk schema or sequence is invalid')
+    }
+    return chunk as OutputChunk
   }
 
   private async writeAtomic(path: string, contents: string): Promise<void> {

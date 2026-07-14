@@ -92,6 +92,45 @@ jobs:
           for _ in $(seq 1 20); do test -f "$state/daemon.json" && break; sleep 0.1; done
           test -f "$state/daemon.json"
 
+  windows-package-smoke:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.8
+      - run: bun ci
+      - run: bun build:prod
+      - name: Pack, import, and start the daemon
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "opencode-pty-$([guid]::NewGuid())"
+          $state = Join-Path $env:RUNNER_TEMP "opencode-pty-state-$([guid]::NewGuid())"
+          $previousState = $env:PTY_DAEMON_DIR
+          $daemon = $null
+          try {
+            New-Item -ItemType Directory -Path $package, $state | Out-Null
+            npm pack --pack-destination $package
+            $archive = (Get-ChildItem -Path $package -Filter *.tgz | Select-Object -First 1).FullName
+            npm install --prefix (Join-Path $package installed) $archive
+            $installed = Join-Path $package 'installed/node_modules/opencode-pty'
+            bun --cwd (Join-Path $package installed) -e "await import('opencode-pty')"
+            $env:PTY_DAEMON_DIR = $state
+            $daemon = Start-Process -FilePath bun -ArgumentList @('--cwd', $installed, 'dist/src/daemon/main.js') -PassThru
+            1..40 | ForEach-Object {
+              if (Test-Path (Join-Path $state daemon.json)) { return }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not (Test-Path (Join-Path $state daemon.json))) { throw 'Packaged daemon did not start.' }
+          } finally {
+            if ($null -ne $daemon -and -not $daemon.HasExited) {
+              Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
+              Wait-Process -Id $daemon.Id -ErrorAction SilentlyContinue
+            }
+            $env:PTY_DAEMON_DIR = $previousState
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $package, $state
+          }
+
   nix-flake-test:
     name: Devenv CI
     runs-on: ubuntu-latest

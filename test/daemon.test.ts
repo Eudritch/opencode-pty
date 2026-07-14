@@ -476,6 +476,79 @@ test('malformed session metadata is quarantined without blocking daemon recovery
   expect(await readdir(join(root, 'quarantine'))).toHaveLength(1)
 })
 
+test('corrupt journal quarantines only its session and preserves healthy recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-corrupt-journal-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const healthy = record(root, 'pty_healthy', 'exited')
+  const corrupt = record(root, 'pty_corrupt', 'exited')
+  await storage.writeSession(healthy)
+  await storage.appendOutput(healthy.id, [
+    { startSequence: 0, endSequence: 3, timestamp: healthy.updatedAt, data: 'ok\n' },
+  ])
+  healthy.nextSequence = 3
+  healthy.outputBytes = 3
+  healthy.lineCount = 1
+  await storage.writeSession(healthy)
+  await storage.writeSession(corrupt)
+  await mkdir(join(root, 'sessions', corrupt.id, 'output'))
+  await writeFile(
+    join(root, 'sessions', corrupt.id, 'output', '00000000000000000000.json'),
+    '{"startSequence":0,"endSequence":1,"timestamp":"2026-01-01T00:00:00.000Z","data":"\\ud800"}',
+    'utf8'
+  )
+
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+
+  expect((await supervisor.list()).map((item) => item.id)).toEqual([healthy.id])
+  expect(await supervisor.rawOutput(healthy.id)).toEqual({ raw: 'ok\n', byteLength: 3 })
+  expect(await readdir(join(root, 'quarantine'))).toHaveLength(1)
+})
+
+test('invalid persistent fields quarantine before a valid legacy record migrates', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-session-fields-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const invalid = [
+    { pid: null },
+    { nextSequence: -1 },
+    { nextSequence: 1, firstRetainedSequence: 2 },
+    { nextSequence: 1, outputBytes: 2 },
+    { outputJournalVersion: 99 },
+    { createdAt: null },
+    { parentSessionId: null },
+  ]
+  for (const [index, fields] of invalid.entries()) {
+    const id = `pty_invalid_${index}`
+    const session = record(root, id, 'exited')
+    await storage.writeSession(session)
+    await writeFile(
+      join(root, 'sessions', id, 'session.json'),
+      JSON.stringify({ ...session, ...fields })
+    )
+  }
+  const legacy = record(root, 'pty_legacy_valid', 'exited')
+  legacy.nextSequence = 7
+  legacy.outputBytes = 7
+  legacy.lineCount = 1
+  await storage.writeSession(legacy)
+  await writeFile(
+    join(root, 'sessions', legacy.id, 'session.json'),
+    JSON.stringify(
+      Object.fromEntries(Object.entries(legacy).filter(([key]) => key !== 'outputJournalVersion'))
+    )
+  )
+  await writeFile(join(root, 'sessions', legacy.id, 'output.log'), 'legacy\n', 'utf8')
+
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+
+  expect((await supervisor.list()).map((item) => item.id)).toEqual([legacy.id])
+  expect(await supervisor.rawOutput(legacy.id)).toEqual({ raw: 'legacy\n', byteLength: 7 })
+  expect(await readdir(join(root, 'quarantine'))).toHaveLength(invalid.length)
+})
+
 test('fragmented PTY output is coalesced and retained output stays bounded', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-fragmented-output-'))
   roots.push(root)
