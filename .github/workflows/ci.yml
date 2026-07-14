@@ -74,6 +74,8 @@ jobs:
       - name: Run full daemon/package suite
         run: bun unittest
       - run: bun build:prod
+      - name: Exercise native exec from the packed artifact
+        run: bun test/packaged-native-daemon.ts
       - name: Pack and import the artifact
         run: |
           tmpdir=$(mktemp -d)
@@ -116,6 +118,8 @@ jobs:
       - name: Run full daemon/package suite
         run: bun unittest
       - run: bun build:prod
+      - name: Exercise native exec from the packed artifact
+        run: bun test/packaged-native-daemon.ts
       - name: Pack, import, and start the daemon
         shell: pwsh
         run: |

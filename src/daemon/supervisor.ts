@@ -23,6 +23,9 @@ const OUTPUT_CHUNK_BYTES = 64 * 1024
 const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
+const NATIVE_READER_DRAIN_MS = 2000
+const NATIVE_WAIT_MARGIN_MS =
+  NATIVE_READER_DRAIN_MS + TERMINATION_GRACE_MS + TERMINATION_HARD_KILL_MS
 const SAFE_ENVIRONMENT_KEYS = new Set([
   'PATH',
   'HOME',
@@ -726,27 +729,53 @@ export class SessionSupervisor {
     record.updatedAt = new Date().toISOString()
     this.nativeWorkers.set(id, started.client)
     await this.storage.writeSession(record)
-    const result = await started.client.wait(options.timeoutSeconds * 1000 + 1500)
+    let result: WorkerSnapshot
     try {
-      return await this.finishNative(record, result)
-    } finally {
-      if (result.terminationConfirmed && result.status !== 'running') {
-        await started.client.shutdown().catch(() => undefined)
-        this.nativeWorkers.delete(id)
+      result = await started.client.wait(options.timeoutSeconds * 1000 + NATIVE_WAIT_MARGIN_MS)
+    } catch (error) {
+      void this.monitorNative(record, started.client)
+      throw error
+    }
+    if (!this.nativeTerminal(result)) void this.monitorNative(record, started.client)
+    return this.finalizeNative(record, started.client, result)
+  }
+
+  private async monitorNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
+    while (this.nativeWorkers.get(record.id) === worker) {
+      try {
+        let result = await worker.wait((record.timeoutSeconds ?? 1) * 1000 + NATIVE_WAIT_MARGIN_MS)
+        while (!this.nativeTerminal(result)) {
+          await this.finishNative(record, result)
+          result = await worker.wait(NATIVE_WAIT_MARGIN_MS)
+        }
+        await this.finalizeNative(record, worker, result)
+        return
+      } catch {
+        // Keep the descriptor reachable for recovery while a transient RPC failure clears.
+        await Bun.sleep(100)
       }
     }
   }
 
-  private async monitorNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
+  private nativeTerminal(result: WorkerSnapshot): boolean {
+    return result.terminationConfirmed && result.status !== 'running'
+  }
+
+  private async finalizeNative(
+    record: SessionRecord,
+    worker: WorkerClient,
+    result: WorkerSnapshot
+  ): Promise<ExecResult> {
     try {
-      const result = await worker.wait((record.timeoutSeconds ?? 1) * 1000 + 1500)
-      await this.finishNative(record, result)
-      if (result.terminationConfirmed && result.status !== 'running') {
-        await worker.shutdown().catch(() => undefined)
-        this.nativeWorkers.delete(record.id)
+      return await this.finishNative(record, result)
+    } finally {
+      if (this.nativeTerminal(result)) {
+        try {
+          await worker.shutdown().catch(() => undefined)
+        } finally {
+          this.nativeWorkers.delete(record.id)
+        }
       }
-    } catch {
-      // Recovery will retry a reachable descriptor on the next daemon start.
     }
   }
 
@@ -780,10 +809,14 @@ export class SessionSupervisor {
     record.terminationRequested = result.terminationRequested
     record.terminationConfirmed = result.terminationConfirmed
     record.storageFailure = result.storageFailure ?? undefined
-    if (result.storageFailure)
+    if (result.storageFailure || result.readerFailure || result.outputIncomplete)
       record.exitReason = {
         kind: 'unknown',
-        message: `Native worker storage failure: ${result.storageFailure}`,
+        message: result.storageFailure
+          ? `Native worker storage failure: ${result.storageFailure}`
+          : result.readerFailure
+            ? `Native worker output incomplete: ${result.readerFailure}`
+            : 'Native worker output incomplete: reader drain deadline elapsed.',
       }
     else if (result.exitReason === 'timeout') record.exitReason = { kind: 'timeout' }
     else if (result.exitReason === 'output_limit') record.exitReason = { kind: 'output_limit' }
@@ -799,8 +832,15 @@ export class SessionSupervisor {
     record.exitedAt = result.exitedAt
     record.updatedAt = new Date().toISOString()
     await this.storage.writeSession(record)
-    if (result.storageFailure && result.terminationConfirmed) {
-      const error = new Error(`Native worker output storage failed: ${result.storageFailure}`)
+    if (
+      (result.storageFailure || result.readerFailure || result.outputIncomplete) &&
+      result.terminationConfirmed
+    ) {
+      const error = new Error(
+        result.storageFailure
+          ? `Native worker output storage failed: ${result.storageFailure}`
+          : `Native worker output incomplete${result.readerFailure ? `: ${result.readerFailure}` : '.'}`
+      )
       Object.assign(error, { code: 'ESTORAGE' })
       throw error
     }
@@ -870,7 +910,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finishNative(record, await native.snapshot())
+      await this.finalizeNative(record, native, await native.snapshot())
     }
     return record ? this.toInfo(record) : null
   }
@@ -908,7 +948,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finishNative(record, await native.snapshot())
+      await this.finalizeNative(record, native, await native.snapshot())
     }
     return record?.execOutput ?? null
   }
@@ -922,7 +962,7 @@ export class SessionSupervisor {
       record.status = 'stopping'
       await this.storage.writeSession(record)
       const result = await native.stop()
-      await this.finishNative(record, result)
+      await this.finalizeNative(record, native, result)
       return { requested: true, terminationConfirmed: record.terminationConfirmed }
     }
     const active = this.active.get(id)

@@ -1118,6 +1118,7 @@ test('native exec uses independent stdout/stderr caps and persists terminal stor
     ).toMatchObject({
       result: { status: 'lost', terminationConfirmed: true },
     })
+    await expect(stat(join(root, 'sessions', id, 'worker.json'))).rejects.toThrow()
   } finally {
     await server.stop()
     if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED

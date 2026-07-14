@@ -64,6 +64,8 @@ struct State {
     storage_failure: Option<String>,
     stdout_eof: bool,
     stderr_eof: bool,
+    stdout_reader_error: Option<String>,
+    stderr_reader_error: Option<String>,
     reader_drain_deadline: Option<SystemTime>,
     output_incomplete: bool,
 }
@@ -335,10 +337,29 @@ fn mark_reader_eof(worker: &Arc<Worker>, stdout: bool) {
     }
 }
 
-fn update_reader_drain(worker: &Arc<Worker>) {
-    let mut state = worker.state.lock().expect("state lock");
+fn mark_reader_failure(state: &mut State, stdout: bool, error: String) {
+    let diagnostic = format!(
+        "{} reader error: {error}",
+        if stdout { "stdout" } else { "stderr" }
+    );
+    if stdout {
+        state.stdout_reader_error = Some(diagnostic);
+    } else {
+        state.stderr_reader_error = Some(diagnostic);
+    }
+    state.output_incomplete = true;
+}
+
+fn output_complete(state: &State) -> bool {
+    state.stdout_eof
+        && state.stderr_eof
+        && state.stdout_reader_error.is_none()
+        && state.stderr_reader_error.is_none()
+}
+
+fn update_reader_drain_state(state: &mut State) {
     if state.termination_confirmed
-        && (!state.stdout_eof || !state.stderr_eof)
+        && (!output_complete(state))
         && state
             .reader_drain_deadline
             .is_some_and(|deadline| SystemTime::now() >= deadline)
@@ -347,19 +368,34 @@ fn update_reader_drain(worker: &Arc<Worker>) {
     }
 }
 
+fn update_reader_drain(worker: &Arc<Worker>) {
+    let mut state = worker.state.lock().expect("state lock");
+    update_reader_drain_state(&mut state);
+}
+
 fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: bool) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         let mut tail = String::new();
         loop {
             match pipe.read(&mut buffer) {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
                     append_output(
                         &worker,
                         stdout,
                         redact_stream(String::new(), &mut tail, &worker.secrets, true),
                     );
                     mark_reader_eof(&worker, stdout);
+                    return;
+                }
+                Err(error) => {
+                    append_output(
+                        &worker,
+                        stdout,
+                        redact_stream(String::new(), &mut tail, &worker.secrets, true),
+                    );
+                    let mut state = worker.state.lock().expect("state lock");
+                    mark_reader_failure(&mut state, stdout, error.to_string());
                     return;
                 }
                 Ok(size) => append_output(
@@ -403,7 +439,14 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
     update_reader_drain(worker);
     let pid = worker.child.lock().expect("child lock").id();
     let state = worker.state.lock().expect("state lock");
-    let output_complete = state.stdout_eof && state.stderr_eof;
+    let output_complete = output_complete(&state);
+    let reader_failure = state
+        .stdout_reader_error
+        .iter()
+        .chain(state.stderr_reader_error.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
     let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
     let status = if terminal && (state.storage_failure.is_some() || state.output_incomplete) {
         "lost"
@@ -422,8 +465,44 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "startedAt": state.started_at, "exitedAt": state.exited_at, "timedOut": state.timed_out,
         "terminationRequested": state.termination_requested, "terminationConfirmed": state.termination_confirmed,
         "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
+        "readerFailure": if reader_failure.is_empty() { Value::Null } else { Value::String(reader_failure) },
         "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_error_is_not_eof_or_complete_output() {
+        let mut state = State {
+            termination_confirmed: true,
+            ..State::default()
+        };
+        mark_reader_failure(&mut state, true, "injected read failure".into());
+        assert!(!state.stdout_eof);
+        assert!(!output_complete(&state));
+        assert!(state.output_incomplete);
+        assert!(
+            state
+                .stdout_reader_error
+                .unwrap()
+                .contains("injected read failure")
+        );
+    }
+
+    #[test]
+    fn reader_drain_timeout_marks_output_incomplete() {
+        let mut state = State {
+            termination_confirmed: true,
+            reader_drain_deadline: Some(SystemTime::now() - Duration::from_millis(1)),
+            ..State::default()
+        };
+        update_reader_drain_state(&mut state);
+        assert!(state.output_incomplete);
+        assert!(!output_complete(&state));
+    }
 }
 
 fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {

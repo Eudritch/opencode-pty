@@ -148,7 +148,16 @@ export class WorkerClient {
   }
 
   async shutdown(): Promise<WorkerSnapshot> {
-    return this.call('shutdown', {}, 10_000)
+    const result = await this.call<WorkerSnapshot>('shutdown', {}, 10_000)
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await this.call('health', {}, 100)
+        await Bun.sleep(20)
+      } catch {
+        return result
+      }
+    }
+    throw new Error('Native worker did not exit after shutdown.')
   }
 
   private async call<T>(
@@ -210,4 +219,5 @@ export interface WorkerSnapshot {
   stderrEof: boolean
   outputComplete: boolean
   outputIncomplete: boolean
+  readerFailure?: string
 }
