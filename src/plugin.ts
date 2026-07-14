@@ -31,3 +31,6 @@ export const PTYPlugin = async ({ client, directory }: PluginContext): Promise<P
     },
   }
 }
+
+// OpenCode accepts this legacy module entry name as well as PTYPlugin.
+export const server = PTYPlugin

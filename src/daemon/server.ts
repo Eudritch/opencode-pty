@@ -54,7 +54,13 @@ export class DaemonServer implements Disposable {
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       token: this.token,
     }
-    await this.storage.writeDescriptor(descriptor)
+    try {
+      await this.storage.writeDescriptor(descriptor)
+    } catch (error) {
+      this.server.stop(true)
+      this.server = null
+      throw error
+    }
     return descriptor
   }
 

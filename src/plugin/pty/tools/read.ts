@@ -8,9 +8,12 @@ import { escapeXml } from '../xml.ts'
 import DESCRIPTION from './read.txt'
 
 function buildTimeoutReminder(session: PTYSessionInfo): string {
+  const termination = session.terminationConfirmed
+    ? 'Termination was confirmed.'
+    : 'Termination was requested but is not confirmed.'
   return [
     `<system_reminder>`,
-    `This session was auto-killed after reaching \`timeoutSeconds=${session.timeoutSeconds ?? 'unknown'}\`.`,
+    `This session reached \`timeoutSeconds=${session.timeoutSeconds ?? 'unknown'}\`. ${termination}`,
     `Use \`pty_read\` to inspect the final output or \`pty_list\` to review other sessions.`,
     `</system_reminder>`,
   ].join('\n')

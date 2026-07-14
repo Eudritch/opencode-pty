@@ -1,1 +1,1 @@
-export { PTYPlugin } from './src/plugin.ts'
+export { PTYPlugin, server } from './src/plugin.ts'

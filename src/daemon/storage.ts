@@ -67,6 +67,7 @@ export function daemonDataDirectory(): string {
 
 export class DaemonStorage {
   private readonly outputTails = new Map<string, OutputChunk>()
+  private windowsUserSid: Promise<string> | undefined
 
   constructor(private readonly root: string = daemonDataDirectory()) {}
 
@@ -157,6 +158,7 @@ export class DaemonStorage {
     try {
       const handle = await open(this.startLockPath, 'wx', 0o600)
       await handle.close()
+      await this.privateFile(this.startLockPath)
       return true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
@@ -637,10 +639,73 @@ export class DaemonStorage {
 
   private async privateDirectory(path: string): Promise<void> {
     await mkdir(path, { recursive: true, mode: 0o700 })
-    if (process.platform !== 'win32') await chmod(path, 0o700)
+    if (process.platform === 'win32') await this.protectWindowsPath(path, true, true)
+    else await chmod(path, 0o700)
   }
 
   private async privateFile(path: string): Promise<void> {
-    if (process.platform !== 'win32') await chmod(path, 0o600)
+    if (process.platform === 'win32') await this.protectWindowsPath(path, false, false)
+    else await chmod(path, 0o600)
+  }
+
+  private async protectWindowsPath(
+    path: string,
+    directory: boolean,
+    recursive: boolean
+  ): Promise<void> {
+    const sid = await this.currentWindowsUserSid()
+    const inheritedGrant = directory ? '(OI)(CI)F' : 'F'
+    const child = Bun.spawn({
+      cmd: [
+        'icacls.exe',
+        path,
+        '/inheritance:r',
+        '/grant:r',
+        `*${sid}:F`,
+        '/grant:r',
+        '*S-1-5-18:F',
+        ...(directory
+          ? ['/grant', `*${sid}:${inheritedGrant}`, '/grant', `*S-1-5-18:${inheritedGrant}`]
+          : []),
+        ...(recursive ? ['/t'] : []),
+      ],
+      stdout: 'ignore',
+      stderr: 'pipe',
+    })
+    const exitCode = await child.exited
+    if (exitCode === 0) return
+    const error = (await new Response(child.stderr).text()).trim()
+    throw new Error(
+      `Unable to protect daemon storage with a Windows DACL${error ? `: ${error}` : '.'}`
+    )
+  }
+
+  private async currentWindowsUserSid(): Promise<string> {
+    this.windowsUserSid ??= (async () => {
+      const process = Bun.spawn({
+        cmd: [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+        ],
+        stdout: 'pipe',
+        stderr: 'ignore',
+      })
+      const sid = (await new Response(process.stdout).text()).trim()
+      if ((await process.exited) !== 0 || !/^S-\d+(?:-\d+)+$/.test(sid)) {
+        throw new Error(
+          'Unable to identify the current Windows user for daemon storage protection.'
+        )
+      }
+      return sid
+    })()
+    try {
+      return await this.windowsUserSid
+    } catch (error) {
+      this.windowsUserSid = undefined
+      throw error
+    }
   }
 }

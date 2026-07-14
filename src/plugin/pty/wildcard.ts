@@ -36,7 +36,7 @@ export function allStructured(
     const parts = pattern.split(/\s+/)
     const firstPart = parts[0]
     if (!firstPart || !match(input.head, firstPart)) continue
-    if (parts.length === 1 || matchSequence(input.tail, parts.slice(1))) {
+    if (matchSequence(input.tail, parts.slice(1))) {
       result = value
     }
   }
@@ -44,19 +44,14 @@ export function allStructured(
 }
 
 function matchSequence(items: string[], patterns: string[]): boolean {
-  if (patterns.length === 0) return true
+  if (patterns.length === 0) return items.length === 0
   const [pattern, ...rest] = patterns
-  if (pattern === '*') return matchSequence(items, rest)
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i]
-    if (
-      item !== undefined &&
-      pattern !== undefined &&
-      match(item, pattern) &&
-      matchSequence(items.slice(i + 1), rest)
-    ) {
-      return true
+  if (pattern === '*') {
+    for (let index = 0; index <= items.length; index += 1) {
+      if (matchSequence(items.slice(index), rest)) return true
     }
+    return false
   }
-  return false
+  const [item, ...remaining] = items
+  return Boolean(item && pattern && match(item, pattern) && matchSequence(remaining, rest))
 }

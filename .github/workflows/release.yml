@@ -71,6 +71,7 @@ jobs:
           bun lint
           bun format
           bun build:prod
+          bun package:smoke
           npm pack --dry-run
           package=$(mktemp -d)
           state=$(mktemp -d)
@@ -85,7 +86,7 @@ jobs:
           trap cleanup EXIT
           npm pack --pack-destination "$package"
           npm install --prefix "$package/installed" "$package"/*.tgz
-          bun --cwd "$package/installed" -e "await import('opencode-pty')"
+          bun --cwd "$package/installed" -e "const plugin = await import('opencode-pty'); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin) throw new Error('Package is missing compatible PTYPlugin/server exports.')"
           PTY_DAEMON_DIR="$state" bun --cwd "$package/installed/node_modules/opencode-pty" dist/src/daemon/main.js &
           daemon_pid=$!
           for _ in $(seq 1 20); do test -f "$state/daemon.json" && break; sleep 0.1; done

@@ -38,7 +38,7 @@ export function createPtySpawn(authorizeSpawn: SpawnAuthorizer) {
         .number()
         .optional()
         .describe(
-          'Optional per-session timeout in seconds. The PTY is killed automatically when this duration elapses.'
+          'Optional per-session timeout in seconds. The daemon requests termination when this duration elapses.'
         ),
       name: tool.schema
         .string()

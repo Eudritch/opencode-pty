@@ -41,6 +41,8 @@ interface ActiveSession {
   timeout?: ReturnType<typeof setTimeout>
   outputBuffer: string
   outputBufferBytes: number
+  outputStartSequence: number
+  outputArrivalSequence: number
   outputTimer?: ReturnType<typeof setTimeout>
 }
 
@@ -314,6 +316,8 @@ export class SessionSupervisor {
       environment,
       outputBuffer: '',
       outputBufferBytes: 0,
+      outputStartSequence: record.nextSequence,
+      outputArrivalSequence: record.nextSequence,
     }
     this.active.set(id, active)
     ptyProcess.onData((data: string) => this.handleOutput(active, redactOutput(data, environment)))
@@ -351,9 +355,10 @@ export class SessionSupervisor {
   ): Promise<WaitResult> {
     await this.flush()
     this.validateWait(condition, timeoutSeconds)
-    const record = this.recordFor(id)
-    const afterSequence = record.nextSequence
     await this.write(id, data)
+    // onData may run synchronously from write; that output predates accepted input.
+    const afterSequence =
+      this.active.get(id)?.outputArrivalSequence ?? this.recordFor(id).nextSequence
     return this.wait(
       id,
       { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
@@ -758,6 +763,8 @@ export class SessionSupervisor {
 
   private handleOutput(active: ActiveSession, data: string): void {
     if (!data) return
+    if (!active.outputBuffer) active.outputStartSequence = active.outputArrivalSequence
+    active.outputArrivalSequence += Buffer.byteLength(data)
     active.outputBuffer += data
     active.outputBufferBytes += Buffer.byteLength(data)
     if (active.outputBufferBytes >= OUTPUT_CHUNK_BYTES) this.persistOutput(active)
@@ -770,13 +777,14 @@ export class SessionSupervisor {
     if (active.outputTimer) clearTimeout(active.outputTimer)
     active.outputTimer = undefined
     const buffered = active.outputBuffer
+    const startSequence = active.outputStartSequence
     active.outputBuffer = ''
     active.outputBufferBytes = 0
     this.enqueuePersist(async () => {
       const next = { ...active.record }
       const byteLength = Buffer.byteLength(buffered)
-      const chunks = outputChunks(buffered, next.nextSequence)
-      next.nextSequence += byteLength
+      const chunks = outputChunks(buffered, startSequence)
+      next.nextSequence = startSequence + byteLength
       next.outputBytes += byteLength
       const newlines = buffered.split('\n').length - 1
       if (next.outputHasPartialLine) {
@@ -866,6 +874,7 @@ export class SessionSupervisor {
           runtimeEnvironment(options.env, options.inheritEnv === true),
           options.inheritEnv === true
         ).fingerprint ||
+      existing.name !== options.name ||
       existing.timeoutSeconds !== options.timeoutSeconds
     ) {
       throw new Error(

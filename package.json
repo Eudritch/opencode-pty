@@ -3,7 +3,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "module": "dist/index.js",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "description": "OpenCode plugin for interactive PTY management - run background processes, send input, read output with regex filtering",
   "author": "Eudritch",
   "keywords": [
@@ -45,6 +45,7 @@
     "build:plugin": "tsc -p tsconfig.build.json && bun x copyfiles -u 0 \"src/**/*.txt\" dist",
     "build:dev": "bun clean && bun build:plugin",
     "build:prod": "bun clean && bun build:plugin",
+    "package:smoke": "bun -e \"const plugin = await import('./dist/index.js'); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin) throw new Error('Package is missing compatible PTYPlugin/server exports.')\"",
     "prepack": "bun build:prod",
     "clean": "rm -rf dist",
     "lint": "biome lint .",

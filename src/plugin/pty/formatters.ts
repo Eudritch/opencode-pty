@@ -11,11 +11,11 @@ export function formatSessionInfo(session: PTYSessionInfo): string[] {
   return [
     `[${escapeXml(session.id)}] ${escapeXml(session.title)}`,
     `  Command: ${escapeXml(session.command)} ${escapeXml(session.args.join(' '))}`,
-    `  Status: ${session.status}${timedOutInfo}${exitInfo}${exitSignal}`,
+    `  Status: ${escapeXml(session.status)}${timedOutInfo}${exitInfo}${exitSignal}`,
     `  PID: ${session.pid}${timeoutInfo}`,
     `  Lines: ${session.lineCount}${outputInfo}`,
     `  Workdir: ${escapeXml(session.workdir)}`,
-    `  Created: ${session.createdAt}`,
+    `  Created: ${escapeXml(session.createdAt)}`,
     '',
   ]
 }
@@ -27,6 +27,8 @@ export function formatLine(
   sequence?: number
 ): string {
   const lineNumStr = lineNum.toString().padStart(5, '0')
-  const truncatedLine = line.length > maxLength ? `${line.slice(0, maxLength)}...` : line
+  const characters = [...line]
+  const truncatedLine =
+    characters.length > maxLength ? `${characters.slice(0, maxLength).join('')}...` : line
   return `${lineNumStr}${sequence === undefined ? '' : `@${sequence}`}| ${escapeXml(truncatedLine)}`
 }

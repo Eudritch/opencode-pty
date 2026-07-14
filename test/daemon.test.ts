@@ -388,7 +388,7 @@ test('spawn permission adapter fails closed and isolates plugin contexts', async
       } as never,
       directory
     )
-  const allow = authorizer({ bash: { '*': 'deny', [process.execPath]: 'allow' } })
+  const allow = authorizer({ bash: { '*': 'deny', [`${process.execPath} *`]: 'allow' } })
   expect(await allow(process.execPath, ['-e', 'process.exit()'], root)).toBe(root)
   await expect(authorizer({})(process.execPath, [], root)).rejects.toThrow('no explicit allow')
   await expect(authorizer({ bash: { '*': 'allow' } })('other-command', [], root)).resolves.toBe(
@@ -408,6 +408,9 @@ test('spawn permission adapter fails closed and isolates plugin contexts', async
     'no explicit allow'
   )
   await expect(authorizer('allow')(process.execPath, [], root)).rejects.toThrow('no explicit allow')
+  const git = authorizer({ bash: { '*': 'deny', 'git status': 'allow' } })
+  await expect(git('git', ['status'], root)).resolves.toBe(root)
+  await expect(git('git', ['reset', '--hard', 'status'], root)).rejects.toThrow('no explicit allow')
   const secondRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-second-'))
   roots.push(secondRoot)
   await Promise.all([
@@ -702,6 +705,9 @@ test('PTY idempotency reuses only an active matching owner and spec', async () =
   await expect(supervisor.spawn({ ...options, args: ['-e', 'process.exit()'] })).rejects.toThrow(
     'different command or specification'
   )
+  await expect(supervisor.spawn({ ...options, name: 'other-server' })).rejects.toThrow(
+    'different command or specification'
+  )
   await supervisor.stop(first.id)
   await Bun.sleep(25)
   await supervisor.flush()
@@ -778,7 +784,7 @@ test('daemon waits for output, exit, and deadline without plugin polling', async
   await supervisor.flush()
 })
 
-test('sendWait ignores output before its durable write cursor and wait settles one race winner', async () => {
+test('sendWait ignores output before input acceptance and waits for later output', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-'))
   roots.push(root)
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
@@ -787,22 +793,56 @@ test('sendWait ignores output before its durable write cursor and wait settles o
     command: process.execPath,
     args: [
       '-e',
-      "setTimeout(() => console.log('old ready'), 50); setTimeout(() => console.log('new ready'), 500); setTimeout(() => process.exit(0), 800)",
+      "setTimeout(() => console.log('ready'), 50); setTimeout(() => console.log('ready'), 500); setTimeout(() => process.exit(0), 800)",
     ],
     parentSessionId: 'parent',
     workdir: root,
   })
   await Bun.sleep(200)
+  const started = Date.now()
   const result = await supervisor.sendWait(
     session.id,
     'go\n',
-    { kind: 'output', literal: 'new ready' },
+    { kind: 'output', literal: 'ready' },
     2
   )
-  expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'new ready' })
+  expect(Date.now() - started).toBeGreaterThan(150)
+  expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
   const exit = await supervisor.wait(session.id, { kind: 'exit' }, 2)
   expect(exit).toMatchObject({ satisfied: true, reason: 'exit', exitCode: 0 })
   expect((await supervisor.get(session.id))?.lastWaitResult).toMatchObject({ reason: 'exit' })
+})
+
+test('sendWait excludes output delivered synchronously by PTY write acceptance', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-write-race-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const session = record(root, 'pty_write_race')
+  const state = supervisor as unknown as {
+    active: Map<string, { record: SessionRecord; process: { write(data: string): void } }>
+    records: Map<string, SessionRecord>
+    handleOutput(active: unknown, data: string): void
+  }
+  state.records.set(session.id, session)
+  const active = {
+    record: session,
+    process: {
+      write: () => state.handleOutput(active, 'write-adjacent ready\n'),
+    },
+    environment: {},
+    outputBuffer: '',
+    outputBufferBytes: 0,
+    outputStartSequence: 0,
+    outputArrivalSequence: 0,
+  }
+  state.active.set(session.id, active)
+
+  await expect(
+    supervisor.sendWait(session.id, 'go\n', { kind: 'output', literal: 'ready' }, 1)
+  ).resolves.toMatchObject({ satisfied: false, reason: 'deadline' })
+  await supervisor.flush()
 })
 
 test('exec output remains separately recoverable after restart', async () => {
@@ -831,7 +871,9 @@ test('exec output remains separately recoverable after restart', async () => {
 
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
+  expect(escapeXml(`ok\u0000\u001f\ud800😀`)).toBe('ok���😀')
   expect(formatLine('<output>', 1)).toContain('&lt;output&gt;')
+  expect(formatLine('😀x', 1, 1)).toContain('😀...')
 })
 
 test('client preserves a healthy incompatible daemon descriptor', async () => {
@@ -893,6 +935,11 @@ test('daemon storage protects private paths on POSIX', async () => {
       (await stat(join(root, 'sessions', 'pty_test', 'output', '00000000000000000000.json'))).mode &
         0o777
     ).toBe(0o600)
+  } else {
+    const acl = Bun.spawn({ cmd: ['icacls.exe', root], stdout: 'pipe', stderr: 'ignore' })
+    const output = await new Response(acl.stdout).text()
+    expect(await acl.exited).toBe(0)
+    expect(output).toMatch(/SYSTEM.*\(.*F\)/)
   }
 })
 
