@@ -125,7 +125,9 @@ async function processIdentity(pid: number) {
       `Read macOS process identity for ${pid}`,
       5000
     )
-    return result.exitCode === 0 && result.stdout ? `darwin:${pid}:${result.stdout.trim()}` : undefined
+    return result.exitCode === 0 && result.stdout
+      ? `darwin:${pid}:${result.stdout.trim()}`
+      : undefined
   }
   try {
     const data = await readFile(`/proc/${pid}/stat`, 'utf8')
@@ -250,6 +252,9 @@ async function rpc(
   return response.json() as Promise<{ ok: boolean; result?: unknown; error?: unknown }>
 }
 
+let testFailure: unknown
+let cleanupFailure: unknown
+
 try {
   if (!supportedPlatforms.has(platform)) throw new Error(`No native package for ${platform}.`)
   await requireCommand(['cargo', 'build', '--locked', '--release', '--workspace'], 'cargo build')
@@ -350,8 +355,10 @@ try {
         await readFile(join(stateDirectory, 'sessions', id.id, 'session.json'), 'utf8')
       ) as { worker?: { executable?: string } }
       const executable = firstRecord.worker?.executable
+      const { pid } = descriptor
       if (
-        Number.isInteger(descriptor.pid) &&
+        typeof pid === 'number' &&
+        Number.isInteger(pid) &&
         typeof descriptor.startIdentity === 'string' &&
         typeof descriptor.processIdentity === 'string' &&
         typeof descriptor.endpoint === 'string' &&
@@ -359,7 +366,7 @@ try {
         typeof executable === 'string'
       )
         worker = {
-          pid: descriptor.pid,
+          pid,
           startIdentity: descriptor.startIdentity,
           processIdentity: descriptor.processIdentity,
           endpoint: descriptor.endpoint,
@@ -437,10 +444,11 @@ try {
     () => undefined
   )
   cleanupVerified = true
+} catch (error) {
+  testFailure = error
 } finally {
   executeAbort?.abort()
   await waitForExecution().catch(() => undefined)
-  let cleanupFailure: unknown
   if (active && installed) {
     if (!daemon || daemon.exitCode !== null) {
       const restarted = await startDaemon(installed).catch(() => undefined)
@@ -464,8 +472,9 @@ try {
     if (daemon) await waitForExit(daemon, 'Packaged daemon cleanup').catch(() => undefined)
     await Promise.allSettled([removeTemporary(packageDirectory), removeTemporary(stateDirectory)])
   }
-  if (cleanupFailure) throw cleanupFailure
 }
 
+if (testFailure) throw testFailure
+if (cleanupFailure) throw cleanupFailure
 if (!cleanupVerified) throw new Error('Packaged native cleanup was not verified.')
 process.exit(0)
