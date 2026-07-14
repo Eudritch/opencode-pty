@@ -311,10 +311,21 @@ try {
     const pty = await rpc(
       started.descriptor,
       'spawn',
-      { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] },
+      {
+        command: process.execPath,
+        args: ['-e', "process.stdin.on('data', data => process.stdout.write(data))"],
+      },
       owner
     )
-    if (pty.ok) throw new Error(`Windows packaged PTY did not fail closed: ${JSON.stringify(pty)}`)
+    if (!pty.ok) throw new Error(`Windows packaged ConPTY did not start: ${JSON.stringify(pty)}`)
+    const id = (pty.result as { id: string }).id
+    const written = await rpc(started.descriptor, 'write', { id, data: 'conpty-check\n' }, owner)
+    if (!written.ok)
+      throw new Error(`Windows packaged ConPTY did not accept input: ${JSON.stringify(written)}`)
+    const resized = await rpc(started.descriptor, 'resize', { id, cols: 100, rows: 30 }, owner)
+    if (!resized.ok)
+      throw new Error(`Windows packaged ConPTY did not resize: ${JSON.stringify(resized)}`)
+    await rpc(started.descriptor, 'stop', { id }, owner)
   }
   executeAbort = new AbortController()
   executing = rpc(
@@ -431,6 +442,10 @@ try {
   )
     throw new Error(
       `Linux packaged native exec was not containment-confirmed: ${terminalResult.containment?.status}`
+    )
+  if (process.platform === 'win32' && terminalResult.containment?.status !== 'windows_job_empty')
+    throw new Error(
+      `Windows packaged native exec was not Job-drain-confirmed: ${terminalResult.containment?.status}`
     )
   const output = await rpc(started.descriptor, 'execOutput', { id: id.id }, owner)
   if (

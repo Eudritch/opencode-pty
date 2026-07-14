@@ -452,7 +452,7 @@ export class DaemonStorage {
       if (!containment || typeof containment !== 'object') return false
       const value = containment as Record<string, unknown>
       return (
-        ['linux_proc', 'posix_verification_unavailable', 'not_applicable'].includes(
+        ['linux_proc', 'windows_job', 'posix_verification_unavailable', 'not_applicable'].includes(
           String(value.platform)
         ) &&
         [
@@ -460,6 +460,9 @@ export class DaemonStorage {
           'posix_processes_remaining',
           'posix_escape_observed',
           'posix_containment_unknown',
+          'windows_job_empty',
+          'windows_job_processes_remaining',
+          'windows_job_unknown',
           'not_applicable',
         ].includes(String(value.status)) &&
         validNonnegativeInteger(value.rootPid) &&

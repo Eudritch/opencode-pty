@@ -461,10 +461,15 @@ export class DaemonServer implements Disposable {
       },
       environment: { inheritEnabled: true, defaultProfile: 'safe' },
       platform: {
-        nativeContainment: process.platform === 'linux',
-        processTreeTermination: process.platform === 'linux',
-        ptyContainment: process.platform === 'linux',
-        containmentVerification: process.platform === 'linux' ? 'linux_proc' : 'unavailable',
+        nativeContainment: process.platform === 'linux' || process.platform === 'win32',
+        processTreeTermination: process.platform === 'linux' || process.platform === 'win32',
+        ptyContainment: process.platform === 'linux' || process.platform === 'win32',
+        containmentVerification:
+          process.platform === 'linux'
+            ? 'linux_proc'
+            : process.platform === 'win32'
+              ? 'windows_job'
+              : 'unavailable',
       },
     }
   }

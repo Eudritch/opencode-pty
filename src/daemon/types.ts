@@ -35,12 +35,15 @@ export interface SpawnFailure {
 }
 
 export interface ContainmentReport {
-  platform: 'linux_proc' | 'posix_verification_unavailable' | 'not_applicable'
+  platform: 'linux_proc' | 'windows_job' | 'posix_verification_unavailable' | 'not_applicable'
   status:
     | 'posix_best_effort_empty'
     | 'posix_processes_remaining'
     | 'posix_escape_observed'
     | 'posix_containment_unknown'
+    | 'windows_job_empty'
+    | 'windows_job_processes_remaining'
+    | 'windows_job_unknown'
     | 'not_applicable'
   rootPid: number
   processGroupId?: number
@@ -257,6 +260,6 @@ export interface DaemonDiagnostics {
     nativeContainment: boolean
     processTreeTermination: boolean
     ptyContainment: boolean
-    containmentVerification: 'linux_proc' | 'unavailable'
+    containmentVerification: 'linux_proc' | 'windows_job' | 'unavailable'
   }
 }

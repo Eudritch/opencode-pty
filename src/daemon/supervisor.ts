@@ -121,6 +121,7 @@ function containmentDrained(
   return (
     !record.containment ||
     record.containment.status === 'posix_best_effort_empty' ||
+    record.containment.status === 'windows_job_empty' ||
     // macOS only proves direct-child exit; it never claims descendant drain.
     (process.platform === 'darwin' && record.terminationConfirmed) ||
     record.containment.status === 'not_applicable'

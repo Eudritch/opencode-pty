@@ -8,3 +8,4 @@ publish = false
 libc = "=0.2.180"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_IO", "Win32_System_Pipes", "Win32_Storage_FileSystem"] }
