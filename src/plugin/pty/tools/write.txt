@@ -7,7 +7,7 @@ Use this tool to:
 
 Usage:
 - `id`: The PTY session ID (from pty_spawn or pty_list)
-- `data`: The input to send (text, commands, or escape sequences)
+- `data`: The input to send (text, commands, or supported escape sequences; unknown escapes stay literal)
 
 Common escape sequences:
 - Enter/newline: "\n" or "\r"

@@ -41,7 +41,7 @@ export const ptyKill = tool({
       `Termination confirmed: ${stop.terminationConfirmed ? 'yes' : 'no'}`,
       `Title: ${escapeXml(session.title)}`,
       `Command: ${escapeXml(session.command)} ${escapeXml(session.args.join(' '))}`,
-      `Final line count: ${session.lineCount}`,
+      `Line count before stop request: ${session.lineCount}`,
       `</pty_stop>`,
     ].join('\n')
   },

@@ -54,6 +54,44 @@ jobs:
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
 
+  package-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.8
+      - run: bun ci
+      - run: bun build:prod
+      - name: Pack and import the artifact
+        run: |
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          npm pack --pack-destination "$tmpdir"
+          npm install --prefix "$tmpdir/installed" "$tmpdir"/*.tgz
+          bun --cwd "$tmpdir/installed" -e "await import('opencode-pty')"
+      - name: Start the packaged daemon entrypoint
+        run: |
+          set -euo pipefail
+          state=$(mktemp -d)
+          package=""
+          daemon_pid=""
+          cleanup() {
+            if [ -n "$daemon_pid" ]; then
+              kill -TERM "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+            fi
+            rm -rf "$package" "$state"
+          }
+          trap cleanup EXIT
+          package=$(mktemp -d)
+          npm pack --pack-destination "$package"
+          npm install --prefix "$package/installed" "$package"/*.tgz
+          PTY_DAEMON_DIR="$state" bun --cwd "$package/installed/node_modules/opencode-pty" dist/src/daemon/main.js &
+          daemon_pid=$!
+          for _ in $(seq 1 20); do test -f "$state/daemon.json" && break; sleep 0.1; done
+          test -f "$state/daemon.json"
+
   nix-flake-test:
     name: Devenv CI
     runs-on: ubuntu-latest

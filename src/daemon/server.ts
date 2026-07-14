@@ -9,6 +9,7 @@ import {
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
+import { effectiveMaxOutputBytes } from './supervisor.ts'
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 
@@ -76,12 +77,11 @@ export class DaemonServer implements Disposable {
     }
     let rpcRequest: RpcRequest
     try {
-      const body = await request.text()
-      if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) {
-        return this.failure('', 'validation', 'Request body is too large.', 413)
-      }
+      const body = await this.requestBody(request)
       rpcRequest = JSON.parse(body) as RpcRequest
-    } catch {
+    } catch (error) {
+      if (error instanceof ValidationError)
+        return this.failure('', 'validation', error.message, 413)
       return this.failure('', 'validation', 'Request body must be JSON.', 400)
     }
     if (!rpcRequest || typeof rpcRequest !== 'object' || Array.isArray(rpcRequest)) {
@@ -123,6 +123,35 @@ export class DaemonServer implements Disposable {
                       ? 'session_closed'
                       : 'internal'
       return this.failure(rpcRequest.id, code, message, code === 'not_found' ? 404 : 400)
+    }
+  }
+
+  private async requestBody(request: Request): Promise<string> {
+    const contentLength = request.headers.get('content-length')
+    if (contentLength) {
+      if (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_REQUEST_BYTES) {
+        throw new ValidationError('Request body is too large.')
+      }
+    }
+    if (!request.body) return ''
+    const reader = request.body.getReader()
+    const decoder = new TextDecoder()
+    let bytes = 0
+    let body = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) return body + decoder.decode()
+        if (!value) continue
+        bytes += value.byteLength
+        if (bytes > MAX_REQUEST_BYTES) {
+          await reader.cancel()
+          throw new ValidationError('Request body is too large.')
+        }
+        body += decoder.decode(value, { stream: true })
+      }
+    } finally {
+      reader.releaseLock()
     }
   }
 
@@ -402,7 +431,7 @@ export class DaemonServer implements Disposable {
         maxSessionsPerOwner: this.maxSessionsPerOwner,
         maxInputBytes: MAX_INPUT_BYTES,
         maxInputBytesPerMinute: MAX_INPUT_BYTES_PER_MINUTE,
-        maxOutputBytes: Number.parseInt(process.env.PTY_MAX_OUTPUT_BYTES ?? '1000000', 10),
+        maxOutputBytes: effectiveMaxOutputBytes(),
         maxExecRuntimeSeconds: MAX_EXEC_RUNTIME_SECONDS,
       },
       environment: { inheritEnabled: true, defaultProfile: 'safe' },

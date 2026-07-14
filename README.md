@@ -1,6 +1,6 @@
 # opencode-pty
 
-An OpenCode plugin for durable interactive PTY sessions and finite argv execution. A per-user Bun daemon owns processes and persisted PTY output; the plugin supplies tools and applies OpenCode spawn permissions.
+An OpenCode plugin for durable interactive PTY sessions and finite argv execution. It requires Bun 1.3.8 or later. A per-user Bun daemon owns processes and persisted PTY output; the plugin supplies tools and applies a local fail-closed permission adapter.
 
 ## Tools
 
@@ -33,7 +33,7 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 - Environment defaults to a small platform/project-safe allowlist plus explicitly supplied variables. Set `inheritEnv: true` only when the command needs the daemon environment. Raw environment values are never persisted: records retain only profile kind, redacted key markers, and a fingerprint. Output replaces values of obvious secret-named environment variables with `[REDACTED]`.
 - Browser-facing APIs, WebSockets, and slash commands are intentionally not provided.
 
-OpenCode `permission.bash` rules are checked before spawn. Unavailable permission configuration and `ask` rules are denied. External working directories are resolved canonically; `permission.external_directory: "ask"` is denied because the plugin cannot render the native prompt.
+The installed OpenCode plugin SDK (1.3.13) exposes config reads and permission hooks, but no callable evaluator or prompt request API for a tool. Before spawn, this plugin applies a local matcher to `permission.bash`: only an explicit matching `allow` permits a command; absent, unmatched, `ask`, unreadable, and `deny` rules deny it. External directories use canonical containment and require explicit scalar `permission.external_directory: "allow"`; absent, object, `ask`, or `deny` rules fail closed. This is not an authoritative OpenCode permission invocation.
 
 This tranche does not provide per-session worker processes, native Job Objects/cgroups, terminal emulation, browser UI, signed binaries, OS CPU/memory limits, or a native descendant-process termination guarantee. Bun limits session count per owner, PTY input size/rate, retained output, and exec runtime/output only.
 
@@ -53,7 +53,7 @@ This tranche does not provide per-session worker processes, native Job Objects/c
 | `PTY_DAEMON_DIR` | per-user state directory | Daemon descriptor, session metadata, and output. |
 | `PTY_MAX_OUTPUT_BYTES` | `1000000` | Maximum retained output bytes per session. |
 
-Output is an append-only, session-local UTF-8 chunk journal. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
+Output is an append-only, session-local UTF-8 chunk journal. Callbacks are coalesced into bounded 64 KiB UTF-8 segments and retained output is capped at the configured value (up to 64 MiB), so fragmented output cannot create unbounded files. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
 
 The daemon `diagnostics` RPC reports active Bun-enforced limits and explicitly reports that native containment and process-tree termination are unavailable. It intentionally exposes no secret values or global session data.
 

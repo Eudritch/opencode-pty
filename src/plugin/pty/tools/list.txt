@@ -1,7 +1,7 @@
-Lists all PTY sessions (active and exited).
+Lists this OpenCode session's durable records (PTY and exec, including retained terminal records).
 
 Use this tool to:
-- See all running and exited PTY sessions
+- See owned running, exited, lost, and otherwise retained PTY and exec records
 - Get session IDs for use with other pty_* tools
 - Check the status and output line count of each session
 - Monitor which processes are still running
@@ -10,8 +10,8 @@ Returns for each session:
 - `id`: Unique identifier for use with other tools
 - `title`: Human-readable name
 - `command`: The command that was executed
-- `status`: Current status (running, exited, killed)
-- `exitCode`: Exit code (if exited/killed)
+- `status`: Current durable status (such as running, exited, lost, or timed_out)
+- `exitCode`: Exit code when observed
 - `pid`: Process ID
 - `lineCount`: Number of lines in the output buffer
 - `createdAt`: When the session was created

@@ -15,6 +15,10 @@ const LEGACY_OUTPUT_FILE = 'output.log'
 const OUTPUT_DIRECTORY = 'output'
 const START_LOCK_FILE = 'daemon-start.lock'
 const STALE_START_LOCK_MS = 10000
+const QUARANTINE_DIRECTORY = 'quarantine'
+const OUTPUT_SEGMENT_BYTES = 64 * 1024
+
+class InvalidSessionError extends Error {}
 
 export function daemonDataDirectory(): string {
   if (process.env.PTY_DAEMON_DIR) return process.env.PTY_DAEMON_DIR
@@ -24,6 +28,8 @@ export function daemonDataDirectory(): string {
 }
 
 export class DaemonStorage {
+  private readonly outputTails = new Map<string, OutputChunk>()
+
   constructor(private readonly root: string = daemonDataDirectory()) {}
 
   get rootDirectory(): string {
@@ -61,6 +67,7 @@ export class DaemonStorage {
   async initialize(): Promise<void> {
     await this.privateDirectory(this.root)
     await this.privateDirectory(join(this.root, SESSIONS_DIRECTORY))
+    await this.privateDirectory(join(this.root, QUARANTINE_DIRECTORY))
   }
 
   async readDescriptor(): Promise<DaemonDescriptor | null> {
@@ -143,10 +150,27 @@ export class DaemonStorage {
     const directory = this.outputDirectory(id)
     await this.privateDirectory(directory)
     for (const chunk of chunks) {
+      const previous = this.outputTails.get(id)
+      if (
+        previous &&
+        previous.endSequence === chunk.startSequence &&
+        previous.endSequence - previous.startSequence + (chunk.endSequence - chunk.startSequence) <=
+          OUTPUT_SEGMENT_BYTES
+      ) {
+        previous.endSequence = chunk.endSequence
+        previous.data += chunk.data
+        await this.writeAtomic(
+          join(directory, `${previous.startSequence.toString().padStart(20, '0')}.json`),
+          JSON.stringify(previous)
+        )
+        continue
+      }
       await this.writeAtomic(
         join(directory, `${chunk.startSequence.toString().padStart(20, '0')}.json`),
         JSON.stringify(chunk)
       )
+      if (!previous || chunk.endSequence > previous.endSequence)
+        this.outputTails.set(id, { ...chunk })
     }
   }
 
@@ -189,6 +213,7 @@ export class DaemonStorage {
       )
     }
     if (chunks.length > 0) await this.syncDirectory(this.outputDirectory(id))
+    this.outputTails.delete(id)
     return retained
   }
 
@@ -226,6 +251,7 @@ export class DaemonStorage {
   }
 
   async deleteSession(id: string): Promise<void> {
+    this.outputTails.delete(id)
     await rm(this.sessionDirectory(id), { recursive: true, force: true })
   }
 
@@ -244,11 +270,62 @@ export class DaemonStorage {
 
   private async readSession(id: string): Promise<SessionRecord | null> {
     try {
-      const record = JSON.parse(await readFile(this.metadataPath(id), 'utf8')) as SessionRecord
+      let record: unknown
+      try {
+        record = JSON.parse(await readFile(this.metadataPath(id), 'utf8'))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw new InvalidSessionError()
+      }
+      if (!this.validSession(record, id)) throw new InvalidSessionError()
       return this.migrateSession(record)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if (error instanceof InvalidSessionError) {
+        await this.quarantineSession(id)
+        return null
+      }
       throw error
+    }
+  }
+
+  private validSession(record: unknown, id: string): record is SessionRecord {
+    return (
+      Boolean(record) &&
+      typeof record === 'object' &&
+      (record as { id?: unknown }).id === id &&
+      typeof (record as { title?: unknown }).title === 'string' &&
+      typeof (record as { command?: unknown }).command === 'string' &&
+      Array.isArray((record as { args?: unknown }).args) &&
+      (record as { args: unknown[] }).args.every((arg) => typeof arg === 'string') &&
+      [
+        'starting',
+        'running',
+        'stopping',
+        'exited',
+        'timed_out',
+        'lost',
+        'spawn_failed',
+        'output_limited',
+      ].includes((record as { status?: unknown }).status as string) &&
+      typeof (record as { workdir?: unknown }).workdir === 'string' &&
+      typeof (record as { pid?: unknown }).pid === 'number' &&
+      typeof (record as { createdAt?: unknown }).createdAt === 'string' &&
+      typeof (record as { updatedAt?: unknown }).updatedAt === 'string' &&
+      typeof (record as { parentSessionId?: unknown }).parentSessionId === 'string' &&
+      typeof (record as { timedOut?: unknown }).timedOut === 'boolean'
+    )
+  }
+
+  private async quarantineSession(id: string): Promise<void> {
+    try {
+      await rename(
+        this.sessionDirectory(id),
+        join(this.root, QUARANTINE_DIRECTORY, `${id}-${Date.now()}-${crypto.randomUUID()}`)
+      )
+      console.warn(`Skipped malformed PTY session ${JSON.stringify(id)}.`)
+    } catch {
+      console.warn(`Skipped malformed PTY session ${JSON.stringify(id)}; quarantine failed.`)
     }
   }
 

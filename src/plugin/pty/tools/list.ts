@@ -11,14 +11,14 @@ export const ptyList = tool({
     const sessions = await manager.list(ownerContext(ctx.sessionID, ctx.directory))
 
     if (sessions.length === 0) {
-      return '<pty_list>\nNo active PTY sessions.\n</pty_list>'
+      return '<pty_list>\nNo PTY session records.\n</pty_list>'
     }
 
     const lines = ['<pty_list>']
     for (const session of sessions) {
       lines.push(...formatSessionInfo(session))
     }
-    lines.push(`Total: ${sessions.length} session(s)`)
+    lines.push(`Total retained records: ${sessions.length}`)
     lines.push('</pty_list>')
 
     return lines.join('\n')

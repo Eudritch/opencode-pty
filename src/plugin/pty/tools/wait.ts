@@ -2,6 +2,7 @@ import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
 import { ownerContext } from '../daemon-client.ts'
 import { escapeXml } from '../xml.ts'
+import { parseEscapeSequences } from './write.ts'
 
 const waitArgs = {
   id: tool.schema.string().describe('PTY session ID'),
@@ -47,12 +48,15 @@ export const ptyWait = tool({
 
 export const ptySendWait = tool({
   description: 'Send input to a running PTY, then wait daemon-side for output or exit.',
-  args: { ...waitArgs, data: tool.schema.string().describe('Input to send unchanged to the PTY') },
+  args: {
+    ...waitArgs,
+    data: tool.schema.string().describe('Input to send to the PTY; terminal escapes are decoded'),
+  },
   async execute(args, ctx) {
     return format(
       await manager.sendWait(
         args.id,
-        args.data,
+        parseEscapeSequences(args.data),
         condition(args),
         args.timeoutSeconds,
         ownerContext(ctx.sessionID, ctx.directory)

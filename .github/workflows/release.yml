@@ -14,18 +14,26 @@ permissions:
 
 jobs:
   publish:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.head_branch == 'main' &&
+           github.event.workflow_run.head_repository.full_name == github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Verify checked commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.8
 
       - name: Determine release state
         id: determine
@@ -53,8 +61,35 @@ jobs:
           fi
 
       - name: Install dependencies
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
         run: bun ci
+
+      - name: Validate release artifact
+        run: |
+          set -euo pipefail
+          bun typecheck
+          bun unittest
+          bun lint
+          bun format
+          bun build:prod
+          npm pack --dry-run
+          package=$(mktemp -d)
+          state=$(mktemp -d)
+          daemon_pid=""
+          cleanup() {
+            if [ -n "$daemon_pid" ]; then
+              kill -TERM "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+            fi
+            rm -rf "$package" "$state"
+          }
+          trap cleanup EXIT
+          npm pack --pack-destination "$package"
+          npm install --prefix "$package/installed" "$package"/*.tgz
+          bun --cwd "$package/installed" -e "await import('opencode-pty')"
+          PTY_DAEMON_DIR="$state" bun --cwd "$package/installed/node_modules/opencode-pty" dist/src/daemon/main.js &
+          daemon_pid=$!
+          for _ in $(seq 1 20); do test -f "$state/daemon.json" && break; sleep 0.1; done
+          test -f "$state/daemon.json"
 
       - name: Generate release notes
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'

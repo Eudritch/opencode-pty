@@ -1,16 +1,21 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
-import { ProcessError, SessionSupervisor } from '../src/daemon/supervisor.ts'
+import {
+  effectiveMaxOutputBytes,
+  ProcessError,
+  SessionSupervisor,
+} from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
 import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
 import { ownerContext } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine } from '../src/plugin/pty/formatters.ts'
-import { authorizeSpawn, initPermissions } from '../src/plugin/pty/permissions.ts'
+import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
+import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
 
 const roots: string[] = []
@@ -371,34 +376,148 @@ test('conversation cleanup excludes persistent sessions and environment values s
   await supervisor.flush()
 })
 
-test('spawn permission adapter checks argv and returns a canonical workdir', async () => {
+test('spawn permission adapter fails closed and isolates plugin contexts', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-'))
+  const external = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-external-'))
+  roots.push(root, external)
+  const authorizer = (permission: unknown, directory = root) =>
+    createSpawnAuthorizer(
+      {
+        config: { get: async () => ({ data: { permission } }) },
+        tui: { showToast: async () => {} },
+      } as never,
+      directory
+    )
+  const allow = authorizer({ bash: { '*': 'deny', [process.execPath]: 'allow' } })
+  expect(await allow(process.execPath, ['-e', 'process.exit()'], root)).toBe(root)
+  await expect(authorizer({})(process.execPath, [], root)).rejects.toThrow('no explicit allow')
+  await expect(authorizer({ bash: { '*': 'allow' } })('other-command', [], root)).resolves.toBe(
+    root
+  )
+  await expect(
+    authorizer({ bash: { '*': 'allow' } })(process.execPath, [], external)
+  ).rejects.toThrow('external_directory allow')
+  expect(
+    await authorizer({ bash: { '*': 'allow' }, external_directory: 'allow' })(
+      process.execPath,
+      [],
+      external
+    )
+  ).toBe(external)
+  await expect(authorizer({ bash: 'ask' })(process.execPath, [], root)).rejects.toThrow(
+    'no explicit allow'
+  )
+  await expect(authorizer('allow')(process.execPath, [], root)).rejects.toThrow('no explicit allow')
+  const secondRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-second-'))
+  roots.push(secondRoot)
+  await Promise.all([
+    expect(allow(process.execPath, [], root)).resolves.toBe(root),
+    expect(
+      authorizer({ bash: 'deny' }, secondRoot)(process.execPath, [], secondRoot)
+    ).rejects.toThrow('no explicit allow'),
+  ])
+})
+
+test('daemon rejects oversized content-length and chunked RPC bodies before JSON materialization', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-request-cap-'))
   roots.push(root)
-  let configReads = 0
-  initPermissions(
-    {
-      config: {
-        get: async () => {
-          configReads += 1
-          return { data: { permission: { bash: { [process.execPath]: 'allow' } } } }
-        },
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  const descriptor = await server.start()
+  const headers = { authorization: 'Bearer test-token', 'content-type': 'application/json' }
+  try {
+    await expect(
+      (server as unknown as { requestBody(request: Request): Promise<string> }).requestBody(
+        new Request(`${descriptor.endpoint}/rpc`, {
+          method: 'POST',
+          headers: { ...headers, 'content-length': '1048577' },
+          body: '{}',
+        })
+      )
+    ).rejects.toThrow('too large')
+    const chunked = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(1024 * 1024))
+        controller.enqueue(new Uint8Array(1))
+        controller.close()
       },
-      tui: { showToast: async () => {} },
-    } as never,
-    root
-  )
+    })
+    await expect(
+      (server as unknown as { requestBody(request: Request): Promise<string> }).requestBody(
+        new Request(`${descriptor.endpoint}/rpc`, {
+          method: 'POST',
+          headers,
+          body: chunked,
+          // Bun accepts request streams; browsers require this flag and ignore it here.
+          duplex: 'half',
+        } as RequestInit)
+      )
+    ).rejects.toThrow('too large')
+  } finally {
+    await server.stop()
+  }
+})
 
-  expect(await authorizeSpawn(process.execPath, ['-e', 'process.exit()'], root)).toBe(root)
-  expect(configReads).toBe(1)
-
-  initPermissions(
-    {
-      config: { get: async () => ({ data: { permission: { bash: 'deny' } } }) },
-      tui: { showToast: async () => {} },
-    } as never,
-    root
+test('malformed session metadata is quarantined without blocking daemon recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-malformed-session-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  await storage.initialize()
+  const bad = join(root, 'sessions', 'pty_bad')
+  await mkdir(bad)
+  await writeFile(
+    join(bad, 'session.json'),
+    JSON.stringify({ id: 'pty_bad', command: 'test', args: [], status: 'not-a-status' }),
+    'utf8'
   )
-  await expect(authorizeSpawn(process.execPath, [], root)).rejects.toThrow('disabled')
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  expect(await supervisor.list()).toEqual([])
+  expect(await readdir(join(root, 'quarantine'))).toHaveLength(1)
+})
+
+test('fragmented PTY output is coalesced and retained output stays bounded', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-fragmented-output-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_fragmented', 'exited')
+  await storage.writeSession(session)
+  const fragments = ['A', '😀', 'B']
+  let sequence = 0
+  for (const data of fragments) {
+    const endSequence = sequence + Buffer.byteLength(data)
+    await storage.appendOutput(session.id, [
+      { startSequence: sequence, endSequence, timestamp: session.updatedAt, data },
+    ])
+    sequence = endSequence
+  }
+  for (let index = 0; index < 256; index += 1) {
+    await storage.appendOutput(session.id, [
+      {
+        startSequence: sequence,
+        endSequence: sequence + 1,
+        timestamp: session.updatedAt,
+        data: 'x',
+      },
+    ])
+    sequence += 1
+  }
+  expect((await readdir(join(root, 'sessions', session.id, 'output'))).length).toBe(1)
+  expect(await storage.readOutput(session.id)).toStartWith('A😀B')
+  expect(await storage.trimOutput(session.id, 32)).toMatchObject({
+    outputBytes: 0,
+    outputTruncated: true,
+  })
+  expect(Buffer.byteLength(await storage.readOutput(session.id))).toBeLessThanOrEqual(32)
+})
+
+test('invalid PTY_MAX_OUTPUT_BYTES reports the effective safe default', () => {
+  expect(effectiveMaxOutputBytes('invalid')).toBe(1000000)
+  expect(effectiveMaxOutputBytes('0')).toBe(1000000)
+})
+
+test('pty_write and pty_send_wait use equivalent terminal escape decoding', () => {
+  expect(parseEscapeSequences(String.raw`one\n\x03\u2192\\`)).toBe('one\n\x03→\\')
 })
 
 test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evidence', async () => {

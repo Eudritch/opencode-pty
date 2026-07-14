@@ -15,11 +15,8 @@ import {
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
 
-const configuredOutputLimit = Number.parseInt(process.env.PTY_MAX_OUTPUT_BYTES ?? '1000000', 10)
-const DEFAULT_MAX_OUTPUT_BYTES =
-  Number.isSafeInteger(configuredOutputLimit) && configuredOutputLimit > 0
-    ? configuredOutputLimit
-    : 1000000
+const DEFAULT_MAX_OUTPUT_BYTES = 1000000
+const MAX_OUTPUT_BYTES = 64 * 1024 * 64
 const OUTPUT_CHUNK_BYTES = 64 * 1024
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
@@ -42,6 +39,9 @@ interface ActiveSession {
   process: IPty
   environment: Record<string, string>
   timeout?: ReturnType<typeof setTimeout>
+  outputBuffer: string
+  outputBufferBytes: number
+  outputTimer?: ReturnType<typeof setTimeout>
 }
 
 interface ExecOptions extends SpawnOptions {
@@ -56,6 +56,13 @@ interface PendingWait {
 }
 
 export class ProcessError extends Error {}
+
+export function effectiveMaxOutputBytes(value = process.env.PTY_MAX_OUTPUT_BYTES): number {
+  const parsed = Number.parseInt(value ?? '', 10)
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? Math.min(parsed, MAX_OUTPUT_BYTES)
+    : DEFAULT_MAX_OUTPUT_BYTES
+}
 
 function lineCount(output: string): number {
   if (!output) return 0
@@ -91,14 +98,14 @@ function searchLines(
   })
 }
 
-function outputChunks(data: string, startSequence: number, maxBytes: number) {
+function outputChunks(data: string, startSequence: number) {
   const chunks: Array<{
     startSequence: number
     endSequence: number
     timestamp: string
     data: string
   }> = []
-  const chunkBytes = Math.max(1, Math.min(OUTPUT_CHUNK_BYTES, maxBytes))
+  const chunkBytes = OUTPUT_CHUNK_BYTES
   let text = ''
   let bytes = 0
   let sequence = startSequence
@@ -189,7 +196,7 @@ export class SessionSupervisor {
 
   constructor(
     private readonly storage: DaemonStorage,
-    private readonly maxOutputBytes: number = DEFAULT_MAX_OUTPUT_BYTES
+    private readonly maxOutputBytes: number = effectiveMaxOutputBytes()
   ) {}
 
   async initialize(): Promise<void> {
@@ -301,7 +308,13 @@ export class SessionSupervisor {
     record.pid = ptyProcess.pid
     record.status = 'running'
     record.updatedAt = new Date().toISOString()
-    const active: ActiveSession = { record, process: ptyProcess, environment }
+    const active: ActiveSession = {
+      record,
+      process: ptyProcess,
+      environment,
+      outputBuffer: '',
+      outputBufferBytes: 0,
+    }
     this.active.set(id, active)
     ptyProcess.onData((data: string) => this.handleOutput(active, redactOutput(data, environment)))
     ptyProcess.onExit(
@@ -715,6 +728,7 @@ export class SessionSupervisor {
   }
 
   async flush(): Promise<void> {
+    for (const active of this.active.values()) this.persistOutput(active)
     await this.persistQueue
   }
 
@@ -744,19 +758,33 @@ export class SessionSupervisor {
 
   private handleOutput(active: ActiveSession, data: string): void {
     if (!data) return
+    active.outputBuffer += data
+    active.outputBufferBytes += Buffer.byteLength(data)
+    if (active.outputBufferBytes >= OUTPUT_CHUNK_BYTES) this.persistOutput(active)
+    else if (!active.outputTimer)
+      active.outputTimer = setTimeout(() => this.persistOutput(active), 10)
+  }
+
+  private persistOutput(active: ActiveSession): void {
+    if (!active.outputBuffer) return
+    if (active.outputTimer) clearTimeout(active.outputTimer)
+    active.outputTimer = undefined
+    const buffered = active.outputBuffer
+    active.outputBuffer = ''
+    active.outputBufferBytes = 0
     this.enqueuePersist(async () => {
       const next = { ...active.record }
-      const byteLength = Buffer.byteLength(data)
-      const chunks = outputChunks(data, next.nextSequence, this.maxOutputBytes)
+      const byteLength = Buffer.byteLength(buffered)
+      const chunks = outputChunks(buffered, next.nextSequence)
       next.nextSequence += byteLength
       next.outputBytes += byteLength
-      const newlines = data.split('\n').length - 1
+      const newlines = buffered.split('\n').length - 1
       if (next.outputHasPartialLine) {
-        next.lineCount += newlines - (data.endsWith('\n') ? 1 : 0)
+        next.lineCount += newlines - (buffered.endsWith('\n') ? 1 : 0)
       } else {
-        next.lineCount += newlines + (data && !data.endsWith('\n') ? 1 : 0)
+        next.lineCount += newlines + (buffered && !buffered.endsWith('\n') ? 1 : 0)
       }
-      next.outputHasPartialLine = !data.endsWith('\n')
+      next.outputHasPartialLine = !buffered.endsWith('\n')
       next.updatedAt = new Date().toISOString()
       await this.storage.appendOutput(next.id, chunks)
       await this.trimOutput(next)
@@ -778,6 +806,7 @@ export class SessionSupervisor {
     signal?: number | string
   ): void {
     if (active.timeout) clearTimeout(active.timeout)
+    this.persistOutput(active)
     this.active.delete(active.record.id)
     if (active.record.timedOut) {
       active.record.status = 'timed_out'

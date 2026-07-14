@@ -6,11 +6,7 @@ import DESCRIPTION from './write.txt'
 
 const ETX = String.fromCharCode(3)
 
-/**
- * Parse escape sequences in a string to their actual byte values.
- * Handles: \n, \r, \t, \xNN (hex), \uNNNN (unicode), \\
- */
-function parseEscapeSequences(input: string): string {
+export function parseEscapeSequences(input: string): string {
   return input.replace(/\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|[nrt\\])/g, (match, seq: string) => {
     if (seq.startsWith('x')) {
       return String.fromCharCode(parseInt(seq.slice(1), 16))
@@ -50,7 +46,6 @@ export const ptyWrite = tool({
       throw new Error(`Cannot write to PTY '${args.id}' - session status is '${session.status}'.`)
     }
 
-    // Parse escape sequences to actual bytes
     const parsedData = parseEscapeSequences(args.data)
 
     const result = await manager.write(args.id, parsedData, owner)
