@@ -68,6 +68,7 @@ export function daemonDataDirectory(): string {
 export class DaemonStorage {
   private readonly outputTails = new Map<string, OutputChunk>()
   private windowsUserSid: Promise<string> | undefined
+  private windowsRootProtected = false
 
   constructor(private readonly root: string = daemonDataDirectory()) {}
 
@@ -104,6 +105,18 @@ export class DaemonStorage {
   }
 
   async initialize(): Promise<void> {
+    if (process.platform === 'win32') {
+      await mkdir(this.root, { recursive: true, mode: 0o700 })
+      if (!this.windowsRootProtected) {
+        await this.protectWindowsPath(this.root, true)
+        this.windowsRootProtected = true
+      }
+      await Promise.all([
+        mkdir(join(this.root, SESSIONS_DIRECTORY), { recursive: true, mode: 0o700 }),
+        mkdir(join(this.root, QUARANTINE_DIRECTORY), { recursive: true, mode: 0o700 }),
+      ])
+      return
+    }
     await this.privateDirectory(this.root)
     await this.privateDirectory(join(this.root, SESSIONS_DIRECTORY))
     await this.privateDirectory(join(this.root, QUARANTINE_DIRECTORY))
@@ -638,43 +651,83 @@ export class DaemonStorage {
   }
 
   private async privateDirectory(path: string): Promise<void> {
+    if (process.platform === 'win32') {
+      await this.initialize()
+      await mkdir(path, { recursive: true, mode: 0o700 })
+      return
+    }
     await mkdir(path, { recursive: true, mode: 0o700 })
-    if (process.platform === 'win32') await this.protectWindowsPath(path, true, true)
-    else await chmod(path, 0o700)
+    await chmod(path, 0o700)
   }
 
   private async privateFile(path: string): Promise<void> {
-    if (process.platform === 'win32') await this.protectWindowsPath(path, false, false)
-    else await chmod(path, 0o600)
+    // ponytail: files inherit the verified root DACL; per-write ACL subprocesses would block output persistence.
+    if (process.platform !== 'win32') await chmod(path, 0o600)
   }
 
-  private async protectWindowsPath(
-    path: string,
-    directory: boolean,
-    recursive: boolean
-  ): Promise<void> {
+  private async protectWindowsPath(path: string, recursive: boolean): Promise<void> {
     const sid = await this.currentWindowsUserSid()
-    const inheritedGrant = directory ? '(OI)(CI)F' : 'F'
     const child = Bun.spawn({
       cmd: [
-        'icacls.exe',
-        path,
-        '/inheritance:r',
-        '/grant:r',
-        `*${sid}:F`,
-        '/grant:r',
-        '*S-1-5-18:F',
-        ...(directory
-          ? ['/grant', `*${sid}:${inheritedGrant}`, '/grant', `*S-1-5-18:${inheritedGrant}`]
-          : []),
-        ...(recursive ? ['/t'] : []),
+        'powershell.exe',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$ErrorActionPreference = 'Stop'
+$path = $env:PTY_DAEMON_ACL_PATH
+$user = [System.Security.Principal.SecurityIdentifier]::new($env:PTY_DAEMON_ACL_USER_SID)
+$system = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+$none = [System.Security.AccessControl.PropagationFlags]::None
+function Set-PrivateDacl($item) {
+  $isDirectory = $item.PSIsContainer
+  $security = if ($isDirectory) {
+    [System.Security.AccessControl.DirectorySecurity]::new()
+  } else {
+    [System.Security.AccessControl.FileSecurity]::new()
+  }
+  $inheritance = if ($isDirectory) {
+    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+  } else {
+    [System.Security.AccessControl.InheritanceFlags]::None
+  }
+  $security.SetAccessRuleProtection($true, $false)
+  foreach ($identity in @($user, $system)) {
+    [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($identity, $fullControl, $inheritance, $none, $allow))
+  }
+  $item.SetAccessControl($security)
+}
+function Test-PrivateDacl($item) {
+  $security = $item.GetAccessControl()
+  $inheritance = if ($item.PSIsContainer) {
+    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+  } else {
+    [System.Security.AccessControl.InheritanceFlags]::None
+  }
+  $rules = @($security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  if (-not $security.AreAccessRulesProtected -or $rules.Count -ne 2) { throw 'DACL was not replaced.' }
+  foreach ($rule in $rules) {
+    if (($rule.IdentityReference.Value -ne $user.Value -and $rule.IdentityReference.Value -ne $system.Value) -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $fullControl -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $none) { throw 'DACL contains an unexpected ACE.' }
+  }
+}
+$items = @(Get-Item -LiteralPath $path -Force)
+if (${recursive ? '$true' : '$false'}) { $items += @(Get-ChildItem -LiteralPath $path -Force -Recurse) }
+foreach ($item in $items) { Set-PrivateDacl $item }
+foreach ($item in $items) { Test-PrivateDacl $item }`,
       ],
-      stdout: 'ignore',
+      stdout: 'pipe',
       stderr: 'pipe',
+      env: {
+        ...process.env,
+        PTY_DAEMON_ACL_PATH: path,
+        PTY_DAEMON_ACL_USER_SID: sid,
+      },
     })
     const exitCode = await child.exited
     if (exitCode === 0) return
-    const error = (await new Response(child.stderr).text()).trim()
+    const error =
+      `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`.trim()
     throw new Error(
       `Unable to protect daemon storage with a Windows DACL${error ? `: ${error}` : '.'}`
     )

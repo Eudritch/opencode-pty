@@ -411,6 +411,12 @@ test('spawn permission adapter fails closed and isolates plugin contexts', async
   const git = authorizer({ bash: { '*': 'deny', 'git status': 'allow' } })
   await expect(git('git', ['status'], root)).resolves.toBe(root)
   await expect(git('git', ['reset', '--hard', 'status'], root)).rejects.toThrow('no explicit allow')
+  await expect(
+    authorizer({ bash: { '*': 'deny', 'git *': 'allow' } })('git', ['status'], root)
+  ).resolves.toBe(root)
+  await expect(
+    authorizer({ bash: { '*': 'allow', 'git *': 'deny' } })('git', ['status'], root)
+  ).rejects.toThrow('no explicit allow')
   const secondRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-second-'))
   roots.push(secondRoot)
   await Promise.all([
@@ -909,37 +915,95 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
   }
 })
 
-test('daemon storage protects private paths on POSIX', async () => {
+test('daemon storage protects private paths', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-modes-'))
   roots.push(root)
-  const storage = new DaemonStorage(root)
-  await storage.initialize()
-  await storage.writeDescriptor({
-    pid: process.pid,
-    endpoint: 'http://127.0.0.1:1',
-    protocolVersion: DAEMON_PROTOCOL_VERSION,
-    token: 'x',
-  })
-  await storage.writeSession(record(root, 'pty_test', 'exited'))
-  await storage.appendOutput('pty_test', [
-    { startSequence: 0, endSequence: 6, timestamp: new Date().toISOString(), data: 'output' },
-  ])
-  if (process.platform !== 'win32') {
-    expect((await stat(root)).mode & 0o777).toBe(0o700)
-    expect((await stat(join(root, 'daemon.json'))).mode & 0o777).toBe(0o600)
-    expect((await stat(join(root, 'sessions', 'pty_test'))).mode & 0o777).toBe(0o700)
-    expect((await stat(join(root, 'sessions', 'pty_test', 'session.json'))).mode & 0o777).toBe(
-      0o600
-    )
-    expect(
-      (await stat(join(root, 'sessions', 'pty_test', 'output', '00000000000000000000.json'))).mode &
-        0o777
-    ).toBe(0o600)
-  } else {
-    const acl = Bun.spawn({ cmd: ['icacls.exe', root], stdout: 'pipe', stderr: 'ignore' })
-    const output = await new Response(acl.stdout).text()
-    expect(await acl.exited).toBe(0)
-    expect(output).toMatch(/SYSTEM.*\(.*F\)/)
+  const previousDirectory = process.env.PTY_DAEMON_DIR
+  process.env.PTY_DAEMON_DIR = root
+  if (process.platform === 'win32') {
+    const foreignAcl = Bun.spawn({
+      cmd: [
+        'powershell.exe',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$acl = Get-Acl -LiteralPath $env:PTY_DAEMON_ACL_PATH
+$everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($everyone, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $env:PTY_DAEMON_ACL_PATH -AclObject $acl`,
+      ],
+      stdout: 'ignore',
+      stderr: 'pipe',
+      env: { ...process.env, PTY_DAEMON_ACL_PATH: root },
+    })
+    expect(await foreignAcl.exited).toBe(0)
+    process.env.PTY_DAEMON_DIR = root
+  }
+  const storage = new DaemonStorage()
+  try {
+    await storage.initialize()
+    await storage.writeDescriptor({
+      pid: process.pid,
+      endpoint: 'http://127.0.0.1:1',
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
+      token: 'x',
+    })
+    await storage.writeSession(record(root, 'pty_test', 'exited'))
+    await storage.appendOutput('pty_test', [
+      { startSequence: 0, endSequence: 6, timestamp: new Date().toISOString(), data: 'output' },
+    ])
+    if (process.platform !== 'win32') {
+      expect((await stat(root)).mode & 0o777).toBe(0o700)
+      expect((await stat(join(root, 'daemon.json'))).mode & 0o777).toBe(0o600)
+      expect((await stat(join(root, 'sessions', 'pty_test'))).mode & 0o777).toBe(0o700)
+      expect((await stat(join(root, 'sessions', 'pty_test', 'session.json'))).mode & 0o777).toBe(
+        0o600
+      )
+      expect(
+        (await stat(join(root, 'sessions', 'pty_test', 'output', '00000000000000000000.json')))
+          .mode & 0o777
+      ).toBe(0o600)
+    } else {
+      const sidProcess = Bun.spawn({
+        cmd: [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+        ],
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      const sid = (await new Response(sidProcess.stdout).text()).trim()
+      expect(await sidProcess.exited).toBe(0)
+      const acl = Bun.spawn({
+        cmd: [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$items = @(Get-Item -LiteralPath $env:PTY_DAEMON_ACL_PATH -Force) + @(Get-ChildItem -LiteralPath $env:PTY_DAEMON_ACL_PATH -Force -Recurse)
+foreach ($item in $items) {
+  $rules = @($item.GetAccessControl().GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  if ($rules.Count -ne 2 -or @($rules | Where-Object { $_.IdentityReference.Value -notin @($env:PTY_DAEMON_ACL_USER_SID, 'S-1-5-18') }).Count -ne 0) { throw "Foreign ACE survived daemon storage initialization: $($item.FullName): $($rules.IdentityReference.Value -join ',')." }
+}`,
+        ],
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...process.env,
+          PTY_DAEMON_ACL_PATH: root,
+          PTY_DAEMON_ACL_USER_SID: sid,
+        },
+      })
+      const error = `${await new Response(acl.stdout).text()}${await new Response(acl.stderr).text()}`
+      if ((await acl.exited) !== 0) throw new Error(error)
+    }
+  } finally {
+    if (previousDirectory === undefined) delete process.env.PTY_DAEMON_DIR
+    else process.env.PTY_DAEMON_DIR = previousDirectory
   }
 })
 

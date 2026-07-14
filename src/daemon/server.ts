@@ -36,13 +36,14 @@ export class DaemonServer implements Disposable {
   constructor(
     private readonly storage: DaemonStorage,
     private readonly supervisor: SessionSupervisor,
-    private readonly token: string = crypto.randomUUID().replaceAll('-', ''),
+    private token: string = '',
     private readonly maxSessionsPerOwner: number = DEFAULT_MAX_SESSIONS_PER_OWNER
   ) {}
 
   async start(): Promise<DaemonDescriptor> {
     await this.supervisor.initialize()
     this.ownershipSecret = await this.storage.ownershipSecret()
+    this.token ||= crypto.randomUUID().replaceAll('-', '')
     this.server = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
