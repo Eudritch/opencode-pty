@@ -157,6 +157,14 @@ function activeStatus(record: SessionRecord): boolean {
   return record.status === 'starting' || record.status === 'running' || record.status === 'stopping'
 }
 
+function containmentDrained(record: Pick<SessionRecord, 'containment'>): boolean {
+  return (
+    !record.containment ||
+    record.containment.status === 'posix_best_effort_empty' ||
+    record.containment.status === 'not_applicable'
+  )
+}
+
 function canonicalWorkdir(workdir: string | undefined): string {
   return realpathSync(resolve(workdir ?? process.cwd()))
 }
@@ -258,6 +266,7 @@ export class SessionSupervisor {
   async initialize(): Promise<void> {
     await this.storage.initialize()
     for (const record of await this.storage.loadSessions()) {
+      if (record.containment) record.containment.rootIdentityVerified ??= false
       record.mode ??= 'pty'
       record.ownerProjectDirectory ??= record.workdir
       record.ownerCapabilityHash ??= ''
@@ -780,7 +789,11 @@ export class SessionSupervisor {
   }
 
   private nativeTerminal(result: WorkerSnapshot): boolean {
-    return result.terminationConfirmed && result.status !== 'running'
+    return (
+      result.terminationConfirmed &&
+      result.status !== 'running' &&
+      containmentDrained({ containment: result.containment })
+    )
   }
 
   private async rollbackNative(
@@ -925,6 +938,8 @@ export class SessionSupervisor {
       firstRetainedSequence: record.firstRetainedSequence,
       nextSequence: record.nextSequence,
       truncated: record.outputTruncated,
+      containment: record.containment,
+      termination: record.termination,
     }
   }
 
@@ -1060,10 +1075,15 @@ export class SessionSupervisor {
     if (worker) {
       try {
         const result = await worker.shutdown()
-        if (!result.terminationConfirmed || result.status === 'running') return false
+        if (
+          !result.terminationConfirmed ||
+          result.status === 'running' ||
+          !containmentDrained({ containment: result.containment })
+        )
+          return false
       } catch {
         // A completed worker may have already removed its listener; its persisted terminal record is authoritative.
-        if (!record.terminationConfirmed) return false
+        if (!record.terminationConfirmed || !containmentDrained(record)) return false
       }
     }
     this.nativeWorkers.delete(id)
@@ -1310,6 +1330,8 @@ export class SessionSupervisor {
       exitCode: record.exitCode,
       exitSignal: record.exitSignal,
       outputTruncated: record.outputTruncated,
+      containment: record.containment,
+      termination: record.termination,
     }
   }
 
@@ -1440,7 +1462,7 @@ export class SessionSupervisor {
   }
 
   private isTerminal(record: SessionRecord): boolean {
-    return record.terminationConfirmed
+    return record.terminationConfirmed && containmentDrained(record)
   }
 
   private toInfo(record: SessionRecord): PTYSessionInfo {
@@ -1459,6 +1481,8 @@ export class SessionSupervisor {
       timedOut: record.timedOut,
       terminationRequested: record.terminationRequested,
       terminationConfirmed: record.terminationConfirmed,
+      containment: record.containment,
+      termination: record.termination,
       exitCode: record.exitCode,
       exitSignal: record.exitSignal,
       exitReason: record.exitReason,

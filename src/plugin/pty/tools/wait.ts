@@ -28,7 +28,8 @@ function condition(args: { literal?: string; regex?: string; exit?: boolean }) {
 }
 
 function format(result: Awaited<ReturnType<typeof manager.wait>>): string {
-  return `<pty_wait satisfied="${result.satisfied}" reason="${escapeXml(result.reason)}" matched="${escapeXml(result.matched ?? '')}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" output_truncated="${result.outputTruncated}"/>`
+  const containment = result.containment
+  return `<pty_wait satisfied="${result.satisfied}" reason="${escapeXml(result.reason)}" matched="${escapeXml(result.matched ?? '')}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" output_truncated="${result.outputTruncated}" termination_confirmed="${Boolean(result.termination?.rootExited && containment?.status === 'posix_best_effort_empty')}" containment="${escapeXml(containment?.status ?? 'unavailable')}" group_pids="${containment?.observedGroupPids.join(',') ?? ''}" session_pids="${containment?.observedSessionPids.join(',') ?? ''}" escaped_pids="${containment?.observedEscapedDescendantPids.join(',') ?? ''}"/>`
 }
 
 export const ptyWait = tool({

@@ -33,6 +33,7 @@ export interface PTYSessionInfo {
   terminationRequested: boolean
   terminationConfirmed: boolean
   containment?: ContainmentReport
+  termination?: import('../../daemon/types.ts').TerminationResult
   exitCode?: number
   exitSignal?: number | string
   exitReason?: ExitReason
@@ -82,6 +83,8 @@ export interface ReadResult {
   firstRetainedSequence: number
   nextSequence: number
   truncated: boolean
+  containment?: ContainmentReport
+  termination?: import('../../daemon/types.ts').TerminationResult
 }
 
 export interface SearchResult {

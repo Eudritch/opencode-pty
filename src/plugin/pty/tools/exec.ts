@@ -40,6 +40,9 @@ export function createShellExec(authorizeSpawn: SpawnAuthorizer) {
         '<stderr>',
         escapeXml(result.stderr),
         '</stderr>',
+        result.containment
+          ? `<containment status="${escapeXml(result.containment.status)}" root_identity_verified="${result.containment.rootIdentityVerified}" group_pids="${result.containment.observedGroupPids.join(',')}" session_pids="${result.containment.observedSessionPids.join(',')}" escaped_pids="${result.containment.observedEscapedDescendantPids.join(',')}"/>`
+          : '',
         '</shell_exec>',
       ].join('\n')
     },

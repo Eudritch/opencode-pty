@@ -19,6 +19,12 @@ function buildTimeoutReminder(session: PTYSessionInfo): string {
   ].join('\n')
 }
 
+function containmentAttributes(session: PTYSessionInfo): string {
+  return session.containment
+    ? ` containment="${escapeXml(session.containment.status)}" termination_confirmed="${session.terminationConfirmed}" group_pids="${session.containment.observedGroupPids.join(',')}" session_pids="${session.containment.observedSessionPids.join(',')}" escaped_pids="${session.containment.observedEscapedDescendantPids.join(',')}"`
+    : ''
+}
+
 interface ReadArgs {
   id: string
   offset?: number
@@ -43,7 +49,7 @@ function formatPtyOutput(
   endMessage: string
 ): string {
   const output = [
-    `<pty_output id="${escapeXml(id)}" status="${escapeXml(status)}" output_sequence="${session.outputSequence ?? 0}" retained_from="${session.firstRetainedSequence ?? 0}" truncated="${session.outputTruncated ?? false}"${pattern ? ` pattern="${escapeXml(pattern)}"` : ''}>`,
+    `<pty_output id="${escapeXml(id)}" status="${escapeXml(status)}" output_sequence="${session.outputSequence ?? 0}" retained_from="${session.firstRetainedSequence ?? 0}" truncated="${session.outputTruncated ?? false}"${pattern ? ` pattern="${escapeXml(pattern)}"` : ''}${containmentAttributes(session)}>`,
     ...formattedLines,
     '',
     hasMore ? paginationMessage : endMessage,
@@ -85,7 +91,7 @@ async function handlePatternRead(
   if (result.matches.length === 0) {
     return appendSessionReminders(
       [
-        `<pty_output id="${escapeXml(id)}" status="${escapeXml(session.status)}" output_sequence="${result.nextSequence}" retained_from="${result.firstRetainedSequence}" truncated="${result.truncated}" pattern="${escapeXml(pattern)}">`,
+        `<pty_output id="${escapeXml(id)}" status="${escapeXml(session.status)}" output_sequence="${result.nextSequence}" retained_from="${result.firstRetainedSequence}" truncated="${result.truncated}" pattern="${escapeXml(pattern)}"${containmentAttributes(session)}>`,
         `No lines matched the pattern '${escapeXml(pattern)}'.`,
         `Total lines in buffer: ${result.totalLines}`,
         `</pty_output>`,
@@ -140,7 +146,7 @@ async function handlePlainRead(
   if (result.lines.length === 0) {
     return appendSessionReminders(
       [
-        `<pty_output id="${escapeXml(args.id)}" status="${escapeXml(session.status)}" output_sequence="${result.nextSequence}" retained_from="${result.firstRetainedSequence}" truncated="${result.truncated}">`,
+        `<pty_output id="${escapeXml(args.id)}" status="${escapeXml(session.status)}" output_sequence="${result.nextSequence}" retained_from="${result.firstRetainedSequence}" truncated="${result.truncated}"${containmentAttributes(session)}>`,
         `(No output available - buffer is empty)`,
         `Total lines: ${result.totalLines}`,
         `</pty_output>`,

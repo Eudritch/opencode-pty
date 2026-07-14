@@ -39,12 +39,13 @@ export interface ContainmentReport {
     | 'posix_best_effort_empty'
     | 'posix_processes_remaining'
     | 'posix_escape_observed'
-    | 'posix_verification_unavailable'
+    | 'posix_containment_unknown'
     | 'not_applicable'
   rootPid: number
   processGroupId?: number
   sessionId?: number
   rootStartIdentity: string
+  rootIdentityVerified: boolean
   observedGroupPids: number[]
   observedSessionPids: number[]
   observedEscapedDescendantPids: number[]
@@ -88,6 +89,8 @@ export interface WaitResult {
   exitCode?: number
   exitSignal?: number | string
   outputTruncated: boolean
+  containment?: ContainmentReport
+  termination?: TerminationResult
 }
 
 export interface ExecResult {

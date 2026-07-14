@@ -8,6 +8,9 @@ export function formatSessionInfo(session: PTYSessionInfo): string[] {
   const timeoutInfo =
     session.timeoutSeconds !== undefined ? ` | timeout: ${session.timeoutSeconds}s` : ''
   const outputInfo = session.outputTruncated ? ' (older output truncated)' : ''
+  const containment = session.containment
+    ? `  Containment: ${session.containment.status} | root verified: ${session.containment.rootIdentityVerified ? 'yes' : 'no'} | group: ${session.containment.observedGroupPids.join(',') || 'none'} | session: ${session.containment.observedSessionPids.join(',') || 'none'} | escaped: ${session.containment.observedEscapedDescendantPids.join(',') || 'none'}`
+    : ''
   return [
     `[${escapeXml(session.id)}] ${escapeXml(session.title)}`,
     `  Command: ${escapeXml(session.command)} ${escapeXml(session.args.join(' '))}`,
@@ -16,6 +19,7 @@ export function formatSessionInfo(session: PTYSessionInfo): string[] {
     `  Lines: ${session.lineCount}${outputInfo}`,
     `  Workdir: ${escapeXml(session.workdir)}`,
     `  Created: ${escapeXml(session.createdAt)}`,
+    ...(containment ? [escapeXml(containment)] : []),
     '',
   ]
 }

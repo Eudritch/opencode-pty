@@ -457,13 +457,14 @@ export class DaemonStorage {
           'posix_best_effort_empty',
           'posix_processes_remaining',
           'posix_escape_observed',
-          'posix_verification_unavailable',
+          'posix_containment_unknown',
           'not_applicable',
         ].includes(String(value.status)) &&
         validNonnegativeInteger(value.rootPid) &&
         (value.processGroupId === null || validOptionalInteger(value.processGroupId)) &&
         (value.sessionId === null || validOptionalInteger(value.sessionId)) &&
         validText(value.rootStartIdentity) &&
+        (value.rootIdentityVerified === undefined || typeof value.rootIdentityVerified === 'boolean') &&
         [
           value.observedGroupPids,
           value.observedSessionPids,

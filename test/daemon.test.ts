@@ -13,7 +13,7 @@ import {
 } from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
 import { DaemonClient, ownerContext } from '../src/plugin/pty/daemon-client.ts'
-import { formatLine } from '../src/plugin/pty/formatters.ts'
+import { formatLine, formatSessionInfo } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
@@ -1446,7 +1446,7 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
       if (!record) await Bun.sleep(20)
     }
     expect(record?.containment).toMatchObject({
-      platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
+       platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
       rootPid: record?.pid,
       processGroupId: record?.pid,
       sessionId: record?.pid,
@@ -1459,7 +1459,7 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
           status:
             process.platform === 'linux'
               ? 'posix_best_effort_empty'
-              : 'posix_verification_unavailable',
+               : 'posix_containment_unknown',
         },
       },
     })
@@ -1513,6 +1513,57 @@ test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`ok\u0000\u001f\ud800😀`)).toBe('ok���😀')
   expect(formatLine('<output>', 1)).toContain('&lt;output&gt;')
   expect(formatLine('😀x', 1, 1)).toContain('😀...')
+})
+
+test('tool session rendering preserves containment survivors and unknown verification', () => {
+  const root = process.cwd()
+  const session = record(root, 'exec_survivor', 'lost')
+  session.mode = 'exec'
+  session.terminationRequested = true
+  session.terminationConfirmed = false
+  session.containment = {
+    platform: 'linux_proc',
+    status: 'posix_processes_remaining',
+    rootPid: 1,
+    processGroupId: 1,
+    sessionId: 1,
+    rootStartIdentity: 'posix:1:1',
+    rootIdentityVerified: false,
+    observedGroupPids: [2],
+    observedSessionPids: [2],
+    observedEscapedDescendantPids: [],
+    verifiedAt: new Date().toISOString(),
+  }
+  expect(formatSessionInfo(session).join('\n')).toContain('Containment: posix_processes_remaining')
+  session.containment.status = 'posix_containment_unknown'
+  expect(formatSessionInfo(session).join('\n')).toContain('Containment: posix_containment_unknown')
+})
+
+test('cleanup retains a terminal record with unverified containment', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-containment-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  await storage.initialize()
+  const session = record(root, 'exec_unverified', 'exited')
+  session.mode = 'exec'
+  session.containment = {
+    platform: 'linux_proc',
+    status: 'posix_containment_unknown',
+    rootPid: 1,
+    processGroupId: 1,
+    sessionId: 1,
+    rootStartIdentity: 'posix:1:1',
+    rootIdentityVerified: false,
+    observedGroupPids: [],
+    observedSessionPids: [],
+    observedEscapedDescendantPids: [],
+    verifiedAt: new Date().toISOString(),
+  }
+  await storage.writeSession(session)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  expect(await supervisor.cleanup(session.id)).toBeFalse()
+  expect((await storage.loadSessions()).map((entry) => entry.id)).toContain(session.id)
 })
 
 test('client preserves a healthy incompatible daemon descriptor', async () => {
