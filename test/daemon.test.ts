@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { existsSync, realpathSync, watch } from 'node:fs'
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
@@ -1572,6 +1572,8 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-posix', root)
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-posix')
+  const directChildPidFile = join(root, 'direct-child.pid')
+  let directChildPid = 0
   let escapedPid = 0
   try {
     const descriptor = await server.start()
@@ -1583,7 +1585,7 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
         context
       )
     const running = run(
-      "const {spawn}=require('node:child_process');spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});setInterval(()=>{},1000)"
+      `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});writeFileSync(${JSON.stringify(directChildPidFile)},String(child.pid));setInterval(()=>{},1000)`
     )
     let record: SessionRecord | undefined
     for (let attempt = 0; attempt < 50 && !record; attempt += 1) {
@@ -1596,6 +1598,11 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
       processGroupId: record?.pid,
       sessionId: record?.pid,
     })
+    for (let attempt = 0; attempt < 50 && !directChildPid; attempt += 1) {
+      directChildPid = Number((await readFile(directChildPidFile, 'utf8').catch(() => '')).trim())
+      if (!directChildPid) await Bun.sleep(20)
+    }
+    if (process.platform === 'darwin') expect(directChildPid).toBeGreaterThan(0)
     const stopped = await rpc(descriptor, 'stop', { id: record?.id }, context).then((response) =>
       response.json()
     )
@@ -1659,12 +1666,23 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
       })
     await escaped
   } finally {
-    if (escapedPid) process.kill(escapedPid, 'SIGKILL')
-    await server.stop()
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    try {
+      if (process.platform === 'darwin' && directChildPid) {
+        try {
+          process.kill(directChildPid, 'SIGKILL')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+        }
+        expect(await processGone(directChildPid)).toBeTrue()
+      }
+      if (escapedPid) process.kill(escapedPid, 'SIGKILL')
+    } finally {
+      await server.stop()
+      if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+      else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    }
   }
 }, 15_000)
 

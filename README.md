@@ -71,7 +71,7 @@ Native artifact tarballs have SHA-256 entries and GitHub build provenance in the
 ## Development
 
 ```bash
-bun ci
+bun install --frozen-lockfile
 bun typecheck
 bun unittest
 bun lint

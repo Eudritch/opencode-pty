@@ -22,6 +22,17 @@ let active:
       id: string
     }
   | undefined
+let worker:
+  | {
+      pid: number
+      startIdentity: string
+      processIdentity: string
+      endpoint: string
+      token: string
+      executable: string
+      observedIdentity?: string
+    }
+  | undefined
 
 type Child = ReturnType<typeof Bun.spawn>
 
@@ -108,6 +119,14 @@ async function processIdentity(pid: number) {
     )
     return result.exitCode === 0 && result.stdout ? result.stdout.trim() : undefined
   }
+  if (process.platform === 'darwin') {
+    const result = await runCommand(
+      ['ps', '-p', String(pid), '-o', 'lstart='],
+      `Read macOS process identity for ${pid}`,
+      5000
+    )
+    return result.exitCode === 0 && result.stdout ? `darwin:${pid}:${result.stdout.trim()}` : undefined
+  }
   try {
     const data = await readFile(`/proc/${pid}/stat`, 'utf8')
     const fields = data
@@ -121,14 +140,46 @@ async function processIdentity(pid: number) {
   }
 }
 
-async function assertWorkerStopped(worker: { pid: number; processIdentity: string }) {
+async function workerHealth(worker: { endpoint: string; token: string }, timeoutMs: number) {
+  const response = await fetch(`${worker.endpoint}/rpc`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${worker.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ operation: 'health' }),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  const body = (await response.json()) as { ok?: boolean }
+  if (!body.ok) throw new Error('Native worker rejected its authenticated health probe.')
+}
+
+async function shutdownWorker(worker: { endpoint: string; token: string }) {
+  await fetch(`${worker.endpoint}/rpc`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${worker.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ operation: 'shutdown' }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => undefined)
+}
+
+async function assertWorkerStopped(worker: {
+  pid: number
+  processIdentity: string
+  endpoint: string
+  token: string
+  observedIdentity?: string
+}) {
+  const identity = worker.observedIdentity ?? worker.processIdentity
   const deadline = Date.now() + 5000
   while (Date.now() < deadline) {
-    // A reused PID is not our worker. Never signal a PID obtained from metadata.
-    if ((await processIdentity(worker.pid)) !== worker.processIdentity) return
+    const current = await processIdentity(worker.pid)
+    if (current !== identity) return // A reused PID is not our worker.
+    try {
+      await workerHealth(worker, 250)
+    } catch {
+      // Shutdown closes the listener before process exit; the identity probe remains authoritative.
+    }
     await Bun.sleep(25)
   }
-  throw new Error(`Native worker survived authenticated shutdown: ${worker.processIdentity}`)
+  throw new Error(`Native worker survived authenticated shutdown: ${identity}`)
 }
 
 async function removeTemporary(path: string) {
@@ -284,32 +335,36 @@ try {
   }
   if (!id) throw new Error('Packaged native exec was not recorded.')
   active = { descriptor: started.descriptor, owner, id: id.id }
-  let worker:
-    | { pid: number; startIdentity: string; processIdentity: string; executable: string }
-    | undefined
   for (let attempt = 0; attempt < 100 && !worker; attempt += 1) {
     try {
+      const descriptor = JSON.parse(
+        await readFile(join(stateDirectory, 'sessions', id.id, 'worker.json'), 'utf8')
+      ) as {
+        pid?: number
+        startIdentity?: string
+        processIdentity?: string
+        endpoint?: string
+        token?: string
+      }
       const firstRecord = JSON.parse(
         await readFile(join(stateDirectory, 'sessions', id.id, 'session.json'), 'utf8')
-      ) as {
-        worker?: {
-          pid?: number
-          startIdentity?: string
-          processIdentity?: string
-          executable?: string
-        }
-      }
+      ) as { worker?: { executable?: string } }
+      const executable = firstRecord.worker?.executable
       if (
-        Number.isInteger(firstRecord.worker?.pid) &&
-        typeof firstRecord.worker?.startIdentity === 'string' &&
-        typeof firstRecord.worker?.processIdentity === 'string' &&
-        typeof firstRecord.worker?.executable === 'string'
+        Number.isInteger(descriptor.pid) &&
+        typeof descriptor.startIdentity === 'string' &&
+        typeof descriptor.processIdentity === 'string' &&
+        typeof descriptor.endpoint === 'string' &&
+        typeof descriptor.token === 'string' &&
+        typeof executable === 'string'
       )
-        worker = firstRecord.worker as {
-          pid: number
-          startIdentity: string
-          processIdentity: string
-          executable: string
+        worker = {
+          pid: descriptor.pid,
+          startIdentity: descriptor.startIdentity,
+          processIdentity: descriptor.processIdentity,
+          endpoint: descriptor.endpoint,
+          token: descriptor.token,
+          executable,
         }
     } catch {}
     if (!worker) await Bun.sleep(25)
@@ -327,10 +382,13 @@ try {
     throw new Error(
       `Native worker was not resolved from the packed optional package: ${worker.executable}`
     )
-  const observedIdentity = await processIdentity(worker.pid)
-  if (observedIdentity && observedIdentity !== worker.processIdentity)
+  await workerHealth(worker, 5000)
+  worker.observedIdentity = await processIdentity(worker.pid)
+  if (!worker.observedIdentity)
+    throw new Error(`Native worker identity could not be read: ${worker.pid}`)
+  if (process.platform !== 'darwin' && worker.observedIdentity !== worker.processIdentity)
     throw new Error(
-      `Native worker identity mismatch: ${worker.processIdentity} != ${observedIdentity}`
+      `Native worker identity mismatch: ${worker.processIdentity} != ${worker.observedIdentity}`
     )
 
   daemon.kill('SIGKILL')
@@ -382,6 +440,7 @@ try {
 } finally {
   executeAbort?.abort()
   await waitForExecution().catch(() => undefined)
+  let cleanupFailure: unknown
   if (active && installed) {
     if (!daemon || daemon.exitCode !== null) {
       const restarted = await startDaemon(installed).catch(() => undefined)
@@ -393,9 +452,19 @@ try {
     if (daemon?.exitCode === null)
       await rpc(active.descriptor, 'stop', { id: active.id }, active.owner).catch(() => undefined)
   }
-  if (daemon?.exitCode === null) daemon.kill('SIGKILL')
-  if (daemon) await waitForExit(daemon, 'Packaged daemon cleanup').catch(() => undefined)
-  await Promise.allSettled([removeTemporary(packageDirectory), removeTemporary(stateDirectory)])
+  try {
+    if (worker) {
+      await shutdownWorker(worker)
+      await assertWorkerStopped(worker)
+    }
+  } catch (error) {
+    cleanupFailure = error
+  } finally {
+    if (daemon?.exitCode === null) daemon.kill('SIGKILL')
+    if (daemon) await waitForExit(daemon, 'Packaged daemon cleanup').catch(() => undefined)
+    await Promise.allSettled([removeTemporary(packageDirectory), removeTemporary(stateDirectory)])
+  }
+  if (cleanupFailure) throw cleanupFailure
 }
 
 if (!cleanupVerified) throw new Error('Packaged native cleanup was not verified.')
