@@ -695,12 +695,18 @@ export class SessionSupervisor {
     return true
   }
 
-  async cleanupByParentSession(parentSessionId: string): Promise<void> {
+  async cleanupByParentSession(
+    parentSessionId: string,
+    projectDirectory: string,
+    capabilityHash: string
+  ): Promise<void> {
     await Promise.all(
       [...this.records.values()]
         .filter(
           (record) =>
             record.parentSessionId === parentSessionId &&
+            record.ownerProjectDirectory === projectDirectory &&
+            record.ownerCapabilityHash === capabilityHash &&
             record.lifecycle === 'conversation' &&
             this.active.has(record.id)
         )

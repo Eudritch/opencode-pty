@@ -8,6 +8,7 @@ import {
 } from './types.ts'
 
 const DESCRIPTOR_FILE = 'daemon.json'
+const OWNERSHIP_SECRET_FILE = 'ownership-secret'
 const SESSIONS_DIRECTORY = 'sessions'
 const METADATA_FILE = 'session.json'
 const LEGACY_OUTPUT_FILE = 'output.log'
@@ -31,6 +32,10 @@ export class DaemonStorage {
 
   get descriptorPath(): string {
     return join(this.root, DESCRIPTOR_FILE)
+  }
+
+  private get ownershipSecretPath(): string {
+    return join(this.root, OWNERSHIP_SECRET_FILE)
   }
 
   private get startLockPath(): string {
@@ -73,6 +78,33 @@ export class DaemonStorage {
 
   async removeDescriptor(): Promise<void> {
     await rm(this.descriptorPath, { force: true })
+  }
+
+  async ownershipSecret(): Promise<string> {
+    await this.initialize()
+    try {
+      const secret = (await readFile(this.ownershipSecretPath, 'utf8')).trim()
+      if (/^[a-f0-9]{64}$/.test(secret)) return secret
+      throw new Error('Daemon ownership secret is invalid.')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    const secret = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '')
+    try {
+      const handle = await open(this.ownershipSecretPath, 'wx', 0o600)
+      try {
+        await handle.writeFile(secret, 'utf8')
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      await this.privateFile(this.ownershipSecretPath)
+      await this.syncDirectory(this.root)
+      return secret
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      return this.ownershipSecret()
+    }
   }
 
   async acquireStartLock(): Promise<boolean> {

@@ -9,6 +9,8 @@ import {
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
+import { realpathSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 const MAX_REQUEST_BYTES = 1024 * 1024
 const MAX_ID_LENGTH = 128
@@ -19,7 +21,7 @@ const MAX_ENVIRONMENT_ENTRIES = 128
 const MAX_PAGE_SIZE = 10_000
 const MAX_INPUT_BYTES = 64 * 1024
 const MAX_INPUT_BYTES_PER_MINUTE = 256 * 1024
-const MAX_SESSIONS_PER_OWNER = 32
+const DEFAULT_MAX_SESSIONS_PER_OWNER = 32
 const MAX_EXEC_RUNTIME_SECONDS = 3600
 
 class ValidationError extends Error {}
@@ -27,15 +29,19 @@ class ValidationError extends Error {}
 export class DaemonServer implements Disposable {
   private server: ReturnType<typeof Bun.serve> | null = null
   private readonly inputUsage = new Map<string, { startedAt: number; bytes: number }>()
+  private readonly pendingSessions = new Map<string, number>()
+  private ownershipSecret = ''
 
   constructor(
     private readonly storage: DaemonStorage,
     private readonly supervisor: SessionSupervisor,
-    private readonly token: string = crypto.randomUUID().replaceAll('-', '')
+    private readonly token: string = crypto.randomUUID().replaceAll('-', ''),
+    private readonly maxSessionsPerOwner: number = DEFAULT_MAX_SESSIONS_PER_OWNER
   ) {}
 
   async start(): Promise<DaemonDescriptor> {
     await this.supervisor.initialize()
+    this.ownershipSecret = await this.storage.ownershipSecret()
     this.server = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
@@ -274,21 +280,25 @@ export class DaemonServer implements Disposable {
     this.onlyFields(value, ['parentSessionId'])
     const parentSessionId = this.requiredString(value, 'parentSessionId')
     if (parentSessionId !== owner.parentSessionId) throw new Error('Owner is not authorized.')
-    return this.supervisor.cleanupByParentSession(parentSessionId)
+    return this.supervisor.cleanupByParentSession(
+      parentSessionId,
+      owner.projectDirectory,
+      owner.capability
+    )
   }
 
   private async spawn(
     options: Parameters<SessionSupervisor['spawn']>[0],
     owner: OwnerContext
   ): Promise<unknown> {
-    const owned = (await this.supervisor.list()).filter((session) => this.owns(session.id, owner))
-    if (owned.length >= MAX_SESSIONS_PER_OWNER) throw new Error('Session limit exceeded.')
-    return this.supervisor.spawn({
-      ...options,
-      parentSessionId: owner.parentSessionId,
-      ownerProjectDirectory: owner.projectDirectory,
-      ownerCapabilityHash: owner.capability,
-    })
+    return this.withSessionSlot(owner, () =>
+      this.supervisor.spawn({
+        ...options,
+        parentSessionId: owner.parentSessionId,
+        ownerProjectDirectory: owner.projectDirectory,
+        ownerCapabilityHash: owner.capability,
+      })
+    )
   }
 
   private async exec(
@@ -298,12 +308,14 @@ export class DaemonServer implements Disposable {
     if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
       throw new Error('Exec runtime limit exceeded.')
     }
-    return this.supervisor.exec({
-      ...options,
-      parentSessionId: owner.parentSessionId,
-      ownerProjectDirectory: owner.projectDirectory,
-      ownerCapabilityHash: owner.capability,
-    })
+    return this.withSessionSlot(owner, () =>
+      this.supervisor.exec({
+        ...options,
+        parentSessionId: owner.parentSessionId,
+        ownerProjectDirectory: owner.projectDirectory,
+        ownerCapabilityHash: owner.capability,
+      })
+    )
   }
 
   private owner(request: RpcRequest): OwnerContext {
@@ -319,10 +331,16 @@ export class DaemonServer implements Disposable {
     ) {
       throw new ValidationError('A valid owner context is required.')
     }
-    if (owner.capability !== this.capability(owner.parentSessionId, owner.projectDirectory)) {
+    let projectDirectory: string
+    try {
+      projectDirectory = realpathSync(resolve(owner.projectDirectory))
+    } catch {
+      throw new ValidationError('Owner project directory must exist.')
+    }
+    if (owner.capability !== this.capability(owner.parentSessionId, projectDirectory)) {
       throw new Error('Owner is not authorized.')
     }
-    return owner
+    return { ...owner, projectDirectory }
   }
 
   private authorize(id: string, owner: OwnerContext): void {
@@ -335,8 +353,31 @@ export class DaemonServer implements Disposable {
 
   private capability(parentSessionId: string, projectDirectory: string): string {
     return new Bun.CryptoHasher('sha256')
-      .update(`${this.token}\0${parentSessionId}\0${projectDirectory}`)
+      .update(`${this.ownershipSecret}\0${parentSessionId}\0${projectDirectory}`)
       .digest('hex')
+  }
+
+  private active(status: string): boolean {
+    return status === 'starting' || status === 'running' || status === 'stopping'
+  }
+
+  private async withSessionSlot<T>(owner: OwnerContext, task: () => Promise<T>): Promise<T> {
+    const key = `${owner.parentSessionId}\0${owner.projectDirectory}\0${owner.capability}`
+    const pending = (this.pendingSessions.get(key) ?? 0) + 1
+    if (pending > this.maxSessionsPerOwner) throw new Error('Session limit exceeded.')
+    this.pendingSessions.set(key, pending)
+    try {
+      const owned = (await this.supervisor.list()).filter((session) => this.owns(session.id, owner))
+      if (
+        owned.filter((session) => this.active(session.status)).length + pending >
+        this.maxSessionsPerOwner
+      )
+        throw new Error('Session limit exceeded.')
+      return await task()
+    } finally {
+      if (pending === 1) this.pendingSessions.delete(key)
+      else this.pendingSessions.set(key, pending - 1)
+    }
   }
 
   private useInput(owner: OwnerContext, data: string): void {
@@ -358,7 +399,7 @@ export class DaemonServer implements Disposable {
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       pid: process.pid,
       limits: {
-        maxSessionsPerOwner: MAX_SESSIONS_PER_OWNER,
+        maxSessionsPerOwner: this.maxSessionsPerOwner,
         maxInputBytes: MAX_INPUT_BYTES,
         maxInputBytesPerMinute: MAX_INPUT_BYTES_PER_MINUTE,
         maxOutputBytes: Number.parseInt(process.env.PTY_MAX_OUTPUT_BYTES ?? '1000000', 10),

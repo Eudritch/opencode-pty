@@ -73,7 +73,7 @@ export const ptySpawn = tool({
         name: args.name,
         idempotencyKey: args.idempotencyKey,
       },
-      ownerContext(sessionId, workdir)
+      ownerContext(sessionId, ctx.directory)
     )
 
     const output = [

@@ -174,7 +174,10 @@ export class DaemonClient {
         id: crypto.randomUUID(),
         version: DAEMON_PROTOCOL_VERSION,
         operation,
-        owner: owner && { ...owner, capability: this.capability(descriptor.token, owner) },
+        owner: owner && {
+          ...owner,
+          capability: this.capability(await this.storage.ownershipSecret(), owner),
+        },
         payload,
       }),
       signal: AbortSignal.timeout(timeout),
@@ -289,9 +292,9 @@ export class DaemonClient {
     )
   }
 
-  private capability(token: string, owner: Omit<OwnerContext, 'capability'>): string {
+  private capability(secret: string, owner: Omit<OwnerContext, 'capability'>): string {
     return new Bun.CryptoHasher('sha256')
-      .update(`${token}\0${owner.parentSessionId}\0${owner.projectDirectory}`)
+      .update(`${secret}\0${owner.parentSessionId}\0${owner.projectDirectory}`)
       .digest('hex')
   }
 }

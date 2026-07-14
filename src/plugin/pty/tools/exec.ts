@@ -29,7 +29,7 @@ export const shellExec = tool({
         parentAgent: ctx.agent,
         inheritEnv: args.inheritEnv,
       },
-      ownerContext(ctx.sessionID, workdir)
+      ownerContext(ctx.sessionID, ctx.directory)
     )
     return [
       `<shell_exec id="${escapeXml(result.session.id)}" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" output_limited="${result.outputLimited}" termination_confirmed="${result.terminationConfirmed}">`,
