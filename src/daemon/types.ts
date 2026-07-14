@@ -73,6 +73,13 @@ export interface ExecOutput {
   stderrTruncated: boolean
 }
 
+export interface WorkerReference {
+  pid: number
+  startIdentity: string
+  endpoint: string
+  protocolVersion: number
+}
+
 export interface SessionRecord {
   id: string
   title: string
@@ -111,6 +118,7 @@ export interface SessionRecord {
   outputHasPartialLine: boolean
   outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
   execOutput?: ExecOutput
+  worker?: WorkerReference
   lastWaitResult?: WaitResult
 }
 

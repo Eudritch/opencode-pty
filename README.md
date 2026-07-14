@@ -1,6 +1,6 @@
 # opencode-pty
 
-An OpenCode plugin for durable interactive PTY sessions and finite argv execution. It requires Bun 1.3.8 or later. A per-user Bun daemon owns processes and persisted PTY output; the plugin supplies tools and applies a local fail-closed permission adapter.
+An OpenCode plugin for durable interactive PTY sessions and finite argv execution. It requires Bun 1.3.8 or later. PTYs remain owned by the per-user Bun daemon. When explicitly enabled and given a built Rust worker, finite exec processes are owned by a per-session native worker.
 
 ## Tools
 
@@ -19,7 +19,7 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 
 `notifyOnExit` remains accepted for compatibility but is rejected: the durable daemon has no safe event channel back into a completed OpenCode session.
 
-`shell_exec` is `exec` mode, not a shell parser: `command` and `args` are passed as argv and a positive timeout is required. It returns separately bounded stdout/stderr, observed exit evidence, timeout/output-limit flags, and whether termination was confirmed. Each exec record durably retains the captured streams and their byte/truncation metadata; inspect it through daemon RPC `execOutput`. Timeout and output limits request termination, wait briefly, then force-kill and return within a bounded interval. If the operating system cannot confirm termination, the record reports unknown termination rather than claiming success.
+`shell_exec` is `exec` mode, not a shell parser: `command` and `args` are passed as argv and a positive timeout is required. With the native worker enabled, a Rust per-session worker owns the finite child using `std::process`, exposes an authenticated loopback RPC endpoint, and writes redacted output to the existing session chunk journal. The daemon can reconnect to a reachable worker after restart and recover its output cursor and final state. Without the explicit worker configuration, exec retains the legacy Bun behavior.
 
 `pty_spawn` is `pty` mode and remains interactive. A supplied `idempotencyKey` reuses only a matching active PTY scoped to the originating OpenCode session and canonical workdir; changing command, args, environment, timeout, or name is rejected. Titles and descriptions are presentation fields and do not affect reuse. `pty_wait` conditions are literal output, a limited-safe regex, or exit. They run in the daemon against output/exit events with a 3600-second maximum deadline, not plugin polling. `pty_send_wait` captures its output boundary after PTY input is accepted, so output that arrived before or during acceptance cannot satisfy the wait. Output readiness is evidence only; no bare `ready` state is claimed.
 
@@ -36,7 +36,7 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 
 The installed OpenCode plugin SDK (1.3.13) exposes config reads and permission hooks, but no callable evaluator or prompt request API for a tool. Before every `pty_spawn` and `shell_exec`, this plugin reads OpenCode's merged config and locally applies the documented ruleset: global `permission` rules are evaluated in declaration order, then `agent.<agent>.permission` rules in declaration order, with the last matching rule winning. Thus an agent deny overrides a global allow, and an agent allow overrides a global deny. Only an effective matching `allow` permits a command; absent, unmatched, `ask`, unreadable, malformed, and `deny` rules deny it. Rules match the executable followed by the complete argv using OpenCode wildcards. External directories use canonical containment and require an effective matching `external_directory` allow for the resolved path. This is not an authoritative OpenCode permission invocation.
 
-This tranche does not provide per-session worker processes, native Job Objects/cgroups, terminal emulation, browser UI, signed binaries, OS CPU/memory limits, or a native descendant-process termination guarantee. Bun limits session count per owner, PTY input size/rate, retained output, and exec runtime/output only.
+This tranche does not provide Job Objects/cgroups, terminal emulation, signed binaries, OS CPU/memory limits, or native descendant-process termination guarantees. PTY sessions remain legacy Bun/bun-pty sessions: they are not worker-contained and have no worker recovery until native ConPTY/POSIX PTY support is added.
 
 ## Setup
 
@@ -53,6 +53,9 @@ This tranche does not provide per-session worker processes, native Job Objects/c
 | --- | --- | --- |
 | `PTY_DAEMON_DIR` | per-user state directory | Daemon descriptor, ownership secret, session metadata, and output; protected with the same restrictive DACL on Windows. |
 | `PTY_MAX_OUTPUT_BYTES` | `1000000` | Maximum retained output bytes per session. |
+| `PTY_NATIVE_WORKER_ENABLED` | unset | Set to `1` to route `shell_exec` through the native worker. |
+| `PTY_NATIVE_WORKER_PATH` | unset | Required production path to a built `opencode-pty-worker` executable. |
+| `PTY_NATIVE_WORKER_DEV` | unset | Set only in development to run `cargo run --manifest-path worker/Cargo.toml`; never a production fallback. |
 
 Output is an append-only, session-local UTF-8 chunk journal. Callbacks are coalesced into bounded 64 KiB UTF-8 segments and retained output is capped at the configured value (up to 64 MiB), so fragmented output cannot create unbounded files. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
 
@@ -68,6 +71,7 @@ bun lint
 bun format
 bun build:prod
 bun package:smoke
+cargo build --locked --workspace
 ```
 
 ## License

@@ -416,6 +416,18 @@ export class DaemonStorage {
         typeof value.outputTruncated === 'boolean'
       )
     }
+    const validWorker = (worker: unknown): boolean => {
+      if (worker === undefined) return true
+      if (!worker || typeof worker !== 'object') return false
+      const value = worker as Record<string, unknown>
+      return (
+        validNonnegativeInteger(value.pid) &&
+        value.pid > 0 &&
+        validText(value.startIdentity) &&
+        validText(value.endpoint) &&
+        value.protocolVersion === 1
+      )
+    }
     if (
       value.id !== id ||
       !validText(value.title) ||
@@ -463,6 +475,7 @@ export class DaemonStorage {
         value.lifecycle !== 'persistent') ||
       !validEnvironment(value.environment) ||
       !validExecOutput(value.execOutput) ||
+      !validWorker(value.worker) ||
       !validWait(value.lastWaitResult)
     ) {
       return false
@@ -479,8 +492,8 @@ export class DaemonStorage {
     }
     if (value.mode === 'exec') {
       return (
-        value.firstRetainedSequence === 0 &&
-        value.nextSequence === 0 &&
+        (value.worker !== undefined ||
+          (value.firstRetainedSequence === 0 && value.nextSequence === 0)) &&
         (value.execOutput === undefined ||
           value.outputBytes === value.execOutput.stdoutBytes + value.execOutput.stderrBytes)
       )

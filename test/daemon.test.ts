@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,6 +14,7 @@ import {
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
 import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
 import { ownerContext } from '../src/plugin/pty/daemon-client.ts'
+import { WorkerClient } from '../src/daemon/worker-client.ts'
 import { formatLine } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
@@ -975,6 +976,60 @@ test('exec output remains separately recoverable after restart', async () => {
     stdoutTruncated: false,
     stderrTruncated: false,
   })
+})
+
+test('native worker authenticates, owns exec output, and redacts its descriptor metadata', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-worker-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  try {
+    await stat(workerPath)
+  } catch {
+    console.warn('Skipping native worker test: Rust worker has not been built.')
+    return
+  }
+  const secret = 'native-worker-secret'
+  const previous = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  try {
+    const sessionDirectory = join(root, 'sessions', 'exec_worker')
+    const { client, reference } = await WorkerClient.start({
+      command: process.execPath,
+      args: ['-e', "console.log(process.env.API_TOKEN); console.error('err')"],
+      workdir: root,
+      env: { ...process.env, API_TOKEN: secret } as Record<string, string>,
+      redactionSecrets: [secret],
+      sessionDirectory,
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    const descriptor = await readFile(join(sessionDirectory, 'worker.json'), 'utf8')
+    expect(descriptor).not.toContain(secret)
+    const raw = JSON.parse(descriptor) as { endpoint: string }
+    const denied = await fetch(`${raw.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer wrong', 'content-type': 'application/json' },
+      body: JSON.stringify({ operation: 'snapshot' }),
+    })
+    expect((await denied.json()) as { ok: boolean }).toMatchObject({ ok: false })
+    const result = await client.wait(3000)
+    expect(result.stdout).toContain('[REDACTED]')
+    expect(result.stdout).not.toContain(secret)
+    expect(result.stderr).toContain('err')
+    const reconnected = await WorkerClient.reconnect(sessionDirectory, reference)
+    await expect(reconnected?.snapshot()).resolves.toMatchObject({
+      status: 'exited',
+    })
+    await client.stop()
+  } finally {
+    process.env.PTY_NATIVE_WORKER_PATH = previous
+  }
 })
 
 test('tool output XML escaping covers text and attributes', () => {

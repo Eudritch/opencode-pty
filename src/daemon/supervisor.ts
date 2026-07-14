@@ -1,6 +1,6 @@
 import { spawn, type IPty } from 'bun-pty'
 import { realpathSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
 import {
   type ExecResult,
@@ -14,6 +14,8 @@ import {
   type WriteResult,
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
+import type { WorkerClient, WorkerSnapshot } from './worker-client.ts'
+import { WorkerClient as NativeWorkerClient } from './worker-client.ts'
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1000000
 const MAX_OUTPUT_BYTES = 64 * 1024 * 64
@@ -234,6 +236,7 @@ export class SessionSupervisor {
   private readonly active = new Map<string, ActiveSession>()
   private readonly records = new Map<string, SessionRecord>()
   private readonly waits = new Map<string, PendingWait[]>()
+  private readonly nativeWorkers = new Map<string, WorkerClient>()
   private persistQueue = Promise.resolve()
 
   constructor(
@@ -260,6 +263,18 @@ export class SessionSupervisor {
         record.status === 'running' ||
         record.status === 'stopping'
       ) {
+        if (record.mode === 'exec' && record.worker) {
+          const worker = await NativeWorkerClient.reconnect(
+            join(this.storage.rootDirectory, 'sessions', record.id),
+            record.worker
+          )
+          if (worker) {
+            this.nativeWorkers.set(record.id, worker)
+            this.records.set(record.id, record)
+            void this.monitorNative(record, worker)
+            continue
+          }
+        }
         const output = await this.storage.readOutput(record.id)
         record.status = 'lost'
         record.exitReason = { kind: 'unknown' }
@@ -633,6 +648,136 @@ export class SessionSupervisor {
     }
   }
 
+  async nativeExec(options: ExecOptions): Promise<ExecResult> {
+    await this.flush()
+    if (!options.command || !options.timeoutSeconds)
+      throw new Error('timeoutSeconds is required for exec')
+    const args = options.args ?? []
+    const now = new Date().toISOString()
+    const id = `exec_${crypto.randomUUID()}`
+    const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
+    const record: SessionRecord = {
+      id,
+      title: options.title ?? `${options.command} ${args.join(' ')}`.trim(),
+      description: options.description,
+      command: options.command,
+      args,
+      mode: 'exec',
+      workdir: canonicalWorkdir(options.workdir),
+      ownerProjectDirectory: canonicalWorkdir(options.ownerProjectDirectory ?? options.workdir),
+      ownerCapabilityHash: options.ownerCapabilityHash ?? '',
+      lifecycle: options.lifecycle ?? 'conversation',
+      environment: environmentProfile(environment, options.inheritEnv === true),
+      status: 'starting',
+      pid: 0,
+      createdAt: now,
+      startedAt: now,
+      updatedAt: now,
+      parentSessionId: options.parentSessionId,
+      parentAgent: options.parentAgent,
+      timeoutSeconds: options.timeoutSeconds,
+      timedOut: false,
+      terminationRequested: false,
+      terminationConfirmed: false,
+      nextSequence: 0,
+      firstRetainedSequence: 0,
+      outputBytes: 0,
+      outputTruncated: false,
+      lineCount: 0,
+      outputHasPartialLine: false,
+      outputJournalVersion: OUTPUT_JOURNAL_VERSION,
+    }
+    this.records.set(id, record)
+    await this.storage.writeSession(record)
+    const redactionSecrets = Object.entries(environment)
+      .filter(([key, value]) => SENSITIVE_ENVIRONMENT_KEY.test(key) && value.length >= 4)
+      .map(([, value]) => value)
+    let started: Awaited<ReturnType<typeof NativeWorkerClient.start>>
+    try {
+      started = await NativeWorkerClient.start({
+        command: record.command,
+        args: record.args,
+        workdir: record.workdir,
+        env: environment,
+        redactionSecrets,
+        sessionDirectory: join(this.storage.rootDirectory, 'sessions', id),
+        timeoutSeconds: options.timeoutSeconds,
+        maxOutputBytes: Math.min(
+          options.maxOutputBytes ?? this.maxOutputBytes,
+          this.maxOutputBytes
+        ),
+        mode: 'exec',
+      })
+    } catch (error) {
+      record.status = 'spawn_failed'
+      record.terminationConfirmed = true
+      record.exitReason = { kind: 'spawn_error', message: String(error) }
+      record.updatedAt = new Date().toISOString()
+      await this.storage.writeSession(record)
+      throw new ProcessError(String(error))
+    }
+    record.pid = started.reference.pid
+    record.worker = started.reference
+    record.status = 'running'
+    record.updatedAt = new Date().toISOString()
+    this.nativeWorkers.set(id, started.client)
+    await this.storage.writeSession(record)
+    const result = await started.client.wait(options.timeoutSeconds * 1000 + 1500)
+    return this.finishNative(record, result)
+  }
+
+  private async monitorNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
+    try {
+      const result = await worker.wait((record.timeoutSeconds ?? 1) * 1000 + 1500)
+      await this.finishNative(record, result)
+    } catch {
+      // Recovery will retry a reachable descriptor on the next daemon start.
+    }
+  }
+
+  private async finishNative(record: SessionRecord, result: WorkerSnapshot): Promise<ExecResult> {
+    record.pid = result.pid
+    record.nextSequence = result.nextSequence
+    record.firstRetainedSequence = result.firstRetainedSequence
+    record.outputBytes = result.stdoutBytes + result.stderrBytes
+    record.outputTruncated = result.outputTruncated
+    record.timedOut = result.timedOut
+    record.execOutput = {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      stdoutBytes: result.stdoutBytes,
+      stderrBytes: result.stderrBytes,
+      stdoutTruncated: result.stdoutTruncated,
+      stderrTruncated: result.stderrTruncated,
+    }
+    record.status =
+      result.status === 'running' ? 'running' : result.timedOut ? 'timed_out' : 'exited'
+    record.exitCode = result.exitCode
+    record.terminationConfirmed = result.status === 'exited'
+    record.exitReason = record.terminationConfirmed
+      ? this.exitReason(result.exitCode ?? null)
+      : { kind: 'unknown' }
+    record.exitedAt = result.exitedAt
+    record.updatedAt = new Date().toISOString()
+    await this.storage.writeSession(record)
+    if (record.terminationConfirmed) {
+      const worker = this.nativeWorkers.get(record.id)
+      this.nativeWorkers.delete(record.id)
+      void worker?.stop().catch(() => undefined)
+    }
+    return {
+      session: { id: record.id, status: record.status, mode: 'exec', pid: record.pid },
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: record.exitCode,
+      timedOut: record.timedOut,
+      outputLimited: record.outputTruncated,
+      terminationConfirmed: record.terminationConfirmed,
+      startedAt: record.startedAt ?? record.createdAt,
+      exitedAt: record.exitedAt ?? record.updatedAt,
+    }
+  }
+
   async read(id: string, offset = 0, limit?: number, sequence?: number): Promise<ReadResult> {
     const record = this.recordFor(id)
     const output = await this.outputFor(id)
@@ -683,6 +828,10 @@ export class SessionSupervisor {
   async get(id: string): Promise<PTYSessionInfo | null> {
     await this.flush()
     const record = this.records.get(id)
+    const native = this.nativeWorkers.get(id)
+    if (record?.worker && native) {
+      await this.finishNative(record, await native.snapshot())
+    }
     return record ? this.toInfo(record) : null
   }
 
@@ -717,11 +866,25 @@ export class SessionSupervisor {
   async execOutput(id: string) {
     await this.flush()
     const record = this.records.get(id)
+    const native = this.nativeWorkers.get(id)
+    if (record?.worker && native) {
+      await this.finishNative(record, await native.snapshot())
+    }
     return record?.execOutput ?? null
   }
 
   async stop(id: string): Promise<StopResult> {
     await this.flush()
+    const native = this.nativeWorkers.get(id)
+    if (native) {
+      const record = this.recordFor(id)
+      record.terminationRequested = true
+      record.status = 'stopping'
+      await this.storage.writeSession(record)
+      const result = await native.stop()
+      await this.finishNative(record, result)
+      return { requested: true, terminationConfirmed: record.terminationConfirmed }
+    }
     const active = this.active.get(id)
     if (!active) {
       const record = this.records.get(id)
@@ -780,6 +943,12 @@ export class SessionSupervisor {
   async flush(): Promise<void> {
     for (const active of this.active.values()) this.persistOutput(active)
     await this.persistQueue
+  }
+
+  async shutdown(): Promise<void> {
+    await Promise.all(
+      [...this.nativeWorkers.values()].map((worker) => worker.stop().catch(() => undefined))
+    )
   }
 
   private async timeout(id: string): Promise<void> {

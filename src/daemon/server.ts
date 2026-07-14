@@ -67,6 +67,7 @@ export class DaemonServer implements Disposable {
 
   async stop(): Promise<void> {
     this.server?.stop(true)
+    await this.supervisor.shutdown?.()
     await this.supervisor.flush()
     await this.storage.removeDescriptor()
   }
@@ -345,7 +346,9 @@ export class DaemonServer implements Disposable {
       throw new Error('Exec runtime limit exceeded.')
     }
     return this.withSessionSlot(owner, () =>
-      this.supervisor.exec({
+      (process.env.PTY_NATIVE_WORKER_ENABLED === '1'
+        ? this.supervisor.nativeExec.bind(this.supervisor)
+        : this.supervisor.exec.bind(this.supervisor))({
         ...options,
         parentSessionId: owner.parentSessionId,
         ownerProjectDirectory: owner.projectDirectory,
