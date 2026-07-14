@@ -15,7 +15,10 @@
       },
       "optionalDependencies": {
         "@eudritch/opencode-pty-worker-darwin-arm64": "0.5.0",
+        "@eudritch/opencode-pty-worker-darwin-x64": "0.5.0",
+        "@eudritch/opencode-pty-worker-linux-arm64-gnu": "0.5.0",
         "@eudritch/opencode-pty-worker-linux-x64-gnu": "0.5.0",
+        "@eudritch/opencode-pty-worker-win32-arm64": "0.5.0",
         "@eudritch/opencode-pty-worker-win32-x64": "0.5.0",
       },
       "peerDependencies": {

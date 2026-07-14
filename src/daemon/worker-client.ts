@@ -1,6 +1,7 @@
 import { access, readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { nativeWorkerPackageName, nativeWorkerTarget } from '../shared/native-worker-targets.ts'
 import type { ContainmentReport, SpawnCleanup, TerminationResult } from './types.ts'
 
 function readyTimeout(value: string | undefined): number {
@@ -87,14 +88,11 @@ function workerCommand(): string[] {
       '--',
     ]
   }
+  const target = nativeWorkerTarget(process.platform, process.arch)
   const workerPackage =
-    process.platform === 'linux' && process.arch === 'x64'
-      ? linuxWorkerPackage()
-      : process.platform === 'win32' && process.arch === 'x64'
-        ? '@eudritch/opencode-pty-worker-win32-x64'
-        : process.platform === 'darwin' && process.arch === 'arm64'
-          ? '@eudritch/opencode-pty-worker-darwin-arm64'
-          : undefined
+    process.platform === 'linux' && target
+      ? linuxWorkerPackage(target as 'linux-x64-gnu' | 'linux-arm64-gnu')
+      : target && nativeWorkerPackageName(target)
   if (workerPackage) {
     try {
       const require = createRequire(import.meta.url)
@@ -110,18 +108,18 @@ function workerCommand(): string[] {
   )
 }
 
-function linuxWorkerPackage(): string {
+function linuxWorkerPackage(target: 'linux-x64-gnu' | 'linux-arm64-gnu'): string {
   const probe = Bun.spawnSync({ cmd: ['ldd', '--version'], stdout: 'pipe', stderr: 'pipe' })
   const output = `${Buffer.from(probe.stdout)}${Buffer.from(probe.stderr)}`.toLowerCase()
   if (output.includes('musl'))
     throw new Error(
-      'native_worker_unavailable: linux-x64-gnu worker requires glibc; Alpine/musl is unsupported. Set PTY_NATIVE_WORKER_PATH to a compatible worker.'
+      `native_worker_unavailable: ${target} worker requires glibc; Alpine/musl is unsupported. Set PTY_NATIVE_WORKER_PATH to a compatible worker.`
     )
   if (!output.includes('glibc') && !output.includes('gnu libc'))
     throw new Error(
       'native_worker_unavailable: could not verify a glibc Linux runtime. Set PTY_NATIVE_WORKER_PATH to a compatible worker.'
     )
-  return '@eudritch/opencode-pty-worker-linux-x64-gnu'
+  return nativeWorkerPackageName(target)
 }
 
 async function processIdentity(pid: number): Promise<string | null> {

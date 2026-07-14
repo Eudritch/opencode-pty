@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { verifyNativeArtifacts } from './native-artifact-verifier.ts'
 
 type Manifest = {
   version: string
@@ -17,9 +18,17 @@ const directory = process.argv[2] ?? 'native-artifacts'
 const manifestPath = join(directory, 'native-artifacts.json')
 const signaturePath = `${manifestPath}.sig`
 const releaseSha = process.argv[3]
-if (!process.env.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY)
+const publicKey = process.env.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY_FILE
+  ? process.env.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY_FILE
+  : process.env.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY && 'env://NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY'
+if (
+  process.env.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY_FILE &&
+  process.env.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY
+)
+  throw new Error('Set only one native artifact public-key source.')
+if (!publicKey)
   throw new Error(
-    'Native artifact verification is not configured: set NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY.'
+    'Native artifact verification requires NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY or NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY_FILE.'
   )
 
 function run(command: string[], label: string): string {
@@ -75,30 +84,26 @@ function verifyPublished(info: PackageInfo, integrity: string) {
 
 await stat(manifestPath)
 await stat(signaturePath)
-run(
-  [
-    'cosign',
-    'verify-blob',
-    '--key',
-    'env://NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY',
-    '--signature',
-    signaturePath,
-    manifestPath,
-  ],
-  'Verify native artifact manifest signature'
-)
 
-const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Manifest & {
-  provenance?: { commit?: unknown }
+function verifyManifestSignature() {
+  run(
+    ['cosign', 'verify-blob', '--key', publicKey, '--signature', signaturePath, manifestPath],
+    'Verify native artifact manifest signature'
+  )
 }
-if (!releaseSha || manifest.provenance?.commit !== releaseSha)
-  throw new Error('Signed native artifact manifest is not tied to the checked-out release commit.')
+
+if (!releaseSha) throw new Error('Usage: bun native:publish <directory> <checked-out-release-sha>')
+verifyManifestSignature()
+await verifyNativeArtifacts(directory, releaseSha)
+const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Manifest
 const expected = new Map(manifest.artifacts.map(({ file, sha256 }) => [file, sha256]))
 const files = (await readdir(directory)).filter((file) => file.endsWith('.tgz')).sort()
 if (!files.length || files.length !== expected.size || files.some((file) => !expected.has(file)))
   throw new Error('Native artifact files do not match the signed manifest.')
 
 for (const file of files) {
+  verifyManifestSignature()
+  await verifyNativeArtifacts(directory, releaseSha)
   const artifact = join(directory, file)
   const contents = await readFile(artifact)
   if (createHash('sha256').update(contents).digest('hex') !== expected.get(file))
@@ -115,6 +120,8 @@ for (const file of files) {
 
 const temporary = await mkdtemp(join(tmpdir(), 'opencode-pty-publish-'))
 try {
+  verifyManifestSignature()
+  await verifyNativeArtifacts(directory, releaseSha)
   const packed = JSON.parse(
     run(['npm', 'pack', '--json', '--pack-destination', temporary], 'Pack root package')
   ) as { filename?: unknown }[]

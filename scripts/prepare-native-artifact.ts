@@ -1,32 +1,28 @@
 import { cp, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import {
+  NATIVE_WORKER_TARGETS,
+  nativeWorkerBinaryName,
+  nativeWorkerPackageName,
+  type NativeWorkerTarget,
+} from '../src/shared/native-worker-targets.ts'
 
-const platforms = {
-  'linux-x64-gnu': { os: 'linux', cpu: 'x64' },
-  'win32-x64': { os: 'win32', cpu: 'x64' },
-  'darwin-arm64': { os: 'darwin', cpu: 'arm64' },
-} as const
+const target = process.argv[2] as NativeWorkerTarget | undefined
+if (!target || !(target in NATIVE_WORKER_TARGETS))
+  throw new Error(`Usage: bun native:prepare <${Object.keys(NATIVE_WORKER_TARGETS).join('|')}>`)
 
-const target = process.argv[2]
-if (!target || !(target in platforms))
-  throw new Error(`Usage: bun native:prepare <${Object.keys(platforms).join('|')}>`)
-
-const platform = platforms[target as keyof typeof platforms]
+const platform = NATIVE_WORKER_TARGETS[target]
 const rootPackage = JSON.parse(await readFile('package.json', 'utf8')) as { version: string }
 const output = join('native-artifacts', target)
-const binary = join(
-  'target',
-  'release',
-  `opencode-pty-worker${platform.os === 'win32' ? '.exe' : ''}`
-)
+const binary = join('target', 'release', nativeWorkerBinaryName(platform.os))
 await stat(binary)
 await mkdir(join(output, 'bin'), { recursive: true })
-await cp(binary, join(output, 'bin', `opencode-pty-worker${platform.os === 'win32' ? '.exe' : ''}`))
+await cp(binary, join(output, 'bin', nativeWorkerBinaryName(platform.os)))
 await writeFile(
   join(output, 'package.json'),
   `${JSON.stringify(
     {
-      name: `@eudritch/opencode-pty-worker-${target}`,
+      name: nativeWorkerPackageName(target),
       version: rootPackage.version,
       description: `Native worker for opencode-pty on ${target}`,
       license: 'MIT',

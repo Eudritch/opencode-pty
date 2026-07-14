@@ -48,7 +48,10 @@
     "package:smoke": "bun test/packaged-native-daemon.ts",
     "native:prepare": "bun scripts/prepare-native-artifact.ts",
     "native:manifest": "bun scripts/write-native-manifest.ts",
+    "native:verify": "bun scripts/verify-native-artifacts.ts",
     "native:sign": "bun scripts/sign-native-artifacts.ts",
+    "native:sign:windows": "bun scripts/sign-windows-worker.ts",
+    "native:sign:macos": "bun scripts/sign-macos-worker.ts",
     "native:publish": "bun scripts/publish-native-artifacts.ts",
     "prepack": "bun build:prod",
     "clean": "rm -rf dist",
@@ -75,7 +78,10 @@
   },
   "optionalDependencies": {
     "@eudritch/opencode-pty-worker-darwin-arm64": "0.5.0",
+    "@eudritch/opencode-pty-worker-darwin-x64": "0.5.0",
+    "@eudritch/opencode-pty-worker-linux-arm64-gnu": "0.5.0",
     "@eudritch/opencode-pty-worker-linux-x64-gnu": "0.5.0",
+    "@eudritch/opencode-pty-worker-win32-arm64": "0.5.0",
     "@eudritch/opencode-pty-worker-win32-x64": "0.5.0"
   }
 }
