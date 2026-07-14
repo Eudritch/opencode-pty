@@ -7,6 +7,7 @@ import { DaemonStorage } from '../src/daemon/storage.ts'
 import { ProcessError, SessionSupervisor } from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
 import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
+import { ownerContext } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine } from '../src/plugin/pty/formatters.ts'
 import { authorizeSpawn, initPermissions } from '../src/plugin/pty/permissions.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
@@ -30,6 +31,10 @@ function record(
     args: [],
     mode: 'pty',
     workdir: root,
+    ownerProjectDirectory: root,
+    ownerCapabilityHash: '',
+    lifecycle: 'conversation',
+    environment: { kind: 'safe', keys: [], fingerprint: '', sensitive: false },
     status,
     pid: 1,
     createdAt: now,
@@ -63,6 +68,13 @@ test('daemon authenticates RPC and retains PTY output', async () => {
         id: crypto.randomUUID(),
         version: DAEMON_PROTOCOL_VERSION,
         operation,
+        owner: {
+          parentSessionId: 'test-session',
+          projectDirectory: root,
+          capability: new Bun.CryptoHasher('sha256')
+            .update(`test-token\0test-session\0${root}`)
+            .digest('hex'),
+        },
         payload,
       }),
     })
@@ -128,6 +140,98 @@ test('daemon validates RPC fields and uses literal searches', async () => {
   } finally {
     await server.stop()
   }
+})
+
+test('daemon denies other owners and reports bounded diagnostics', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  const descriptor = await server.start()
+  const owner = (parentSessionId: string) => ({
+    parentSessionId,
+    projectDirectory: root,
+    capability: new Bun.CryptoHasher('sha256')
+      .update(`test-token\0${parentSessionId}\0${root}`)
+      .digest('hex'),
+  })
+  const rpc = async (operation: string, payload: unknown, context = owner('one')) =>
+    fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation,
+        owner: context,
+        payload,
+      }),
+    })
+  try {
+    const spawned = await rpc('spawn', {
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      description: 'owner isolation test',
+      parentSessionId: 'forged',
+    })
+    const id = ((await spawned.json()) as { result: { id: string } }).result.id
+    const denied = await rpc('read', { id }, owner('two'))
+    expect(((await denied.json()) as { error: { code: string } }).error.code).toBe('authorization')
+    const invalidCapability = await rpc('list', {}, { ...owner('one'), capability: 'x'.repeat(64) })
+    expect(((await invalidCapability.json()) as { error: { code: string } }).error.code).toBe(
+      'authorization'
+    )
+    const diagnostics = (await (await rpc('diagnostics', {})).json()) as {
+      result: { limits: { maxSessionsPerOwner: number }; platform: { nativeContainment: boolean } }
+    }
+    expect(diagnostics.result.limits.maxSessionsPerOwner).toBe(32)
+    expect(diagnostics.result.platform.nativeContainment).toBeFalse()
+    await rpc('stop', { id })
+  } finally {
+    await server.stop()
+  }
+})
+
+test('conversation cleanup excludes persistent sessions and environment values stay out of records', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const common = {
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 5000)'],
+    parentSessionId: 'owner',
+    ownerProjectDirectory: root,
+    ownerCapabilityHash: 'capability',
+    workdir: root,
+    env: { API_TOKEN: 'test-secret-value' },
+  }
+  const conversation = await supervisor.spawn(common)
+  const persistent = await supervisor.spawn({ ...common, lifecycle: 'persistent' })
+  expect((await supervisor.get(conversation.id))?.environment).toEqual({
+    kind: 'safe',
+    keys: expect.arrayContaining(['[REDACTED_ENV_KEY]']),
+    fingerprint: expect.any(String),
+    sensitive: true,
+  })
+  expect(JSON.stringify(await new DaemonStorage(root).loadSessions())).not.toContain(
+    'test-secret-value'
+  )
+  expect(
+    (
+      await supervisor.exec({
+        ...common,
+        args: ['-e', 'console.log(process.env.API_TOKEN)'],
+        timeoutSeconds: 2,
+      })
+    ).stdout
+  ).toBe('[REDACTED]\n')
+  await supervisor.cleanupByParentSession('owner')
+  expect((await supervisor.get(conversation.id))?.terminationRequested).toBeTrue()
+  expect((await supervisor.get(persistent.id))?.terminationRequested).toBeFalse()
+  await supervisor.stop(persistent.id)
+  await Bun.sleep(50)
+  await supervisor.flush()
 })
 
 test('spawn permission adapter checks argv and returns a canonical workdir', async () => {
@@ -677,7 +781,18 @@ test('daemon classifies storage failures', async () => {
     const response = await fetch(`${descriptor.endpoint}/rpc`, {
       method: 'POST',
       headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'list', version: DAEMON_PROTOCOL_VERSION, operation: 'list' }),
+      body: JSON.stringify({
+        id: 'list',
+        version: DAEMON_PROTOCOL_VERSION,
+        operation: 'list',
+        owner: {
+          parentSessionId: 'parent',
+          projectDirectory: root,
+          capability: new Bun.CryptoHasher('sha256')
+            .update(`test-token\0parent\0${root}`)
+            .digest('hex'),
+        },
+      }),
     })
     expect(((await response.json()) as { error: { code: string } }).error.code).toBe('storage')
   } finally {
@@ -692,6 +807,7 @@ test('daemon classifies PTY failures as process failures', async () => {
   const supervisor = {
     initialize: async () => {},
     flush: async () => {},
+    list: async () => [],
     spawn: async () => {
       throw new ProcessError('spawn failed')
     },
@@ -706,7 +822,14 @@ test('daemon classifies PTY failures as process failures', async () => {
         id: 'spawn',
         version: DAEMON_PROTOCOL_VERSION,
         operation: 'spawn',
-        payload: { command: 'test', parentSessionId: 'parent' },
+        owner: {
+          parentSessionId: 'parent',
+          projectDirectory: root,
+          capability: new Bun.CryptoHasher('sha256')
+            .update(`test-token\0parent\0${root}`)
+            .digest('hex'),
+        },
+        payload: { command: 'test', parentSessionId: 'parent', description: 'test' },
       }),
     })
     expect(((await response.json()) as { error: { code: string } }).error.code).toBe('process')
@@ -857,23 +980,27 @@ test('plugin client starts its daemon from the configured data directory', async
       token: 'stale-token',
     })
     const client = new DaemonClient()
-    const session = await client.spawn({
-      command: process.execPath,
-      args: ['-e', "console.log('client daemon output')"],
-      description: 'test client daemon',
-      parentSessionId: 'test-session',
-    })
+    const owner = ownerContext('test-session', root)
+    const session = await client.spawn(
+      {
+        command: process.execPath,
+        args: ['-e', "console.log('client daemon output')"],
+        description: 'test client daemon',
+        parentSessionId: 'test-session',
+      },
+      owner
+    )
     let output = ''
     for (let attempt = 0; attempt < 40 && !output.includes('client daemon output'); attempt += 1) {
       await Bun.sleep(25)
-      output = (await client.getRawBuffer(session.id))?.raw ?? ''
+      output = (await client.getRawBuffer(session.id, owner))?.raw ?? ''
     }
     expect(output).toContain('client daemon output')
     pid = (await storage.readDescriptor())?.pid
     expect(pid).toBeNumber()
     expect((await storage.readDescriptor())?.token).not.toBe('stale-token')
     const recreated = new DaemonClient()
-    const read = await recreated.read(session.id)
+    const read = await recreated.read(session.id, 0, undefined, undefined, owner)
     expect(read.sequences[0]).toBe(0)
     expect(read.lines.join('\n')).toContain('client daemon output')
   } finally {
@@ -890,6 +1017,9 @@ test('daemon client returns RPC sequence cursor and truncation metadata', async 
   process.env.PTY_DAEMON_DIR = root
   const storage = new DaemonStorage(root)
   const session = record(root, 'pty_client_read', 'exited')
+  session.ownerCapabilityHash = new Bun.CryptoHasher('sha256')
+    .update(`test-token\0parent\0${root}`)
+    .digest('hex')
   session.nextSequence = 11
   session.firstRetainedSequence = 2
   session.outputBytes = 9
@@ -903,7 +1033,9 @@ test('daemon client returns RPC sequence cursor and truncation metadata', async 
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
   await server.start()
   try {
-    expect(await new DaemonClient().read(session.id, 0, 1, 7)).toEqual({
+    expect(
+      await new DaemonClient().read(session.id, 0, 1, 7, ownerContext('parent', root))
+    ).toEqual({
       lines: ['end'],
       sequences: [7],
       totalLines: 1,

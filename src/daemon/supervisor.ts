@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
 import {
   type ExecResult,
+  type EnvironmentProfile,
   OUTPUT_JOURNAL_VERSION,
   type ExitReason,
   type SessionRecord,
@@ -22,10 +23,24 @@ const DEFAULT_MAX_OUTPUT_BYTES =
 const OUTPUT_CHUNK_BYTES = 64 * 1024
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
+const SAFE_ENVIRONMENT_KEYS = new Set([
+  'PATH',
+  'HOME',
+  'USERPROFILE',
+  'SYSTEMROOT',
+  'WINDIR',
+  'TEMP',
+  'TMP',
+  'TERM',
+  'LANG',
+  'ComSpec',
+])
+const SENSITIVE_ENVIRONMENT_KEY = /(token|secret|password|credential|api[_-]?key|auth|cookie)/i
 
 interface ActiveSession {
   record: SessionRecord
   process: IPty
+  environment: Record<string, string>
   timeout?: ReturnType<typeof setTimeout>
 }
 
@@ -129,6 +144,43 @@ function canonicalEnv(env: Record<string, string> | undefined): string {
   )
 }
 
+function environmentProfile(env: Record<string, string>, inherited: boolean): EnvironmentProfile {
+  const sourceKeys = Object.keys(env)
+  const keys = sourceKeys
+    .map((key) => (SENSITIVE_ENVIRONMENT_KEY.test(key) ? '[REDACTED_ENV_KEY]' : key))
+    .sort()
+  return {
+    kind: inherited ? 'inherit' : 'safe',
+    keys,
+    fingerprint: new Bun.CryptoHasher('sha256').update(canonicalEnv(env)).digest('hex'),
+    sensitive: sourceKeys.some((key) => SENSITIVE_ENVIRONMENT_KEY.test(key)),
+  }
+}
+
+function runtimeEnvironment(
+  requested: Record<string, string> | undefined,
+  inherit: boolean
+): Record<string, string> {
+  const base = inherit
+    ? process.env
+    : Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => SAFE_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_')
+        )
+      )
+  return { ...base, ...requested } as Record<string, string>
+}
+
+function redactOutput(data: string, environment: Record<string, string>): string {
+  let redacted = data
+  for (const [key, value] of Object.entries(environment)) {
+    if (SENSITIVE_ENVIRONMENT_KEY.test(key) && value.length >= 4) {
+      redacted = redacted.replaceAll(value, '[REDACTED]')
+    }
+  }
+  return redacted
+}
+
 export class SessionSupervisor {
   private readonly active = new Map<string, ActiveSession>()
   private readonly records = new Map<string, SessionRecord>()
@@ -144,6 +196,10 @@ export class SessionSupervisor {
     await this.storage.initialize()
     for (const record of await this.storage.loadSessions()) {
       record.mode ??= 'pty'
+      record.ownerProjectDirectory ??= record.workdir
+      record.ownerCapabilityHash ??= ''
+      record.lifecycle ??= 'conversation'
+      record.environment ??= { kind: 'safe', keys: [], fingerprint: '', sensitive: false }
       record.terminationRequested ??= record.status === 'stopping'
       record.terminationConfirmed ??=
         record.status === 'exited' ||
@@ -182,6 +238,7 @@ export class SessionSupervisor {
     if (existing) return this.toInfo(existing)
     const id = `pty_${crypto.randomUUID()}`
     const now = new Date().toISOString()
+    const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
     const record: SessionRecord = {
       id,
       title:
@@ -194,7 +251,10 @@ export class SessionSupervisor {
       name: options.name,
       idempotencyKey: options.idempotencyKey,
       workdir: canonicalWorkdir(options.workdir),
-      env: options.env,
+      ownerProjectDirectory: canonicalWorkdir(options.ownerProjectDirectory ?? options.workdir),
+      ownerCapabilityHash: options.ownerCapabilityHash ?? '',
+      lifecycle: options.lifecycle ?? 'conversation',
+      environment: environmentProfile(environment, options.inheritEnv === true),
       status: 'starting',
       pid: 0,
       createdAt: now,
@@ -223,7 +283,7 @@ export class SessionSupervisor {
         cols: 120,
         rows: 40,
         cwd: record.workdir,
-        env: { ...process.env, ...record.env } as Record<string, string>,
+        env: environment,
       })
     } catch (error) {
       record.status = 'spawn_failed'
@@ -241,9 +301,9 @@ export class SessionSupervisor {
     record.pid = ptyProcess.pid
     record.status = 'running'
     record.updatedAt = new Date().toISOString()
-    const active: ActiveSession = { record, process: ptyProcess }
+    const active: ActiveSession = { record, process: ptyProcess, environment }
     this.active.set(id, active)
-    ptyProcess.onData((data: string) => this.handleOutput(active, data))
+    ptyProcess.onData((data: string) => this.handleOutput(active, redactOutput(data, environment)))
     ptyProcess.onExit(
       ({ exitCode, signal }: { exitCode: number | null; signal?: number | string }) =>
         this.handleExit(active, exitCode, signal)
@@ -338,6 +398,7 @@ export class SessionSupervisor {
     const args = options.args ?? []
     const now = new Date().toISOString()
     const id = `exec_${crypto.randomUUID()}`
+    const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
     const record: SessionRecord = {
       id,
       title: options.title ?? `${options.command} ${args.join(' ')}`.trim(),
@@ -346,7 +407,10 @@ export class SessionSupervisor {
       args,
       mode: 'exec',
       workdir: canonicalWorkdir(options.workdir),
-      env: options.env,
+      ownerProjectDirectory: canonicalWorkdir(options.ownerProjectDirectory ?? options.workdir),
+      ownerCapabilityHash: options.ownerCapabilityHash ?? '',
+      lifecycle: options.lifecycle ?? 'conversation',
+      environment: environmentProfile(environment, options.inheritEnv === true),
       status: 'starting',
       pid: 0,
       createdAt: now,
@@ -373,7 +437,7 @@ export class SessionSupervisor {
       child = Bun.spawn({
         cmd: [record.command, ...record.args],
         cwd: record.workdir,
-        env: { ...process.env, ...record.env },
+        env: environment,
         stdout: 'pipe',
         stderr: 'pipe',
       })
@@ -459,7 +523,9 @@ export class SessionSupervisor {
       stopReading.forEach((stop) => {
         stop()
       })
-    const [out, err] = await Promise.all([stdout, stderr])
+    const [capturedOut, capturedErr] = await Promise.all([stdout, stderr])
+    const out = { ...capturedOut, data: redactOutput(capturedOut.data, environment) }
+    const err = { ...capturedErr, data: redactOutput(capturedErr.data, environment) }
     const exitedAt = new Date().toISOString()
     record.exitCode = child.exitCode ?? undefined
     record.exitSignal = child.signalCode ?? undefined
@@ -562,6 +628,21 @@ export class SessionSupervisor {
     return [...this.records.values()].map((record) => this.toInfo(record))
   }
 
+  owns(
+    id: string,
+    parentSessionId: string,
+    projectDirectory: string,
+    capabilityHash: string
+  ): boolean {
+    const record = this.records.get(id)
+    return Boolean(
+      record &&
+        record.parentSessionId === parentSessionId &&
+        record.ownerProjectDirectory === projectDirectory &&
+        record.ownerCapabilityHash === capabilityHash
+    )
+  }
+
   async rawOutput(id: string): Promise<{ raw: string; byteLength: number } | null> {
     await this.flush()
     const record = this.records.get(id)
@@ -618,7 +699,10 @@ export class SessionSupervisor {
     await Promise.all(
       [...this.records.values()]
         .filter(
-          (record) => record.parentSessionId === parentSessionId && this.active.has(record.id)
+          (record) =>
+            record.parentSessionId === parentSessionId &&
+            record.lifecycle === 'conversation' &&
+            this.active.has(record.id)
         )
         .map((record) => this.stop(record.id))
     )
@@ -742,7 +826,11 @@ export class SessionSupervisor {
     if (
       existing.command !== options.command ||
       JSON.stringify(existing.args) !== JSON.stringify(args) ||
-      canonicalEnv(existing.env) !== canonicalEnv(options.env) ||
+      existing.environment.fingerprint !==
+        environmentProfile(
+          runtimeEnvironment(options.env, options.inheritEnv === true),
+          options.inheritEnv === true
+        ).fingerprint ||
       existing.timeoutSeconds !== options.timeoutSeconds
     ) {
       throw new Error(
@@ -957,6 +1045,7 @@ export class SessionSupervisor {
       outputTruncated: record.outputTruncated,
       lastWaitResult: record.lastWaitResult,
       execOutput: record.execOutput,
+      environment: record.environment,
     }
   }
 }

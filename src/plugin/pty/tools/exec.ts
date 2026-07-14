@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { ownerContext } from '../daemon-client.ts'
 import { authorizeSpawn } from '../permissions.ts'
 import { escapeXml } from '../xml.ts'
 
@@ -11,6 +12,7 @@ export const shellExec = tool({
     args: tool.schema.array(tool.schema.string()).describe('Structured argv arguments'),
     workdir: tool.schema.string().optional().describe('Working directory'),
     env: tool.schema.record(tool.schema.string(), tool.schema.string()).optional(),
+    inheritEnv: tool.schema.boolean().optional(),
     timeoutSeconds: tool.schema.number().describe('Required finite deadline in seconds'),
     maxOutputBytes: tool.schema
       .number()
@@ -19,12 +21,16 @@ export const shellExec = tool({
   },
   async execute(args, ctx) {
     const workdir = await authorizeSpawn(args.command, args.args ?? [], args.workdir)
-    const result = await manager.exec({
-      ...args,
-      workdir,
-      parentSessionId: ctx.sessionID,
-      parentAgent: ctx.agent,
-    })
+    const result = await manager.exec(
+      {
+        ...args,
+        workdir,
+        parentSessionId: ctx.sessionID,
+        parentAgent: ctx.agent,
+        inheritEnv: args.inheritEnv,
+      },
+      ownerContext(ctx.sessionID, workdir)
+    )
     return [
       `<shell_exec id="${escapeXml(result.session.id)}" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" output_limited="${result.outputLimited}" termination_confirmed="${result.terminationConfirmed}">`,
       '<stdout>',

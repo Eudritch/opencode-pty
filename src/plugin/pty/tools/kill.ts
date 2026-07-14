@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { ownerContext } from '../daemon-client.ts'
 import DESCRIPTION from './kill.txt'
 import { escapeXml } from '../xml.ts'
 
@@ -12,15 +13,17 @@ export const ptyKill = tool({
       .optional()
       .describe('If true, removes the session and frees the buffer (default: false)'),
   },
-  async execute(args) {
-    const session = await manager.get(args.id)
+  async execute(args, ctx) {
+    const owner = ownerContext(ctx.sessionID, ctx.directory)
+    const session = await manager.get(args.id, owner)
     if (!session) {
       throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
     }
 
     const cleanup = args.cleanup ?? false
-    const stop = await manager.stop(args.id)
-    const cleaned = cleanup && stop.terminationConfirmed ? await manager.cleanup(args.id) : false
+    const stop = await manager.stop(args.id, owner)
+    const cleaned =
+      cleanup && stop.terminationConfirmed ? await manager.cleanup(args.id, owner) : false
     const action = stop.terminationConfirmed
       ? 'Termination confirmed'
       : stop.requested

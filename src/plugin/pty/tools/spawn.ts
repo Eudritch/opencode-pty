@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { ownerContext } from '../daemon-client.ts'
 import { authorizeSpawn } from '../permissions.ts'
 import DESCRIPTION from './spawn.txt'
 import { escapeXml } from '../xml.ts'
@@ -13,7 +14,17 @@ export const ptySpawn = tool({
     env: tool.schema
       .record(tool.schema.string(), tool.schema.string())
       .optional()
-      .describe('Additional environment variables'),
+      .describe('Additional environment variables; values are never persisted'),
+    inheritEnv: tool.schema
+      .boolean()
+      .optional()
+      .describe('Explicitly inherit the daemon environment; default uses a safe allowlist'),
+    lifecycle: tool.schema
+      .enum(['conversation', 'persistent'])
+      .optional()
+      .describe(
+        'conversation stops on session deletion; persistent remains until explicitly stopped'
+      ),
     title: tool.schema.string().optional().describe('Human-readable title for the session'),
     description: tool.schema
       .string()
@@ -46,19 +57,24 @@ export const ptySpawn = tool({
     const workdir = await authorizeSpawn(args.command, args.args ?? [], args.workdir)
 
     const sessionId = ctx.sessionID
-    const info = await manager.spawn({
-      command: args.command,
-      args: args.args,
-      workdir,
-      env: args.env,
-      title: args.title,
-      description: args.description,
-      parentSessionId: sessionId,
-      parentAgent: ctx.agent,
-      timeoutSeconds: args.timeoutSeconds,
-      name: args.name,
-      idempotencyKey: args.idempotencyKey,
-    })
+    const info = await manager.spawn(
+      {
+        command: args.command,
+        args: args.args,
+        workdir,
+        env: args.env,
+        inheritEnv: args.inheritEnv,
+        lifecycle: args.lifecycle,
+        title: args.title,
+        description: args.description,
+        parentSessionId: sessionId,
+        parentAgent: ctx.agent,
+        timeoutSeconds: args.timeoutSeconds,
+        name: args.name,
+        idempotencyKey: args.idempotencyKey,
+      },
+      ownerContext(sessionId, workdir)
+    )
 
     const output = [
       `<pty_spawned>`,

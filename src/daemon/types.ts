@@ -1,4 +1,4 @@
-export const DAEMON_PROTOCOL_VERSION = 2
+export const DAEMON_PROTOCOL_VERSION = 3
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
@@ -21,6 +21,21 @@ export type DaemonStatus =
   | 'output_limited'
 
 export type ExecutionMode = 'pty' | 'exec'
+
+export type SessionLifecycle = 'conversation' | 'persistent'
+
+export interface OwnerContext {
+  parentSessionId: string
+  projectDirectory: string
+  capability: string
+}
+
+export interface EnvironmentProfile {
+  kind: 'safe' | 'inherit'
+  keys: string[]
+  fingerprint: string
+  sensitive: boolean
+}
 
 export type WaitCondition =
   | { kind: 'exit' }
@@ -68,7 +83,10 @@ export interface SessionRecord {
   name?: string
   idempotencyKey?: string
   workdir: string
-  env?: Record<string, string>
+  ownerProjectDirectory: string
+  ownerCapabilityHash: string
+  lifecycle: SessionLifecycle
+  environment: EnvironmentProfile
   status: DaemonStatus
   pid: number
   createdAt: string
@@ -119,6 +137,7 @@ export interface RpcRequest {
   id: string
   version: number
   operation: string
+  owner?: OwnerContext
   payload?: unknown
 }
 
@@ -141,6 +160,8 @@ export interface RpcFailure {
       | 'storage'
       | 'internal'
       | 'protocol'
+      | 'authorization'
+      | 'limit'
     message: string
   }
 }
@@ -155,4 +176,18 @@ export interface WriteResult {
 export interface StopResult {
   requested: boolean
   terminationConfirmed: boolean
+}
+
+export interface DaemonDiagnostics {
+  protocolVersion: number
+  pid: number
+  limits: {
+    maxSessionsPerOwner: number
+    maxInputBytes: number
+    maxInputBytesPerMinute: number
+    maxOutputBytes: number
+    maxExecRuntimeSeconds: number
+  }
+  environment: { inheritEnabled: boolean; defaultProfile: 'safe' }
+  platform: { nativeContainment: false; processTreeTermination: false }
 }

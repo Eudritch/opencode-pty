@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { ownerContext } from '../daemon-client.ts'
 import { escapeXml } from '../xml.ts'
 import DESCRIPTION from './write.txt'
 
@@ -38,8 +39,9 @@ export const ptyWrite = tool({
     id: tool.schema.string().describe('The PTY session ID (e.g., pty_a1b2c3d4)'),
     data: tool.schema.string().describe('The input data to send to the PTY'),
   },
-  async execute(args) {
-    const session = await manager.get(args.id)
+  async execute(args, ctx) {
+    const owner = ownerContext(ctx.sessionID, ctx.directory)
+    const session = await manager.get(args.id, owner)
     if (!session) {
       throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
     }
@@ -51,7 +53,7 @@ export const ptyWrite = tool({
     // Parse escape sequences to actual bytes
     const parsedData = parseEscapeSequences(args.data)
 
-    const result = await manager.write(args.id, parsedData)
+    const result = await manager.write(args.id, parsedData, owner)
 
     const preview = args.data.length > 50 ? `${args.data.slice(0, 50)}...` : args.data
     const displayPreview = preview

@@ -11,6 +11,7 @@ import {
 } from '../../daemon/types.ts'
 import { DaemonStorage } from '../../daemon/storage.ts'
 import { fileURLToPath } from 'node:url'
+import { realpathSync } from 'node:fs'
 
 const START_TIMEOUT_MS = 5000
 
@@ -49,82 +50,118 @@ export class DaemonClient {
   private readonly storage = new DaemonStorage()
   private descriptor: DaemonDescriptor | null = null
 
-  async spawn(options: SpawnOptions): Promise<PTYSessionInfo> {
-    return this.call('spawn', options)
+  async spawn(options: SpawnOptions, owner?: OwnerContext): Promise<PTYSessionInfo> {
+    return this.call('spawn', options, START_TIMEOUT_MS, owner)
   }
 
-  async exec(options: SpawnOptions & { maxOutputBytes?: number }): Promise<ExecResult> {
-    return this.call('exec', options, requestTimeout(options.timeoutSeconds ?? 0))
+  async exec(
+    options: SpawnOptions & { maxOutputBytes?: number },
+    owner?: OwnerContext
+  ): Promise<ExecResult> {
+    return this.call('exec', options, requestTimeout(options.timeoutSeconds ?? 0), owner)
   }
 
-  async wait(id: string, condition: WaitCondition, timeoutSeconds: number): Promise<WaitResult> {
-    return this.call('wait', { id, condition, timeoutSeconds }, requestTimeout(timeoutSeconds))
+  async wait(
+    id: string,
+    condition: WaitCondition,
+    timeoutSeconds: number,
+    owner?: OwnerContext
+  ): Promise<WaitResult> {
+    return this.call(
+      'wait',
+      { id, condition, timeoutSeconds },
+      requestTimeout(timeoutSeconds),
+      owner
+    )
   }
 
   async sendWait(
     id: string,
     data: string,
     condition: WaitCondition,
-    timeoutSeconds: number
+    timeoutSeconds: number,
+    owner: OwnerContext
   ): Promise<WaitResult> {
     return this.call(
       'sendWait',
       { id, data, condition, timeoutSeconds },
-      requestTimeout(timeoutSeconds)
+      requestTimeout(timeoutSeconds),
+      owner
     )
   }
 
-  async write(id: string, data: string): Promise<WriteResult> {
-    return this.call('write', { id, data })
+  async write(id: string, data: string, owner: OwnerContext): Promise<WriteResult> {
+    return this.call('write', { id, data }, START_TIMEOUT_MS, owner)
   }
 
-  async read(id: string, offset?: number, limit?: number, sequence?: number): Promise<ReadResult> {
-    return this.call('read', { id, offset, limit, sequence })
+  async read(
+    id: string,
+    offset?: number,
+    limit?: number,
+    sequence?: number,
+    owner?: OwnerContext
+  ): Promise<ReadResult> {
+    return this.call('read', { id, offset, limit, sequence }, START_TIMEOUT_MS, owner)
   }
 
   async search(
     id: string,
     pattern: string,
     ignoreCase = false,
-    offset?: number,
-    limit?: number,
-    sequence?: number
+    offset: number | undefined,
+    limit: number | undefined,
+    sequence: number | undefined,
+    owner: OwnerContext
   ): Promise<SearchResult> {
-    return this.call('search', { id, pattern, ignoreCase, offset, limit, sequence })
+    return this.call(
+      'search',
+      { id, pattern, ignoreCase, offset, limit, sequence },
+      START_TIMEOUT_MS,
+      owner
+    )
   }
 
-  async list(): Promise<PTYSessionInfo[]> {
-    return this.call('list')
+  async list(owner?: OwnerContext): Promise<PTYSessionInfo[]> {
+    return this.call('list', {}, START_TIMEOUT_MS, owner)
   }
 
-  async get(id: string): Promise<PTYSessionInfo | null> {
-    return this.call('get', { id })
+  async get(id: string, owner?: OwnerContext): Promise<PTYSessionInfo | null> {
+    return this.call('get', { id }, START_TIMEOUT_MS, owner)
   }
 
-  async getRawBuffer(id: string): Promise<{ raw: string; byteLength: number } | null> {
-    return this.call('rawOutput', { id })
+  async getRawBuffer(
+    id: string,
+    owner?: OwnerContext
+  ): Promise<{ raw: string; byteLength: number } | null> {
+    return this.call('rawOutput', { id }, START_TIMEOUT_MS, owner)
   }
 
-  async getExecOutput(id: string) {
-    return this.call('execOutput', { id })
+  async getExecOutput(id: string, owner?: OwnerContext) {
+    return this.call('execOutput', { id }, START_TIMEOUT_MS, owner)
   }
 
-  async stop(id: string): Promise<StopResult> {
-    return this.call('stop', { id })
+  async stop(id: string, owner?: OwnerContext): Promise<StopResult> {
+    return this.call('stop', { id }, START_TIMEOUT_MS, owner)
   }
 
-  async cleanup(id: string): Promise<boolean> {
-    return this.call('cleanup', { id })
+  async cleanup(id: string, owner?: OwnerContext): Promise<boolean> {
+    return this.call('cleanup', { id }, START_TIMEOUT_MS, owner)
   }
 
-  async cleanupBySession(parentSessionId: string): Promise<void> {
-    await this.call('cleanupByParentSession', { parentSessionId })
+  async cleanupBySession(owner?: OwnerContext): Promise<void> {
+    await this.call(
+      'cleanupByParentSession',
+      { parentSessionId: owner?.parentSessionId },
+      START_TIMEOUT_MS,
+      owner
+    )
   }
 
   private async call<T>(
     operation: string,
     payload?: unknown,
-    timeout = START_TIMEOUT_MS
+    timeout = START_TIMEOUT_MS,
+    owner?: OwnerContext
   ): Promise<T> {
     const descriptor = await this.ensureDaemon()
     const response = await fetch(`${descriptor.endpoint}/rpc`, {
@@ -137,6 +174,7 @@ export class DaemonClient {
         id: crypto.randomUUID(),
         version: DAEMON_PROTOCOL_VERSION,
         operation,
+        owner: owner && { ...owner, capability: this.capability(descriptor.token, owner) },
         payload,
       }),
       signal: AbortSignal.timeout(timeout),
@@ -249,6 +287,26 @@ export class DaemonClient {
     return new Error(
       `PTY daemon protocol ${descriptor.protocolVersion} is incompatible with client protocol ${DAEMON_PROTOCOL_VERSION}.`
     )
+  }
+
+  private capability(token: string, owner: Omit<OwnerContext, 'capability'>): string {
+    return new Bun.CryptoHasher('sha256')
+      .update(`${token}\0${owner.parentSessionId}\0${owner.projectDirectory}`)
+      .digest('hex')
+  }
+}
+
+export interface OwnerContext {
+  parentSessionId: string
+  projectDirectory: string
+  capability: string
+}
+
+export function ownerContext(parentSessionId: string, projectDirectory: string): OwnerContext {
+  return {
+    parentSessionId,
+    projectDirectory: realpathSync(projectDirectory),
+    capability: '',
   }
 }
 

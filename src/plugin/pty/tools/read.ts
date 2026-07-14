@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { ownerContext, type OwnerContext } from '../daemon-client.ts'
 import { DEFAULT_READ_LIMIT, MAX_LINE_LENGTH } from '../../../shared/constants.ts'
 import { formatLine } from '../formatters.ts'
 import type { PTYSessionInfo } from '../types.ts'
@@ -22,6 +23,7 @@ interface ReadArgs {
   pattern?: string
   ignoreCase?: boolean
   sequence?: number
+  owner?: OwnerContext
 }
 
 /**
@@ -69,9 +71,10 @@ async function handlePatternRead(
   session: PTYSessionInfo,
   offset: number,
   limit: number,
-  sequence?: number
+  sequence: number | undefined,
+  owner: OwnerContext
 ): Promise<string> {
-  const result = await manager.search(id, pattern, ignoreCase, offset, limit, sequence)
+  const result = await manager.search(id, pattern, ignoreCase, offset, limit, sequence, owner)
   if (!result) {
     throw new Error(`PTY session '${id}' not found. Use pty_list to see active sessions.`)
   }
@@ -123,9 +126,10 @@ async function handlePlainRead(
   session: PTYSessionInfo,
   offset: number,
   limit: number,
-  sequence?: number
+  sequence: number | undefined,
+  owner: OwnerContext
 ): Promise<string> {
-  const result = await manager.read(args.id, offset, limit, sequence)
+  const result = await manager.read(args.id, offset, limit, sequence, owner)
   if (!result) {
     throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
   }
@@ -200,8 +204,9 @@ export const ptyRead = tool({
       .optional()
       .describe('Only return lines at or after this durable UTF-8 byte sequence position.'),
   },
-  async execute(args) {
-    const session = await manager.get(args.id)
+  async execute(args, ctx) {
+    const owner = ownerContext(ctx.sessionID, ctx.directory)
+    const session = await manager.get(args.id, owner)
     if (!session) {
       throw new Error(`PTY session '${args.id}' not found. Use pty_list to see active sessions.`)
     }
@@ -217,10 +222,11 @@ export const ptyRead = tool({
         session,
         offset,
         limit,
-        args.sequence
+        args.sequence,
+        owner
       )
     } else {
-      return await handlePlainRead(args, session, offset, limit, args.sequence)
+      return await handlePlainRead(args, session, offset, limit, args.sequence, owner)
     }
   },
 })

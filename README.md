@@ -28,12 +28,14 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 - The daemon binds only to `127.0.0.1` on a random port.
 - Each RPC requires the bearer token in the private per-user daemon descriptor.
 - The daemon persists metadata and output under `PTY_DAEMON_DIR`, or the user state directory by default.
-- Session output is shared by OpenCode instances running as the same OS user. Treat it as same-user local state.
+- Every non-health RPC carries a capability derived by the plugin from the private daemon token, OpenCode session ID, and canonical project directory. A session can only be listed, read, written, waited on, stopped, or deleted by that same owner context. Knowing an ID is insufficient.
+- `session.deleted` stops only that owner's `conversation` sessions. `persistent` sessions remain until their owner explicitly stops them. The daemon itself survives plugin/OpenCode restarts; active sessions become `lost` if the daemon restarts.
+- Environment defaults to a small platform/project-safe allowlist plus explicitly supplied variables. Set `inheritEnv: true` only when the command needs the daemon environment. Raw environment values are never persisted: records retain only profile kind, redacted key markers, and a fingerprint. Output replaces values of obvious secret-named environment variables with `[REDACTED]`.
 - Browser-facing APIs, WebSockets, and slash commands are intentionally not provided.
 
 OpenCode `permission.bash` rules are checked before spawn. Unavailable permission configuration and `ask` rules are denied. External working directories are resolved canonically; `permission.external_directory: "ask"` is denied because the plugin cannot render the native prompt.
 
-This tranche does not provide per-session worker processes, native Job Objects/cgroups, terminal emulation, browser UI, signed binaries, or a native descendant-process termination guarantee.
+This tranche does not provide per-session worker processes, native Job Objects/cgroups, terminal emulation, browser UI, signed binaries, OS CPU/memory limits, or a native descendant-process termination guarantee. Bun limits session count per owner, PTY input size/rate, retained output, and exec runtime/output only.
 
 ## Setup
 
@@ -52,6 +54,8 @@ This tranche does not provide per-session worker processes, native Job Objects/c
 | `PTY_MAX_OUTPUT_BYTES` | `1000000` | Maximum retained output bytes per session. |
 
 Output is an append-only, session-local UTF-8 chunk journal. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
+
+The daemon `diagnostics` RPC reports active Bun-enforced limits and explicitly reports that native containment and process-tree termination are unavailable. It intentionally exposes no secret values or global session data.
 
 ## Development
 

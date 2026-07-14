@@ -1,4 +1,10 @@
-import type { ExecOutput, ExecutionMode, ExitReason, WaitResult } from '../../daemon/types.ts'
+import type {
+  ExecOutput,
+  ExecutionMode,
+  ExitReason,
+  SessionLifecycle,
+  WaitResult,
+} from '../../daemon/types.ts'
 
 export type PTYStatus =
   | 'starting'
@@ -38,6 +44,12 @@ export interface PTYSessionInfo {
   outputTruncated?: boolean
   lastWaitResult?: WaitResult
   execOutput?: ExecOutput
+  environment?: {
+    kind: 'safe' | 'inherit'
+    keys: string[]
+    fingerprint: string
+    sensitive: boolean
+  }
 }
 
 export interface SpawnOptions {
@@ -45,6 +57,8 @@ export interface SpawnOptions {
   args?: string[]
   workdir?: string
   env?: Record<string, string>
+  inheritEnv?: boolean
+  lifecycle?: SessionLifecycle
   title?: string
   description?: string
   parentSessionId: string
@@ -52,6 +66,9 @@ export interface SpawnOptions {
   timeoutSeconds?: number
   name?: string
   idempotencyKey?: string
+  // Daemon-only fields are attached after authenticated owner validation.
+  ownerProjectDirectory?: string
+  ownerCapabilityHash?: string
 }
 
 export interface ReadResult {

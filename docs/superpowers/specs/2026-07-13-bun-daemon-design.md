@@ -32,7 +32,7 @@ The daemon remains running when an OpenCode plugin instance exits, so plugin and
 
 ## Ownership And Policy
 
-Each spawn records the originating OpenCode session ID, optional agent, and working directory. Existing tools keep global daemon visibility to preserve current behavior; this release does not claim cross-conversation isolation.
+Each spawn records the originating OpenCode session ID, canonical project directory, and a daemon-token-derived owner capability hash. Every stateful RPC validates that same owner tuple, so session IDs are not global capabilities. No general sharing is implemented. `conversation` is the default lifecycle and is stopped by the matching `session.deleted` event; `persistent` is explicit and remains until its owner stops it. The daemon may survive plugin/OpenCode restarts, but its own restart marks live handles `lost`.
 
 The protocol has two execution modes. `pty` is interactive and is used by the existing `pty_spawn`; `exec` runs one finite structured argv command through Bun pipes and returns separate stdout and stderr. There is no fake persistent shell parser. Plugin permission and canonical-workdir checks run before either mode starts a process.
 
@@ -123,5 +123,5 @@ Existing PTY integration tests remain the backend smoke tests. Web HTTP/WebSocke
 ## Explicitly Deferred
 
 - A secure human web client can be added later as a daemon client with a one-time capability token, origin validation, and operation-specific capabilities.
-- Resize, terminal-screen emulation, session aliases, resource limits beyond finite exec output, secret redaction, and worker isolation each require independent design.
+- Resize, terminal-screen emulation, session aliases, worker isolation, native CPU/memory limits, Job Objects/cgroups, and verified process-tree termination remain deferred. Bun-level session, input, runtime, and output limits are not native containment.
 - Native containment and a signed platform daemon replace `bun-pty` only when their platform matrix and verification requirements can be tested.

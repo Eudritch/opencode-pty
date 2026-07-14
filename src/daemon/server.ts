@@ -1,6 +1,8 @@
 import {
   DAEMON_PROTOCOL_VERSION,
   type DaemonDescriptor,
+  type DaemonDiagnostics,
+  type OwnerContext,
   type RpcFailure,
   type RpcRequest,
   type RpcResponse,
@@ -15,11 +17,16 @@ const MAX_COMMAND_LENGTH = 4096
 const MAX_ARGUMENTS = 256
 const MAX_ENVIRONMENT_ENTRIES = 128
 const MAX_PAGE_SIZE = 10_000
+const MAX_INPUT_BYTES = 64 * 1024
+const MAX_INPUT_BYTES_PER_MINUTE = 256 * 1024
+const MAX_SESSIONS_PER_OWNER = 32
+const MAX_EXEC_RUNTIME_SECONDS = 3600
 
 class ValidationError extends Error {}
 
 export class DaemonServer implements Disposable {
   private server: ReturnType<typeof Bun.serve> | null = null
+  private readonly inputUsage = new Map<string, { startedAt: number; bytes: number }>()
 
   constructor(
     private readonly storage: DaemonStorage,
@@ -98,38 +105,52 @@ export class DaemonServer implements Disposable {
           ? 'validation'
           : this.isStorageError(error)
             ? 'storage'
-            : error instanceof ProcessError
-              ? 'process'
-              : message.includes('not found')
-                ? 'not_found'
-                : message.includes('closed')
-                  ? 'session_closed'
-                  : 'internal'
+            : message.includes('not authorized')
+              ? 'authorization'
+              : message.includes('limit')
+                ? 'limit'
+                : error instanceof ProcessError
+                  ? 'process'
+                  : message.includes('not found')
+                    ? 'not_found'
+                    : message.includes('closed')
+                      ? 'session_closed'
+                      : 'internal'
       return this.failure(rpcRequest.id, code, message, code === 'not_found' ? 404 : 400)
     }
   }
 
   private async dispatch(request: RpcRequest): Promise<unknown> {
+    if (request.operation === 'health') {
+      this.onlyFields(this.objectPayload(request.payload ?? {}), [])
+      return { protocolVersion: DAEMON_PROTOCOL_VERSION, pid: process.pid }
+    }
+    if (request.operation === 'diagnostics') {
+      const owner = this.owner(request)
+      return this.diagnostics(owner)
+    }
+    const owner = this.owner(request)
     switch (request.operation) {
-      case 'health':
-        this.onlyFields(this.objectPayload(request.payload ?? {}), [])
-        return { protocolVersion: DAEMON_PROTOCOL_VERSION, pid: process.pid }
       case 'spawn':
-        return this.supervisor.spawn(this.spawnPayload(request.payload))
+        return this.spawn(this.spawnPayload(request.payload), owner)
       case 'exec':
-        return this.supervisor.exec(this.execPayload(request.payload))
+        return this.exec(this.execPayload(request.payload), owner)
       case 'write': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'data'])
         const id = this.requiredString(payload, 'id')
         const data = this.requiredString(payload, 'data')
+        this.authorize(id, owner)
+        this.useInput(owner, data)
         return this.supervisor.write(id, data)
       }
       case 'wait': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'condition', 'timeoutSeconds'])
+        const id = this.requiredString(payload, 'id')
+        this.authorize(id, owner)
         return this.supervisor.wait(
-          this.requiredString(payload, 'id'),
+          id,
           this.waitCondition(payload.condition),
           this.requiredPositiveInteger(payload, 'timeoutSeconds')
         )
@@ -137,9 +158,13 @@ export class DaemonServer implements Disposable {
       case 'sendWait': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'data', 'condition', 'timeoutSeconds'])
+        const id = this.requiredString(payload, 'id')
+        const data = this.requiredString(payload, 'data')
+        this.authorize(id, owner)
+        this.useInput(owner, data)
         return this.supervisor.sendWait(
-          this.requiredString(payload, 'id'),
-          this.requiredString(payload, 'data'),
+          id,
+          data,
           this.waitCondition(payload.condition),
           this.requiredPositiveInteger(payload, 'timeoutSeconds')
         )
@@ -147,8 +172,10 @@ export class DaemonServer implements Disposable {
       case 'read': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'offset', 'limit', 'sequence'])
+        const id = this.requiredString(payload, 'id')
+        this.authorize(id, owner)
         return this.supervisor.read(
-          this.requiredString(payload, 'id'),
+          id,
           this.optionalNonnegativeInteger(payload, 'offset'),
           this.optionalNonnegativeInteger(payload, 'limit'),
           this.optionalSequence(payload, 'sequence')
@@ -157,8 +184,10 @@ export class DaemonServer implements Disposable {
       case 'search': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'pattern', 'ignoreCase', 'offset', 'limit', 'sequence'])
+        const id = this.requiredString(payload, 'id')
+        this.authorize(id, owner)
         return this.supervisor.search(
-          this.requiredString(payload, 'id'),
+          id,
           this.requiredString(payload, 'pattern'),
           this.optionalBoolean(payload, 'ignoreCase') ?? false,
           this.optionalNonnegativeInteger(payload, 'offset'),
@@ -167,19 +196,19 @@ export class DaemonServer implements Disposable {
         )
       }
       case 'list':
-        return this.supervisor.list()
+        return (await this.supervisor.list()).filter((record) => this.owns(record.id, owner))
       case 'get':
-        return this.get(request.payload)
+        return this.get(request.payload, owner)
       case 'rawOutput':
-        return this.rawOutput(request.payload)
+        return this.rawOutput(request.payload, owner)
       case 'execOutput':
-        return this.execOutput(request.payload)
+        return this.execOutput(request.payload, owner)
       case 'stop':
-        return this.stopSession(request.payload)
+        return this.stopSession(request.payload, owner)
       case 'cleanup':
-        return this.cleanup(request.payload)
+        return this.cleanup(request.payload, owner)
       case 'cleanupByParentSession':
-        return this.cleanupByParentSession(request.payload)
+        return this.cleanupByParentSession(request.payload, owner)
       default:
         throw new ValidationError(`Unsupported RPC operation '${request.operation}'.`)
     }
@@ -200,40 +229,144 @@ export class DaemonServer implements Disposable {
     }
   }
 
-  private get(payload: unknown) {
+  private get(payload: unknown, owner: OwnerContext) {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['id'])
-    return this.supervisor.get(this.requiredString(value, 'id'))
+    const id = this.requiredString(value, 'id')
+    this.authorize(id, owner)
+    return this.supervisor.get(id)
   }
 
-  private rawOutput(payload: unknown) {
+  private rawOutput(payload: unknown, owner: OwnerContext) {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['id'])
-    return this.supervisor.rawOutput(this.requiredString(value, 'id'))
+    const id = this.requiredString(value, 'id')
+    this.authorize(id, owner)
+    return this.supervisor.rawOutput(id)
   }
 
-  private execOutput(payload: unknown) {
+  private execOutput(payload: unknown, owner: OwnerContext) {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['id'])
-    return this.supervisor.execOutput(this.requiredString(value, 'id'))
+    const id = this.requiredString(value, 'id')
+    this.authorize(id, owner)
+    return this.supervisor.execOutput(id)
   }
 
-  private stopSession(payload: unknown) {
+  private stopSession(payload: unknown, owner: OwnerContext) {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['id'])
-    return this.supervisor.stop(this.requiredString(value, 'id'))
+    const id = this.requiredString(value, 'id')
+    this.authorize(id, owner)
+    return this.supervisor.stop(id)
   }
 
-  private cleanup(payload: unknown) {
+  private cleanup(payload: unknown, owner: OwnerContext) {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['id'])
-    return this.supervisor.cleanup(this.requiredString(value, 'id'))
+    const id = this.requiredString(value, 'id')
+    this.authorize(id, owner)
+    return this.supervisor.cleanup(id)
   }
 
-  private cleanupByParentSession(payload: unknown) {
+  private cleanupByParentSession(payload: unknown, owner: OwnerContext) {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['parentSessionId'])
-    return this.supervisor.cleanupByParentSession(this.requiredString(value, 'parentSessionId'))
+    const parentSessionId = this.requiredString(value, 'parentSessionId')
+    if (parentSessionId !== owner.parentSessionId) throw new Error('Owner is not authorized.')
+    return this.supervisor.cleanupByParentSession(parentSessionId)
+  }
+
+  private async spawn(
+    options: Parameters<SessionSupervisor['spawn']>[0],
+    owner: OwnerContext
+  ): Promise<unknown> {
+    const owned = (await this.supervisor.list()).filter((session) => this.owns(session.id, owner))
+    if (owned.length >= MAX_SESSIONS_PER_OWNER) throw new Error('Session limit exceeded.')
+    return this.supervisor.spawn({
+      ...options,
+      parentSessionId: owner.parentSessionId,
+      ownerProjectDirectory: owner.projectDirectory,
+      ownerCapabilityHash: owner.capability,
+    })
+  }
+
+  private async exec(
+    options: Parameters<SessionSupervisor['exec']>[0],
+    owner: OwnerContext
+  ): Promise<unknown> {
+    if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
+      throw new Error('Exec runtime limit exceeded.')
+    }
+    return this.supervisor.exec({
+      ...options,
+      parentSessionId: owner.parentSessionId,
+      ownerProjectDirectory: owner.projectDirectory,
+      ownerCapabilityHash: owner.capability,
+    })
+  }
+
+  private owner(request: RpcRequest): OwnerContext {
+    const owner = request.owner
+    if (
+      !owner ||
+      typeof owner.parentSessionId !== 'string' ||
+      !owner.parentSessionId ||
+      typeof owner.projectDirectory !== 'string' ||
+      !owner.projectDirectory ||
+      typeof owner.capability !== 'string' ||
+      owner.capability.length !== 64
+    ) {
+      throw new ValidationError('A valid owner context is required.')
+    }
+    if (owner.capability !== this.capability(owner.parentSessionId, owner.projectDirectory)) {
+      throw new Error('Owner is not authorized.')
+    }
+    return owner
+  }
+
+  private authorize(id: string, owner: OwnerContext): void {
+    if (!this.owns(id, owner)) throw new Error('Owner is not authorized.')
+  }
+
+  private owns(id: string, owner: OwnerContext): boolean {
+    return this.supervisor.owns(id, owner.parentSessionId, owner.projectDirectory, owner.capability)
+  }
+
+  private capability(parentSessionId: string, projectDirectory: string): string {
+    return new Bun.CryptoHasher('sha256')
+      .update(`${this.token}\0${parentSessionId}\0${projectDirectory}`)
+      .digest('hex')
+  }
+
+  private useInput(owner: OwnerContext, data: string): void {
+    const bytes = Buffer.byteLength(data)
+    if (bytes > MAX_INPUT_BYTES) throw new Error('Input size limit exceeded.')
+    const now = Date.now()
+    const key = `${owner.parentSessionId}\0${owner.projectDirectory}\0${owner.capability}`
+    const usage = this.inputUsage.get(key)
+    const current = !usage || now - usage.startedAt >= 60_000 ? { startedAt: now, bytes: 0 } : usage
+    if (current.bytes + bytes > MAX_INPUT_BYTES_PER_MINUTE)
+      throw new Error('Input rate limit exceeded.')
+    current.bytes += bytes
+    this.inputUsage.set(key, current)
+  }
+
+  private diagnostics(owner: OwnerContext): DaemonDiagnostics {
+    if (!owner.parentSessionId) throw new Error('Owner is not authorized.')
+    return {
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
+      pid: process.pid,
+      limits: {
+        maxSessionsPerOwner: MAX_SESSIONS_PER_OWNER,
+        maxInputBytes: MAX_INPUT_BYTES,
+        maxInputBytesPerMinute: MAX_INPUT_BYTES_PER_MINUTE,
+        maxOutputBytes: Number.parseInt(process.env.PTY_MAX_OUTPUT_BYTES ?? '1000000', 10),
+        maxExecRuntimeSeconds: MAX_EXEC_RUNTIME_SECONDS,
+      },
+      environment: { inheritEnabled: true, defaultProfile: 'safe' },
+      platform: { nativeContainment: false, processTreeTermination: false },
+    }
   }
 
   private requiredString(payload: Record<string, unknown>, key: string): string {
@@ -299,6 +432,8 @@ export class DaemonServer implements Disposable {
       'description',
       'workdir',
       'env',
+      'inheritEnv',
+      'lifecycle',
       'title',
       'parentSessionId',
       'parentAgent',
@@ -341,6 +476,11 @@ export class DaemonServer implements Disposable {
     const timeoutSeconds = this.optionalNonnegativeInteger(value, 'timeoutSeconds')
     if (timeoutSeconds === 0)
       throw new ValidationError("RPC field 'timeoutSeconds' must be positive.")
+    const inheritEnv = this.optionalBoolean(value, 'inheritEnv')
+    const lifecycle = this.optionalString(value, 'lifecycle')
+    if (lifecycle !== undefined && lifecycle !== 'conversation' && lifecycle !== 'persistent') {
+      throw new ValidationError("RPC field 'lifecycle' must be 'conversation' or 'persistent'.")
+    }
     const command = this.requiredString(value, 'command')
     if (command.length > MAX_COMMAND_LENGTH) {
       throw new ValidationError("RPC field 'command' exceeds the size limit.")
@@ -352,11 +492,13 @@ export class DaemonServer implements Disposable {
       workdir: this.optionalString(value, 'workdir'),
       env: env as Record<string, string> | undefined,
       title: this.optionalString(value, 'title'),
-      parentSessionId: this.requiredString(value, 'parentSessionId'),
+      parentSessionId: this.optionalString(value, 'parentSessionId') ?? '',
       parentAgent: this.optionalString(value, 'parentAgent'),
       timeoutSeconds,
       name: this.optionalString(value, 'name'),
       idempotencyKey: this.optionalString(value, 'idempotencyKey'),
+      inheritEnv,
+      lifecycle,
     }
   }
 
@@ -368,6 +510,8 @@ export class DaemonServer implements Disposable {
       'description',
       'workdir',
       'env',
+      'inheritEnv',
+      'lifecycle',
       'title',
       'parentSessionId',
       'parentAgent',
