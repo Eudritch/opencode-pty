@@ -96,4 +96,6 @@ export interface SearchResult {
   firstRetainedSequence: number
   nextSequence: number
   truncated: boolean
+  containment?: ContainmentReport
+  termination?: import('../../daemon/types.ts').TerminationResult
 }

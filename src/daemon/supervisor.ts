@@ -266,7 +266,10 @@ export class SessionSupervisor {
   async initialize(): Promise<void> {
     await this.storage.initialize()
     for (const record of await this.storage.loadSessions()) {
-      if (record.containment) record.containment.rootIdentityVerified ??= false
+      if (record.containment) {
+        record.containment.rootIdentityVerified ??= false
+        record.containment.observedEscapedDescendants ??= []
+      }
       record.mode ??= 'pty'
       record.ownerProjectDirectory ??= record.workdir
       record.ownerCapabilityHash ??= ''
@@ -646,14 +649,16 @@ export class SessionSupervisor {
           : this.exitReason(child.exitCode, child.signalCode ?? undefined)
     record.outputBytes = out.bytes + err.bytes
     record.outputTruncated = out.limited || err.limited
-    record.execOutput = {
-      stdout: out.data,
-      stderr: err.data,
-      stdoutBytes: out.bytes,
-      stderrBytes: err.bytes,
-      stdoutTruncated: out.limited,
-      stderrTruncated: err.limited,
-    }
+      record.execOutput = {
+        stdout: out.data,
+        stderr: err.data,
+        stdoutBytes: out.bytes,
+        stderrBytes: err.bytes,
+        stdoutTruncated: out.limited,
+        stderrTruncated: err.limited,
+        containment: record.containment,
+        termination: record.termination,
+      }
     record.terminationConfirmed = !stillRunning
     record.exitedAt = exitedAt
     record.updatedAt = exitedAt
@@ -668,6 +673,7 @@ export class SessionSupervisor {
       outputLimited: record.outputTruncated,
       terminationConfirmed: record.terminationConfirmed,
       containment: record.containment,
+      termination: record.termination,
       startedAt: now,
       exitedAt,
     }
@@ -852,6 +858,8 @@ export class SessionSupervisor {
       stderrBytes: result.stderrBytes,
       stdoutTruncated: result.stdoutTruncated,
       stderrTruncated: result.stderrTruncated,
+      containment: result.containment,
+      termination: result.termination,
     }
     record.status =
       result.status === 'lost'
@@ -967,6 +975,8 @@ export class SessionSupervisor {
       firstRetainedSequence: record.firstRetainedSequence,
       nextSequence: record.nextSequence,
       truncated: record.outputTruncated,
+      containment: record.containment,
+      termination: record.termination,
     }
   }
 
@@ -982,6 +992,12 @@ export class SessionSupervisor {
 
   async list(): Promise<PTYSessionInfo[]> {
     await this.flush()
+    await Promise.all(
+      [...this.nativeWorkers.entries()].map(async ([id, worker]) => {
+        const record = this.records.get(id)
+        if (record?.worker) await this.finishNative(record, await worker.snapshot())
+      })
+    )
     return [...this.records.values()].map((record) => this.toInfo(record))
   }
 
@@ -1000,22 +1016,26 @@ export class SessionSupervisor {
     )
   }
 
-  async rawOutput(id: string): Promise<{ raw: string; byteLength: number } | null> {
+  async rawOutput(
+    id: string
+  ): Promise<{ raw: string; byteLength: number; containment?: SessionRecord['containment']; termination?: SessionRecord['termination'] } | null> {
     await this.flush()
     const record = this.records.get(id)
     if (!record) return null
     const raw = await this.storage.readOutput(id)
-    return { raw, byteLength: Buffer.byteLength(raw) }
+    return { raw, byteLength: Buffer.byteLength(raw), containment: record.containment, termination: record.termination }
   }
 
-  async execOutput(id: string) {
+  async execOutput(id: string): Promise<import('./types.ts').ExecOutput | null> {
     await this.flush()
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
       await this.finalizeNative(record, native, await native.snapshot())
     }
-    return record?.execOutput ?? null
+    return record?.execOutput
+      ? { ...record.execOutput, containment: record.containment, termination: record.termination }
+      : null
   }
 
   async stop(id: string): Promise<StopResult> {
@@ -1047,7 +1067,12 @@ export class SessionSupervisor {
       }
     }
     if (active.record.terminationRequested) {
-      return { requested: true, terminationConfirmed: false }
+      return {
+        requested: true,
+        terminationConfirmed: active.record.terminationConfirmed,
+        containment: active.record.containment,
+        termination: active.record.termination,
+      }
     }
     active.record.terminationRequested = true
     if (!active.record.timedOut) active.record.status = 'stopping'
@@ -1064,7 +1089,12 @@ export class SessionSupervisor {
         `Failed to stop PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
       )
     }
-    return { requested: true, terminationConfirmed: !this.active.has(id) }
+    return {
+      requested: true,
+      terminationConfirmed: !this.active.has(id),
+      containment: active.record.containment,
+      termination: active.record.termination,
+    }
   }
 
   async cleanup(id: string): Promise<boolean> {
@@ -1341,11 +1371,16 @@ export class SessionSupervisor {
   }
 
   private async finishWait(record: SessionRecord, result: WaitResult): Promise<WaitResult> {
-    record.lastWaitResult = result
+    const complete = {
+      ...result,
+      containment: record.containment,
+      termination: record.termination,
+    }
+    record.lastWaitResult = complete
     record.updatedAt = new Date().toISOString()
     this.enqueuePersist(() => this.storage.writeSession(record))
     await this.persistQueue
-    return result
+    return complete
   }
 
   private resolveOutputWaits(record: SessionRecord): void {

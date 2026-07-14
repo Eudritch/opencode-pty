@@ -132,7 +132,12 @@ export class DaemonClient {
   async getRawBuffer(
     id: string,
     owner?: OwnerContext
-  ): Promise<{ raw: string; byteLength: number } | null> {
+  ): Promise<{
+    raw: string
+    byteLength: number
+    containment?: import('../../daemon/types.ts').ContainmentReport
+    termination?: import('../../daemon/types.ts').TerminationResult
+  } | null> {
     return this.call('rawOutput', { id }, START_TIMEOUT_MS, owner)
   }
 

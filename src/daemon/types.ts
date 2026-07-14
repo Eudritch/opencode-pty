@@ -49,6 +49,7 @@ export interface ContainmentReport {
   observedGroupPids: number[]
   observedSessionPids: number[]
   observedEscapedDescendantPids: number[]
+  observedEscapedDescendants?: Array<{ pid: number; startIdentity: string }>
   verifiedAt: string
 }
 
@@ -115,6 +116,8 @@ export interface ExecOutput {
   stderrBytes: number
   stdoutTruncated: boolean
   stderrTruncated: boolean
+  containment?: ContainmentReport
+  termination?: TerminationResult
 }
 
 export interface WorkerReference {

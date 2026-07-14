@@ -470,6 +470,15 @@ export class DaemonStorage {
           value.observedSessionPids,
           value.observedEscapedDescendantPids,
         ].every((pids) => Array.isArray(pids) && pids.every(validNonnegativeInteger)) &&
+        (value.observedEscapedDescendants === undefined ||
+          (Array.isArray(value.observedEscapedDescendants) &&
+            value.observedEscapedDescendants.every(
+              (descendant) =>
+                descendant &&
+                typeof descendant === 'object' &&
+                validNonnegativeInteger((descendant as Record<string, unknown>).pid) &&
+                validText((descendant as Record<string, unknown>).startIdentity)
+            ))) &&
         validTimestamp(value.verifiedAt)
       )
     }

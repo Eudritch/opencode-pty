@@ -21,7 +21,7 @@ function buildTimeoutReminder(session: PTYSessionInfo): string {
 
 function containmentAttributes(session: PTYSessionInfo): string {
   return session.containment
-    ? ` containment="${escapeXml(session.containment.status)}" termination_confirmed="${session.terminationConfirmed}" group_pids="${session.containment.observedGroupPids.join(',')}" session_pids="${session.containment.observedSessionPids.join(',')}" escaped_pids="${session.containment.observedEscapedDescendantPids.join(',')}"`
+    ? ` containment="${escapeXml(session.containment.status)}" termination_confirmed="${session.terminationConfirmed}" group_pids="${session.containment.observedGroupPids.join(',')}" session_pids="${session.containment.observedSessionPids.join(',')}" escaped_pids="${session.containment.observedEscapedDescendantPids.join(',')}" escaped_identities="${escapeXml(session.containment.observedEscapedDescendants?.map(({ pid, startIdentity }) => `${pid}:${startIdentity}`).join(',') ?? '')}"`
     : ''
 }
 

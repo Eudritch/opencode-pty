@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::fs::remove_dir_all;
 use std::fs::{File, create_dir_all, remove_file, rename};
@@ -158,7 +160,15 @@ struct ContainmentReport {
     observed_group_pids: Vec<u32>,
     observed_session_pids: Vec<u32>,
     observed_escaped_descendant_pids: Vec<u32>,
+    observed_escaped_descendants: Vec<ProcessIdentity>,
     verified_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessIdentity {
+    pid: u32,
+    start_identity: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -178,6 +188,9 @@ struct Containment {
     root_start_identity: String,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     known_members: Mutex<BTreeMap<u32, String>>,
+    // ponytail: retain only identities needed to prevent an observed escape from becoming empty.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    escaped_members: Mutex<BTreeMap<u32, String>>,
 }
 
 struct Worker {
@@ -338,6 +351,12 @@ struct ProcessInfo {
 }
 
 #[cfg(target_os = "linux")]
+struct ProcessScan {
+    processes: Vec<ProcessInfo>,
+    unreadable_pids: BTreeSet<u32>,
+}
+
+#[cfg(target_os = "linux")]
 impl ProcessInfo {
     fn identity(&self) -> String {
         format!("posix:{}:{}", self.pid, self.start_time)
@@ -345,30 +364,39 @@ impl ProcessInfo {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_processes() -> Result<Vec<ProcessInfo>, String> {
+fn linux_processes() -> Result<ProcessScan, String> {
     let mut processes = Vec::new();
+    let mut unreadable_pids = BTreeSet::new();
     for entry in std::fs::read_dir("/proc").map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            // This PID existed in the directory scan but vanished or could not be inspected.
+            // It may be a containment candidate, so the entire verification is unavailable.
+            unreadable_pids.insert(pid);
             continue;
         };
         let Some((_, tail)) = stat.rsplit_once(')') else {
+            unreadable_pids.insert(pid);
             continue;
         };
         let fields = tail.split_whitespace().collect::<Vec<_>>();
         let Some(ppid) = fields.get(1).and_then(|value| value.parse().ok()) else {
+            unreadable_pids.insert(pid);
             continue;
         };
         let Some(pgid) = fields.get(2).and_then(|value| value.parse().ok()) else {
+            unreadable_pids.insert(pid);
             continue;
         };
         let Some(sid) = fields.get(3).and_then(|value| value.parse().ok()) else {
+            unreadable_pids.insert(pid);
             continue;
         };
         let Some(start_time) = fields.get(19) else {
+            unreadable_pids.insert(pid);
             continue;
         };
         processes.push(ProcessInfo {
@@ -379,13 +407,16 @@ fn linux_processes() -> Result<Vec<ProcessInfo>, String> {
             start_time: (*start_time).into(),
         });
     }
-    Ok(processes)
+    Ok(ProcessScan {
+        processes,
+        unreadable_pids,
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn containment_report(containment: &Containment) -> ContainmentReport {
-    let processes = match linux_processes() {
-        Ok(processes) => processes,
+    let scan = match linux_processes() {
+        Ok(scan) => scan,
         Err(_) => {
             return ContainmentReport {
                 platform: "linux_proc".into(),
@@ -398,18 +429,34 @@ fn containment_report(containment: &Containment) -> ContainmentReport {
                 observed_group_pids: Vec::new(),
                 observed_session_pids: Vec::new(),
                 observed_escaped_descendant_pids: Vec::new(),
+                observed_escaped_descendants: observed_escapes(containment),
                 verified_at: now(),
             };
         }
     };
-    containment_report_from_processes(containment, &processes)
+    containment_report_from_scan(containment, &scan)
 }
 
 #[cfg(target_os = "linux")]
-fn containment_report_from_processes(
+fn observed_escapes(containment: &Containment) -> Vec<ProcessIdentity> {
+    containment
+        .escaped_members
+        .lock()
+        .expect("escaped members lock")
+        .iter()
+        .map(|(pid, start_identity)| ProcessIdentity {
+            pid: *pid,
+            start_identity: start_identity.clone(),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn containment_report_from_scan(
     containment: &Containment,
-    processes: &[ProcessInfo],
+    scan: &ProcessScan,
 ) -> ContainmentReport {
+    let processes = &scan.processes;
     let report = |status: &str,
                   root_identity_verified: bool,
                   group: Vec<u32>,
@@ -425,8 +472,74 @@ fn containment_report_from_processes(
         observed_group_pids: group,
         observed_session_pids: session,
         observed_escaped_descendant_pids: escaped,
+        observed_escaped_descendants: observed_escapes(containment),
         verified_at: now(),
     };
+    let relevant_pids = {
+        let known = containment
+            .known_members
+            .lock()
+            .expect("containment members lock");
+        let escapes = containment
+            .escaped_members
+            .lock()
+            .expect("escaped members lock");
+        known
+            .keys()
+            .chain(escapes.keys())
+            .copied()
+            .chain(std::iter::once(containment.root_pid))
+            .collect::<BTreeSet<_>>()
+    };
+    if scan
+        .unreadable_pids
+        .iter()
+        .any(|pid| relevant_pids.contains(pid))
+    {
+        return report(
+            "posix_containment_unknown",
+            false,
+            Vec::new(),
+            Vec::new(),
+            observed_escapes(containment)
+                .into_iter()
+                .map(|escape| escape.pid)
+                .collect(),
+        );
+    }
+    let reused_escape = {
+        let mut escapes = containment
+            .escaped_members
+            .lock()
+            .expect("escaped members lock");
+        let mut reused = false;
+        for (pid, identity) in escapes.clone() {
+            match processes.iter().find(|process| process.pid == pid) {
+                Some(process) if process.identity() == identity => {}
+                Some(_) => {
+                    reused = true;
+                    break;
+                }
+                // A complete scan that does not list the PID explicitly resolves this escape.
+                None => {
+                    escapes.remove(&pid);
+                }
+            }
+        }
+        reused
+    };
+    if reused_escape {
+        return report(
+            "posix_containment_unknown",
+            false,
+            Vec::new(),
+            Vec::new(),
+            observed_escapes(containment)
+                .into_iter()
+                .map(|escape| escape.pid)
+                .collect(),
+        );
+    }
     let root_pid = processes
         .iter()
         .find(|process| process.pid == containment.root_pid);
@@ -437,7 +550,10 @@ fn containment_report_from_processes(
             false,
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            observed_escapes(containment)
+                .into_iter()
+                .map(|escape| escape.pid)
+                .collect(),
         );
     }
     let (Some(pgid), Some(sid)) = (containment.process_group_id, containment.session_id) else {
@@ -456,7 +572,10 @@ fn containment_report_from_processes(
                 false,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
+                observed_escapes(containment)
+                    .into_iter()
+                    .map(|escape| escape.pid)
+                    .collect(),
             );
         }
         let group = processes
@@ -494,6 +613,19 @@ fn containment_report_from_processes(
             .copied()
             .filter(|pid| !group.contains(pid) && !session.contains(pid))
             .collect::<Vec<_>>();
+        let mut observed = containment
+            .escaped_members
+            .lock()
+            .expect("escaped members lock");
+        for pid in escaped {
+            let process = processes
+                .iter()
+                .find(|process| process.pid == pid)
+                .expect("descendant is scanned");
+            observed.insert(pid, process.identity());
+        }
+        let escaped = observed.keys().copied().collect::<Vec<_>>();
+        drop(observed);
         return report(
             if !escaped.is_empty() {
                 "posix_escape_observed"
@@ -527,9 +659,15 @@ fn containment_report_from_processes(
         .collect();
     let session: Vec<u32> = verified.iter().map(|process| process.pid).collect();
     drop(known);
+    let escaped = observed_escapes(containment)
+        .into_iter()
+        .map(|escape| escape.pid)
+        .collect::<Vec<_>>();
     report(
         if unknown_member {
             "posix_containment_unknown"
+        } else if !escaped.is_empty() {
+            "posix_escape_observed"
         } else if group.is_empty() && session.is_empty() {
             "posix_best_effort_empty"
         } else {
@@ -538,7 +676,21 @@ fn containment_report_from_processes(
         false,
         group,
         session,
-        Vec::new(),
+        escaped,
+    )
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn containment_report_from_processes(
+    containment: &Containment,
+    processes: &[ProcessInfo],
+) -> ContainmentReport {
+    containment_report_from_scan(
+        containment,
+        &ProcessScan {
+            processes: processes.to_vec(),
+            unreadable_pids: BTreeSet::new(),
+        },
     )
 }
 
@@ -565,11 +717,12 @@ fn containment_report(containment: &Containment) -> ContainmentReport {
         observed_group_pids: Vec::new(),
         observed_session_pids: Vec::new(),
         observed_escaped_descendant_pids: Vec::new(),
+        observed_escaped_descendants: Vec::new(),
         verified_at: now(),
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn signal_group(group: u32, signal: i32) -> std::io::Result<()> {
     if unsafe { libc::kill(-(group as i32), signal) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
@@ -582,36 +735,32 @@ fn signal_group(group: u32, signal: i32) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn signal_contained(containment: &Containment, signal: i32) -> (bool, ContainmentReport) {
-    let report = containment_report(containment);
-    if report.status == "posix_containment_unknown" {
-        return (false, report);
-    }
-    if report.root_identity_verified {
-        let sent = containment
-            .process_group_id
-            .is_some_and(|group| signal_group(group, signal).is_ok());
-        return (sent, report);
-    }
-    let known = containment
-        .known_members
-        .lock()
-        .expect("containment members lock");
-    let Ok(processes) = linux_processes() else {
+    signal_contained_with(containment, signal, linux_processes, signal_group)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_contained_with<S, G>(
+    containment: &Containment,
+    signal: i32,
+    scan: S,
+    send_group: G,
+) -> (bool, ContainmentReport)
+where
+    S: FnOnce() -> Result<ProcessScan, String>,
+    G: FnOnce(u32, i32) -> std::io::Result<()>,
+{
+    // Do not reuse a display snapshot: group IDs are PID-derived and must be checked at send time.
+    let report = match scan() {
+        Ok(scan) => containment_report_from_scan(containment, &scan),
+        Err(_) => containment_report(containment),
+    };
+    let Some(group) = containment.process_group_id else {
         return (false, report);
     };
-    let pids = processes
-        .iter()
-        .filter(|process| {
-            known.get(&process.pid) == Some(&process.identity())
-                && (Some(process.pgid) == containment.process_group_id
-                    || Some(process.sid) == containment.session_id)
-        })
-        .map(|process| process.pid)
-        .collect::<Vec<_>>();
-    drop(known);
-    let sent = pids.into_iter().all(|pid| unsafe { libc::kill(pid as i32, signal) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
-    (sent, report)
+    if report.status == "posix_containment_unknown" || !report.root_identity_verified {
+        return (false, report);
+    }
+    (send_group(group, signal).is_ok(), report)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -644,6 +793,10 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
     #[cfg(unix)]
     {
         let (term_sent, before_term) = signal_contained(&worker.containment, libc::SIGTERM);
+        if !term_sent {
+            // Child is a handle we created, unlike a PID/group lookup; it is safe to reap the root.
+            let _ = worker.child.lock().expect("child lock").kill();
+        }
         let deadline = SystemTime::now() + TERMINATION_GRACE;
         while SystemTime::now() < deadline {
             observe_exit(worker);
@@ -658,6 +811,9 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
             thread::sleep(Duration::from_millis(10));
         }
         let (kill_sent, before_kill) = signal_contained(&worker.containment, libc::SIGKILL);
+        if !kill_sent {
+            let _ = worker.child.lock().expect("child lock").kill();
+        }
         let deadline = SystemTime::now() + TERMINATION_HARD_TIMEOUT;
         while SystemTime::now() < deadline {
             observe_exit(worker);
@@ -767,6 +923,9 @@ fn terminate_contained_child_and_wait(child: &mut Child, containment: &Containme
     if term_sent {
         thread::sleep(TERMINATION_GRACE);
         let _ = signal_contained(containment, libc::SIGKILL);
+    } else {
+        // macOS cannot verify group identity; this owned handle is still safe to terminate.
+        let _ = child.kill();
     }
     let _ = child.wait();
 }
@@ -816,6 +975,7 @@ fn verify_containment(pid: u32) -> Result<Containment, String> {
         session_id: Some(sid as u32),
         root_start_identity: child_start_identity(pid)?,
         known_members: Mutex::new(BTreeMap::new()),
+        escaped_members: Mutex::new(BTreeMap::new()),
     })
 }
 
@@ -827,6 +987,7 @@ fn verify_containment(pid: u32) -> Result<Containment, String> {
         session_id: None,
         root_start_identity: format!("process:{pid}"),
         known_members: Mutex::new(BTreeMap::new()),
+        escaped_members: Mutex::new(BTreeMap::new()),
     })
 }
 
@@ -995,6 +1156,7 @@ fn monitor(worker: Arc<Worker>) {
 fn snapshot(worker: &Arc<Worker>) -> Value {
     observe_exit(worker);
     update_reader_drain(worker);
+    let containment = containment_report(&worker.containment);
     let pid = worker.child.lock().expect("child lock").id();
     let state = worker.state.lock().expect("state lock");
     let output_complete = output_complete(&state);
@@ -1006,7 +1168,10 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         .collect::<Vec<_>>()
         .join("; ");
     let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
-    let status = if terminal && (state.storage_failure.is_some() || state.output_incomplete) {
+    let containment_unavailable = containment.status == "posix_containment_unknown";
+    let status = if (terminal || (state.root_exited && containment_unavailable))
+        && (state.storage_failure.is_some() || state.output_incomplete || containment_unavailable)
+    {
         "lost"
     } else if terminal {
         "exited"
@@ -1025,7 +1190,7 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
         "readerFailure": if reader_failure.is_empty() { Value::Null } else { Value::String(reader_failure) },
         "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
-        "containment": containment_report(&worker.containment), "termination": state.termination,
+        "containment": containment, "termination": state.termination,
     })
 }
 
@@ -1108,6 +1273,7 @@ mod tests {
                 session_id: None,
                 root_start_identity: "test".into(),
                 known_members: Mutex::new(BTreeMap::new()),
+                escaped_members: Mutex::new(BTreeMap::new()),
             },
         });
         reader(worker.clone(), FailingReader, true);
@@ -1175,6 +1341,7 @@ mod tests {
                 (10, "posix:10:root".into()),
                 (11, "posix:11:member".into()),
             ])),
+            escaped_members: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1203,6 +1370,82 @@ mod tests {
             }],
         );
         assert_eq!(report.status, "posix_containment_unknown");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_candidate_and_scan_to_signal_change_are_fail_closed() {
+        let containment = test_containment();
+        let report = containment_report_from_scan(
+            &containment,
+            &ProcessScan {
+                processes: Vec::new(),
+                unreadable_pids: BTreeSet::from([11]),
+            },
+        );
+        assert_eq!(report.status, "posix_containment_unknown");
+        let (sent, report) = signal_contained_with(
+            &containment,
+            libc::SIGTERM,
+            || {
+                Ok(ProcessScan {
+                    processes: vec![ProcessInfo {
+                        pid: 10,
+                        ppid: 1,
+                        pgid: 10,
+                        sid: 10,
+                        start_time: "reused".into(),
+                    }],
+                    unreadable_pids: BTreeSet::new(),
+                })
+            },
+            |_, _| panic!("must not signal after identity changes"),
+        );
+        assert!(!sent);
+        assert_eq!(report.status, "posix_containment_unknown");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escape_is_retained_until_a_complete_scan_resolves_its_identity() {
+        let containment = test_containment();
+        let escaped = ProcessInfo {
+            pid: 12,
+            ppid: 10,
+            pgid: 12,
+            sid: 12,
+            start_time: "escape".into(),
+        };
+        let report = containment_report_from_processes(
+            &containment,
+            &[
+                ProcessInfo {
+                    pid: 10,
+                    ppid: 1,
+                    pgid: 10,
+                    sid: 10,
+                    start_time: "root".into(),
+                },
+                escaped.clone(),
+            ],
+        );
+        assert_eq!(report.status, "posix_escape_observed");
+        assert_eq!(
+            report.observed_escaped_descendants[0].start_identity,
+            "posix:12:escape"
+        );
+        let report = containment_report_from_scan(
+            &containment,
+            &ProcessScan {
+                processes: Vec::new(),
+                unreadable_pids: BTreeSet::from([12]),
+            },
+        );
+        assert_eq!(report.status, "posix_containment_unknown");
+        assert_eq!(report.observed_escaped_descendant_pids, vec![12]);
+        let report = containment_report_from_processes(&containment, &[]);
+        assert_eq!(report.status, "posix_best_effort_empty");
+        assert!(report.observed_escaped_descendant_pids.is_empty());
     }
 
     #[cfg(target_os = "linux")]

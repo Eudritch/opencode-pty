@@ -153,7 +153,21 @@ jobs:
             }
             $env:PTY_DAEMON_DIR = $previousState
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $package, $state
-          }
+            }
+
+  macos-native-worker:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.8
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - run: bun ci
+      - run: cargo build --locked --workspace
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace -- -D warnings
+      - run: bun unittest
 
   nix-flake-test:
     name: Devenv CI
