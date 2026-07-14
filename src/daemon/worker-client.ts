@@ -1,4 +1,5 @@
 import { access, readFile, rm } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { ContainmentReport, SpawnCleanup, TerminationResult } from './types.ts'
 
@@ -77,8 +78,26 @@ function workerCommand(): string[] {
       '--',
     ]
   }
+  const workerPackage =
+    process.platform === 'linux' && process.arch === 'x64'
+      ? '@eudritch/opencode-pty-worker-linux-x64'
+      : process.platform === 'win32' && process.arch === 'x64'
+        ? '@eudritch/opencode-pty-worker-win32-x64'
+        : process.platform === 'darwin' && process.arch === 'arm64'
+          ? '@eudritch/opencode-pty-worker-darwin-arm64'
+          : undefined
+  if (workerPackage) {
+    try {
+      const require = createRequire(import.meta.url)
+      return [
+        require.resolve(
+          `${workerPackage}/bin/opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+        ),
+      ]
+    } catch {}
+  }
   throw new Error(
-    'native_worker_unavailable: set PTY_NATIVE_WORKER_PATH to the built worker binary.'
+    `native_worker_unavailable: install the matching optional worker package for ${process.platform}-${process.arch}, or set PTY_NATIVE_WORKER_PATH.`
   )
 }
 

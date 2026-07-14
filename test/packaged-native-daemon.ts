@@ -5,12 +5,8 @@ import { join } from 'node:path'
 const root = process.cwd()
 const packageDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-package-'))
 const stateDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-state-'))
-const workerPath = join(
-  root,
-  'target',
-  'debug',
-  `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
-)
+const platform = `${process.platform}-${process.arch}`
+const supportedPlatforms = new Set(['linux-x64', 'win32-x64', 'darwin-arm64'])
 let daemon: ReturnType<typeof Bun.spawn> | undefined
 let installed: string | undefined
 let executing: Promise<{ ok: boolean; result?: unknown; error?: unknown }> | undefined
@@ -54,9 +50,10 @@ async function stopOwnedCommand(child: Child, name: string) {
   await waitForExit(child, name)
 }
 
-async function runCommand(command: string[], name: string, timeoutMs = 120_000) {
+async function runCommand(command: string[], name: string, timeoutMs = 120_000, cwd?: string) {
   const child = Bun.spawn({
     cmd: process.platform === 'win32' ? command : ['setsid', ...command],
+    ...(cwd ? { cwd } : {}),
     stdout: 'pipe',
     stderr: 'pipe',
   })
@@ -75,8 +72,8 @@ async function runCommand(command: string[], name: string, timeoutMs = 120_000) 
   return { exitCode: child.exitCode, stdout: await stdout, stderr: await stderr }
 }
 
-async function requireCommand(command: string[], name: string, timeoutMs?: number) {
-  const result = await runCommand(command, name, timeoutMs)
+async function requireCommand(command: string[], name: string, timeoutMs?: number, cwd?: string) {
+  const result = await runCommand(command, name, timeoutMs, cwd)
   if (result.exitCode !== 0)
     throw new Error(
       `${name} exited ${result.exitCode}. stdout: ${result.stdout}\nstderr: ${result.stderr}`
@@ -160,7 +157,6 @@ async function startDaemon(installed: string) {
       ...process.env,
       PTY_DAEMON_DIR: stateDirectory,
       PTY_NATIVE_WORKER_ENABLED: '1',
-      PTY_NATIVE_WORKER_PATH: workerPath,
     },
     stdout: 'ignore',
     stderr: 'pipe',
@@ -200,15 +196,45 @@ async function rpc(
 }
 
 try {
-  await stat(workerPath)
+  if (!supportedPlatforms.has(platform)) throw new Error(`No native package for ${platform}.`)
+  await requireCommand(['cargo', 'build', '--locked', '--release', '--workspace'], 'cargo build')
+  await requireCommand(['bun', 'native:prepare', platform], 'prepare native package')
+  const nativeDirectory = join(root, 'native-artifacts', platform)
+  await requireCommand(
+    ['npm', 'pack', '--pack-destination', packageDirectory],
+    'npm pack worker',
+    undefined,
+    nativeDirectory
+  )
   await requireCommand(['npm', 'pack', '--pack-destination', packageDirectory], 'npm pack')
-  const archive = (await Array.fromAsync(new Bun.Glob('*.tgz').scan({ cwd: packageDirectory })))[0]
-  if (!archive) throw new Error('npm pack produced no archive.')
+  const archives = await Array.fromAsync(new Bun.Glob('*.tgz').scan({ cwd: packageDirectory }))
+  const archive = archives.find((file) => file.startsWith('opencode-pty-'))
+  const nativeArchive = archives.find((file) =>
+    file.startsWith(`eudritch-opencode-pty-worker-${platform}-`)
+  )
+  if (!archive || !nativeArchive) throw new Error('npm pack produced incomplete package artifacts.')
   const installedRoot = join(packageDirectory, 'installed')
   installed = join(installedRoot, 'node_modules', 'opencode-pty')
   await requireCommand(
-    ['npm', 'install', '--prefix', installedRoot, join(packageDirectory, archive)],
-    'npm install'
+    [
+      'npm',
+      'install',
+      '--prefix',
+      installedRoot,
+      join(packageDirectory, archive),
+      join(packageDirectory, nativeArchive),
+    ],
+    'npm install packaged native worker'
+  )
+  await stat(
+    join(
+      installedRoot,
+      'node_modules',
+      '@eudritch',
+      `opencode-pty-worker-${platform}`,
+      'bin',
+      `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+    )
   )
 
   let started = await startDaemon(installed)
@@ -295,6 +321,22 @@ try {
       true
   )
     throw new Error('Reconnected packaged daemon did not record native exec termination.')
+  const terminalResult = terminal.result as {
+    containment?: { status?: string }
+  }
+  if (
+    process.platform === 'linux' &&
+    terminalResult.containment?.status !== 'posix_best_effort_empty'
+  )
+    throw new Error(
+      `Linux packaged native exec was not containment-confirmed: ${terminalResult.containment?.status}`
+    )
+  const output = await rpc(started.descriptor, 'execOutput', { id: id.id }, owner)
+  if (
+    process.platform === 'win32' &&
+    (!output.ok || (output.result as { stdout?: string } | null)?.stdout !== 'packed-native\n')
+  )
+    throw new Error('Windows packaged native worker did not directly execute the requested argv.')
   await assertWorkerStopped(worker)
   await stat(join(stateDirectory, 'sessions', id.id, 'worker.json')).then(
     () => Promise.reject(new Error('Native worker descriptor survived shutdown.')),

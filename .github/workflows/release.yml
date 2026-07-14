@@ -7,6 +7,12 @@ on:
       - completed
     branches: [main]
   workflow_dispatch:
+    inputs:
+      sign_native_artifacts:
+        description: Attempt native artifact signing (not yet implemented)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -22,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        os: [ubuntu-24.04, windows-2025, macos-15]
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
@@ -40,12 +46,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.0
       - run: bun ci
       - name: Build native worker
-        run: cargo build --locked --workspace
+        run: cargo build --locked --release --workspace
       - name: Run full daemon/package suite
         run: bun unittest
       - run: bun build:prod
       - name: Exercise native exec from the packed artifact
         run: bun test/packaged-native-daemon.ts
+      - name: Pack platform worker artifact
+        shell: pwsh
+        run: |-
+          $platform = "${{ runner.os }}".ToLowerInvariant().Replace("windows", "win32")
+          if ($platform -eq "linux") { $platform = "linux-x64" }
+          elseif ($platform -eq "win32") { $platform = "win32-x64" }
+          elseif ($platform -eq "macos") { $platform = "darwin-arm64" }
+          bun native:prepare $platform
+          New-Item -ItemType Directory native-dist | Out-Null
+          npm pack --pack-destination native-dist native-artifacts/$platform
+      - name: Upload native worker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-worker-${{ runner.os }}
+          path: native-dist/*.tgz
       - name: Pack, import, and start the daemon
         shell: pwsh
         run: |
@@ -127,6 +148,24 @@ jobs:
 
       - name: Install dependencies
         run: bun ci
+
+      - name: Download native worker artifacts
+        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-worker-*
+          path: native-artifacts
+          merge-multiple: true
+
+      - name: Write native artifact checksums and provenance
+        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        run: bun native:manifest native-artifacts
+
+      - name: Require configured native signing
+        if: github.event_name == 'workflow_dispatch' && inputs.sign_native_artifacts
+        env:
+          NATIVE_ARTIFACT_SIGNING_KEY: ${{ secrets.NATIVE_ARTIFACT_SIGNING_KEY }}
+        run: bun native:sign
 
       - name: Validate release artifact
         run: |
@@ -228,7 +267,10 @@ jobs:
 
       - name: Publish to npm
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
-        run: npm publish --access public --provenance
+        run: |
+          set -euo pipefail
+          for artifact in native-artifacts/*.tgz; do npm publish "$artifact" --access public --provenance; done
+          npm publish --access public --provenance
 
       - name: Create GitHub release
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
@@ -239,6 +281,7 @@ jobs:
           EOF
           gh release create "v${{ steps.determine.outputs.current_version }}" \
             --title "v${{ steps.determine.outputs.current_version }}" \
-            --notes-file "$NOTES_FILE"
+            --notes-file "$NOTES_FILE" \
+            native-artifacts/*.tgz native-artifacts/native-artifacts.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

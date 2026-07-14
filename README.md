@@ -1,6 +1,6 @@
 # opencode-pty
 
-An OpenCode plugin for durable interactive PTY sessions and finite argv execution. It requires Bun 1.3.8 or later. PTYs remain owned by the per-user Bun daemon. When explicitly enabled and given a built Rust worker, finite exec processes are owned by a per-session native worker.
+An OpenCode plugin for durable interactive PTY sessions and finite argv execution. It requires Bun 1.3.8 or later. PTYs remain owned by the per-user Bun daemon. When explicitly enabled, finite exec processes are owned by a per-session native worker from the matching installed optional package.
 
 ## Tools
 
@@ -19,7 +19,7 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 
 `notifyOnExit` remains accepted for compatibility but is rejected: the durable daemon has no safe event channel back into a completed OpenCode session.
 
-`shell_exec` is `exec` mode, not a shell parser: `command` and `args` are passed as argv and a positive timeout is required. With the native worker enabled, a Rust per-session worker owns the finite child using `std::process`, exposes an authenticated loopback RPC endpoint, and writes redacted output to the existing session chunk journal. The daemon can reconnect to a reachable worker after restart and recover its output cursor and final state. Without the explicit worker configuration, exec retains the legacy Bun behavior.
+`shell_exec` is `exec` mode, not a shell parser: `command` and `args` are passed as argv and a positive timeout is required. With the native worker enabled, a Rust per-session worker owns the finite child using `std::process`, exposes an authenticated loopback RPC endpoint, and writes redacted output to the existing session chunk journal. The daemon resolves its platform-specific worker from the installed package, so no repository path is required. The daemon can reconnect to a reachable worker after restart and recover its output cursor and final state. Without the explicit worker configuration, exec retains the legacy Bun behavior.
 
 `pty_spawn` is `pty` mode and remains interactive. A supplied `idempotencyKey` reuses only a matching active PTY scoped to the originating OpenCode session and canonical workdir; changing command, args, environment, timeout, or name is rejected. Titles and descriptions are presentation fields and do not affect reuse. `pty_wait` conditions are literal output, a limited-safe regex, or exit. They run in the daemon against output/exit events with a 3600-second maximum deadline, not plugin polling. `pty_send_wait` captures its output boundary after PTY input is accepted, so output that arrived before or during acceptance cannot satisfy the wait. Output readiness is evidence only; no bare `ready` state is claimed.
 
@@ -54,12 +54,18 @@ On Linux native `shell_exec` runs its child in a fresh POSIX session/process gro
 | `PTY_DAEMON_DIR` | per-user state directory | Daemon descriptor, ownership secret, session metadata, and output; protected with the same restrictive DACL on Windows. |
 | `PTY_MAX_OUTPUT_BYTES` | `1000000` | Maximum retained output bytes per session. |
 | `PTY_NATIVE_WORKER_ENABLED` | unset | Set to `1` to route `shell_exec` through the native worker. |
-| `PTY_NATIVE_WORKER_PATH` | unset | Required production path to a built `opencode-pty-worker` executable. |
+| `PTY_NATIVE_WORKER_PATH` | unset | Explicit worker executable override. The default resolves the matching installed optional package. |
 | `PTY_NATIVE_WORKER_DEV` | unset | Set only in development to run `cargo run --manifest-path worker/Cargo.toml`; never a production fallback. |
 
 Output is an append-only, session-local UTF-8 chunk journal. Callbacks are coalesced into bounded 64 KiB UTF-8 segments and retained output is capped at the configured value (up to 64 MiB), so fragmented output cannot create unbounded files. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
 
 The daemon `diagnostics` RPC reports whether Linux native exec containment is enabled and whether `/proc` verification is available. It never claims PTY containment or Windows Job Objects.
+
+## Native Worker Packages
+
+Native exec is currently packaged for `linux-x64`, `win32-x64`, and `darwin-arm64` as matching optional npm dependencies. `npm` installs only the package matching its `os` and `cpu`; the main `opencode-pty` tarball contains no worker binary. Enable it with `PTY_NATIVE_WORKER_ENABLED=1`; if the matching optional package was omitted or the platform is unsupported, native exec fails closed.
+
+Native artifact tarballs have SHA-256 entries and GitHub build provenance in the release `native-artifacts.json`. Native artifact signing is intentionally not claimed: the release workflow refuses to publish when signing credentials/configuration are absent. macOS worker lifecycle verification and the POSIX signal/identity TOCTOU race remain pending.
 
 ## Development
 
