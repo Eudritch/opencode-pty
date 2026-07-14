@@ -242,6 +242,18 @@ export class SessionSupervisor {
         record.status === 'timed_out' ||
         record.status === 'spawn_failed' ||
         record.status === 'output_limited'
+      if (record.worker && record.worker.protocolVersion !== 3) {
+        record.status = 'lost'
+        record.terminationConfirmed = false
+        record.exitReason = {
+          kind: 'unknown',
+          message: `Native worker protocol v${record.worker.protocolVersion} is incompatible with this daemon; output remains readable but the worker cannot be reconnected or controlled.`,
+        }
+        record.updatedAt = new Date().toISOString()
+        await this.storage.writeSession(record)
+        this.records.set(record.id, record)
+        continue
+      }
       if (
         record.status === 'starting' ||
         record.status === 'running' ||
@@ -337,7 +349,7 @@ export class SessionSupervisor {
         env: environment,
         redactionSecrets: this.redactionSecrets(environment),
         sessionDirectory: join(this.storage.rootDirectory, 'sessions', id),
-        timeoutSeconds: options.timeoutSeconds ?? 24 * 60 * 60,
+        timeoutSeconds: options.timeoutSeconds,
         maxOutputBytes: this.maxOutputBytes,
         mode: 'pty',
         cols: 120,
@@ -392,11 +404,19 @@ export class SessionSupervisor {
   ): Promise<WaitResult> {
     await this.flush()
     this.validateWait(condition, timeoutSeconds)
-    await this.write(id, data)
-    // onData may run synchronously from write; that output predates accepted input.
-    const afterSequence =
-      (await this.nativeWorkers.get(id)?.snapshot())?.nextSequence ??
-      this.recordFor(id).nextSequence
+    const worker = this.nativeWorkers.get(id)
+    const record = this.recordFor(id)
+    if (!worker || record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
+    let afterSequence: number
+    try {
+      // The worker returns the cursor held while it accepted input, so an immediate reply is not
+      // hidden by a later snapshot.
+      afterSequence = (await worker.write(data)).arrivalSequence
+    } catch (error) {
+      throw new ProcessError(
+        `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
     return this.wait(
       id,
       { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
@@ -709,7 +729,7 @@ export class SessionSupervisor {
         error instanceof WorkerStartError
           ? error.cleanup
           : { requested: false, terminationConfirmed: false, method: 'none' as const }
-      record.status = 'spawn_failed'
+      record.status = cleanup.terminationConfirmed ? 'spawn_failed' : 'lost'
       record.terminationRequested = cleanup.requested
       record.terminationConfirmed = cleanup.terminationConfirmed
       record.exitReason = { kind: 'spawn_error', message: String(error), cleanup }
@@ -1055,7 +1075,7 @@ export class SessionSupervisor {
   async cleanup(id: string): Promise<boolean> {
     await this.flush()
     const record = this.records.get(id)
-    if (!record || !this.isTerminal(record)) return false
+    if (!record || (!this.isTerminal(record) && !this.incompatibleWorker(record))) return false
     const worker = this.nativeWorkers.get(id)
     if (worker) {
       try {
@@ -1352,6 +1372,14 @@ export class SessionSupervisor {
 
   private isTerminal(record: SessionRecord): boolean {
     return record.terminationConfirmed && containmentDrained(record)
+  }
+
+  private incompatibleWorker(record: SessionRecord): boolean {
+    return (
+      record.status === 'lost' &&
+      record.worker?.protocolVersion !== undefined &&
+      record.worker.protocolVersion !== 3
+    )
   }
 
   private toInfo(record: SessionRecord): PTYSessionInfo {

@@ -193,7 +193,7 @@ async function rpc(
   const response = await fetch(`${descriptor.endpoint}/rpc`, {
     method: 'POST',
     headers: { authorization: `Bearer ${descriptor.token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ id: crypto.randomUUID(), version: 3, operation, owner, payload }),
+    body: JSON.stringify({ id: crypto.randomUUID(), version: 4, operation, owner, payload }),
     signal: signal ?? AbortSignal.timeout(10_000),
   })
   return response.json() as Promise<{ ok: boolean; result?: unknown; error?: unknown }>

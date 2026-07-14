@@ -918,6 +918,31 @@ test('sendWait ignores output before input acceptance and waits for later output
   }
 })
 
+test('sendWait observes an immediate response after accepted input', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-immediate-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const session = await supervisor.spawn({
+    command: process.execPath,
+    args: [
+      '-e',
+      "process.stdin.setRawMode(true); process.stdin.once('data', () => { process.stdout.write('immediate\\n') })",
+    ],
+    parentSessionId: 'parent',
+    workdir: root,
+  })
+  try {
+    await expect(
+      supervisor.sendWait(session.id, 'x', { kind: 'output', literal: 'immediate' }, 2)
+    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'immediate' })
+  } finally {
+    await supervisor.stop(session.id).catch(() => undefined)
+    await supervisor.flush()
+  }
+})
+
 test('exec output remains separately recoverable after restart', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-record-'))
   roots.push(root)
@@ -1027,7 +1052,7 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
   }
 })
 
-test('native exec uses independent stdout/stderr caps and persists terminal storage failure', async () => {
+test('native exec uses a total stdout/stderr cap and persists terminal storage failure', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-limits-'))
   roots.push(root)
   const workerPath = join(
@@ -1058,7 +1083,7 @@ test('native exec uses independent stdout/stderr caps and persists terminal stor
       context
     ).then((response) => response.json())
     expect(capped).toMatchObject({
-      result: { stdout: 'x'.repeat(64), stderr: 'y'.repeat(64), outputLimited: false },
+      result: { stdout: 'x'.repeat(64), stderr: '', outputLimited: true },
     })
 
     const failing = rpc(
@@ -1541,6 +1566,30 @@ test('tool output XML escaping covers text and attributes', () => {
   expect(formatLine('😀x', 1, 1)).toContain('😀...')
 })
 
+test('native PTY has no implicit worker deadline', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-pty-no-timeout-'))
+  roots.push(root)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  try {
+    const session = await supervisor.spawn({
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      parentSessionId: 'parent',
+      workdir: root,
+    })
+    expect(session.timeoutSeconds).toBeUndefined()
+    expect((await supervisor.get(session.id))?.timeoutSeconds).toBeUndefined()
+    await supervisor.stop(session.id)
+  } finally {
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+})
+
 test('tool session rendering preserves containment survivors and unknown verification', () => {
   const root = process.cwd()
   const session = record(root, 'exec_survivor', 'lost')
@@ -1880,6 +1929,32 @@ test('restart migrates v1 output and marks active sessions lost without losing i
   expect(await recovered.get(session.id)).toMatchObject({ status: 'lost', outputSequence: 10 })
   expect(await recovered.rawOutput(session.id)).toEqual({ raw: 'lost 😀\n', byteLength: 10 })
   expect(await recovered.read(session.id)).toMatchObject({ lines: ['lost 😀'], sequences: [0] })
+})
+
+test('obsolete worker records remain readable, lost, and owner-cleanable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-obsolete-worker-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_obsolete_worker', 'exited')
+  session.worker = {
+    pid: 123,
+    startIdentity: 'old',
+    processIdentity: 'old',
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: 1,
+  }
+  session.nextSequence = 6
+  session.outputBytes = 6
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 6, timestamp: new Date().toISOString(), data: 'saved\n' },
+  ])
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  expect(await supervisor.get(session.id)).toMatchObject({ status: 'lost' })
+  expect(await supervisor.rawOutput(session.id)).toEqual({ raw: 'saved\n', byteLength: 6 })
+  expect(await supervisor.cleanup(session.id)).toBeTrue()
 })
 
 test('v1 migration keeps output.log until journal metadata is durable', async () => {

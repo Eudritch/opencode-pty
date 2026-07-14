@@ -36,7 +36,8 @@ export interface WorkerBootstrap {
   sessionDirectory: string
   workerControlToken: string
   workerId: string
-  timeoutSeconds: number
+  // PTYs deliberately have no worker deadline unless the caller supplied one.
+  timeoutSeconds?: number
   maxOutputBytes: number
   mode: 'exec' | 'pty'
   cols?: number
@@ -64,7 +65,7 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
     typeof descriptor.endpoint === 'string' &&
     typeof descriptor.token === 'string' &&
     descriptor.token.length >= 16 &&
-    descriptor.protocolVersion === 2
+    descriptor.protocolVersion === 3
   )
 }
 
@@ -268,6 +269,22 @@ export class WorkerClient {
     const cleanup = async (): Promise<SpawnCleanup> => {
       if (client) return client.rollback()
       try {
+        const receipt = JSON.parse(
+          await readFile(join(bootstrap.sessionDirectory, 'spawn-failure.json'), 'utf8')
+        ) as { terminationConfirmed?: unknown; message?: unknown }
+        if (
+          typeof receipt.terminationConfirmed === 'boolean' &&
+          typeof receipt.message === 'string'
+        ) {
+          return {
+            requested: true,
+            terminationConfirmed: receipt.terminationConfirmed,
+            method: 'rollback',
+            message: receipt.message,
+          }
+        }
+      } catch {}
+      try {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
         if (
           descriptor.pid === child.pid &&
@@ -382,6 +399,9 @@ export class WorkerClient {
       await rm(join(bootstrap.sessionDirectory, 'worker.json'), { force: true }).catch(
         () => undefined
       )
+      await rm(join(bootstrap.sessionDirectory, 'spawn-failure.json'), { force: true }).catch(
+        () => undefined
+      )
       throw new WorkerStartError(
         `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(outcome)}`,
         outcome
@@ -419,7 +439,7 @@ export class WorkerClient {
     return this.call('wait', { timeoutMs }, timeoutMs + 5000)
   }
 
-  async write(data: string): Promise<{ acceptedBytes: number }> {
+  async write(data: string): Promise<{ acceptedBytes: number; arrivalSequence: number }> {
     return this.call('write', { data })
   }
 

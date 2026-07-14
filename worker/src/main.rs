@@ -38,7 +38,8 @@ struct Bootstrap {
     session_directory: String,
     worker_control_token: String,
     worker_id: String,
-    timeout_seconds: u64,
+    // Exec always has a deadline. PTYs only have one when explicitly requested.
+    timeout_seconds: Option<u64>,
     max_output_bytes: usize,
     mode: String,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -134,6 +135,8 @@ struct State {
     next_sequence: usize,
     first_retained_sequence: usize,
     output_truncated: bool,
+    retained_bytes: usize,
+    chunks: Vec<JournalChunk>,
     exit_code: Option<i32>,
     exit_signal: Option<String>,
     exit_reason: Option<String>,
@@ -151,6 +154,15 @@ struct State {
     reader_drain_deadline: Option<SystemTime>,
     output_incomplete: bool,
     termination: Option<TerminationResult>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalChunk {
+    start_sequence: usize,
+    end_sequence: usize,
+    timestamp: String,
+    data: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -207,9 +219,23 @@ struct Worker {
     secrets: Vec<String>,
     output_directory: PathBuf,
     max_output_bytes: usize,
-    deadline: SystemTime,
+    deadline: Option<SystemTime>,
     containment: Containment,
     mode: String,
+}
+
+#[cfg(unix)]
+struct SpawnCleanup {
+    confirmed: bool,
+    message: String,
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpawnFailureReceipt {
+    termination_confirmed: bool,
+    message: String,
 }
 
 struct WorkerError {
@@ -913,6 +939,57 @@ fn terminate_child_and_wait(child: &mut Child) {
 }
 
 #[cfg(unix)]
+fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
+    let pid = child.id();
+    #[cfg(target_os = "linux")]
+    {
+        let Some(identity) = child_start_identity(pid).ok() else {
+            terminate_child_and_wait(child);
+            return SpawnCleanup {
+                confirmed: false,
+                message: "spawn containment could not verify the child identity; root was reaped but descendants are unknown".into(),
+            };
+        };
+        let containment = Containment {
+            root_pid: pid,
+            process_group_id: Some(pid),
+            session_id: Some(pid),
+            root_start_identity: identity,
+            known_members: Mutex::new(BTreeMap::new()),
+            escaped_members: Mutex::new(BTreeMap::new()),
+        };
+        let (sent, _) = signal_contained(&containment, libc::SIGTERM);
+        if sent {
+            thread::sleep(TERMINATION_GRACE);
+            let _ = signal_contained(&containment, libc::SIGKILL);
+        } else {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        let report = containment_report(&containment);
+        return SpawnCleanup {
+            confirmed: containment_drained(&report),
+            message: if containment_drained(&report) {
+                "unverified spawn session was terminated".into()
+            } else {
+                format!(
+                    "unverified spawn cleanup could not prove descendant termination: {}",
+                    report.status
+                )
+            },
+        };
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        terminate_child_and_wait(child);
+        SpawnCleanup {
+            confirmed: false,
+            message: "spawn containment verification is unavailable; direct child was reaped but descendants are unknown".into(),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn terminate_contained_child_and_wait(child: &mut Child, containment: &Containment) {
     let (term_sent, _) = signal_contained(containment, libc::SIGTERM);
     if term_sent {
@@ -1073,11 +1150,10 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
         if state.storage_failure.is_some() {
             return;
         }
-        // Each stream owns its advertised cap; next_sequence remains the aggregate journal cursor.
-        let available = if stdout {
-            worker.max_output_bytes.saturating_sub(state.stdout_bytes)
+        let available = if worker.mode == "exec" {
+            worker.max_output_bytes.saturating_sub(state.retained_bytes)
         } else {
-            worker.max_output_bytes.saturating_sub(state.stderr_bytes)
+            data.len()
         };
         let mut end = available.min(data.len());
         while end < data.len() && end > 0 && (data.as_bytes()[end] & 0xc0) == 0x80 {
@@ -1096,21 +1172,77 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
         if !kept.is_empty() {
             let start = state.next_sequence;
             let end = start + kept.len();
-            let chunk = json!({ "startSequence": start, "endSequence": end, "timestamp": now(), "data": kept });
-            let path = worker.output_directory.join(format!("{start:020}.json"));
-            if let Err(error) = write_atomic(&path, &chunk.to_string()) {
+            let chunk = if let Some(previous) = state.chunks.last_mut() {
+                if previous.end_sequence == start && previous.data.len() + kept.len() <= 64 * 1024 {
+                    previous.end_sequence = end;
+                    previous.timestamp = now();
+                    previous.data.push_str(kept);
+                    previous.clone()
+                } else {
+                    JournalChunk {
+                        start_sequence: start,
+                        end_sequence: end,
+                        timestamp: now(),
+                        data: kept.into(),
+                    }
+                }
+            } else {
+                JournalChunk {
+                    start_sequence: start,
+                    end_sequence: end,
+                    timestamp: now(),
+                    data: kept.into(),
+                }
+            };
+            let path = worker
+                .output_directory
+                .join(format!("{:020}.json", chunk.start_sequence));
+            if let Err(error) = write_atomic(
+                &path,
+                &serde_json::to_string(&chunk).expect("journal chunk serializes"),
+            ) {
                 state.storage_failure = Some(error.to_string());
                 state.exit_reason = Some("storage_failure".into());
                 terminate = Some("storage_failure");
             } else {
-                state.next_sequence = end;
-                if stdout {
-                    state.stdout.push_str(kept);
-                    state.stdout_bytes += kept.len();
-                } else {
-                    state.stderr.push_str(kept);
-                    state.stderr_bytes += kept.len();
+                if state
+                    .chunks
+                    .last()
+                    .is_none_or(|previous| previous.start_sequence != chunk.start_sequence)
+                {
+                    state.chunks.push(chunk);
                 }
+                state.next_sequence = end;
+                state.retained_bytes += kept.len();
+                if worker.mode == "exec" {
+                    if stdout {
+                        state.stdout.push_str(kept);
+                        state.stdout_bytes += kept.len();
+                    } else {
+                        state.stderr.push_str(kept);
+                        state.stderr_bytes += kept.len();
+                    }
+                }
+                while worker.mode == "pty" && state.retained_bytes > worker.max_output_bytes {
+                    let removed = state.chunks.remove(0);
+                    if let Err(error) = remove_file(
+                        worker
+                            .output_directory
+                            .join(format!("{:020}.json", removed.start_sequence)),
+                    ) {
+                        state.storage_failure = Some(error.to_string());
+                        state.exit_reason = Some("storage_failure".into());
+                        terminate = Some("storage_failure");
+                        break;
+                    }
+                    state.retained_bytes -= removed.data.len();
+                    state.output_truncated = true;
+                }
+                state.first_retained_sequence = state
+                    .chunks
+                    .first()
+                    .map(|chunk| chunk.start_sequence)
+                    .unwrap_or(state.next_sequence);
             }
         }
     }
@@ -1221,7 +1353,10 @@ fn monitor(worker: Arc<Worker>) {
             if terminal {
                 return;
             }
-            if SystemTime::now() >= worker.deadline {
+            if worker
+                .deadline
+                .is_some_and(|deadline| SystemTime::now() >= deadline)
+            {
                 mark_termination(&worker, "timeout");
             }
             thread::sleep(Duration::from_millis(20));
@@ -1347,7 +1482,7 @@ mod tests {
             secrets: Vec::new(),
             output_directory: output_directory.clone(),
             max_output_bytes: MAX_OUTPUT_BYTES,
-            deadline: SystemTime::now() - Duration::from_millis(1),
+            deadline: Some(SystemTime::now() - Duration::from_millis(1)),
             containment: Containment {
                 root_pid: 0,
                 process_group_id: None,
@@ -1573,7 +1708,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             message: "missing operation".into(),
         })?;
     match operation {
-        "health" => Ok((json!({"protocolVersion": 2}), false)),
+        "health" => Ok((json!({"protocolVersion": 3}), false)),
         "snapshot" => Ok((snapshot(worker), false)),
         "write" => {
             let data = request
@@ -1603,6 +1738,10 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             }
             #[cfg(unix)]
             if let Some(terminal) = &worker.terminal {
+                // Hold the journal cursor across terminal acceptance. A reader cannot append
+                // between this boundary and the write, so immediate replies remain waitable.
+                let state = worker.state.lock().expect("state lock");
+                let arrival_sequence = state.next_sequence;
                 let mut terminal = terminal.lock().expect("terminal lock");
                 terminal
                     .write_all(data.as_bytes())
@@ -1614,7 +1753,10 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                     code: "process",
                     message: error.to_string(),
                 })?;
-                return Ok((json!({"acceptedBytes": data.len()}), false));
+                return Ok((
+                    json!({"acceptedBytes": data.len(), "arrivalSequence": arrival_sequence}),
+                    false,
+                ));
             }
             let mut child = worker.child.lock().expect("child lock");
             let input = child.stdin.as_mut().ok_or(WorkerError {
@@ -1631,7 +1773,11 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                 code: "process",
                 message: error.to_string(),
             })?;
-            Ok((json!({"acceptedBytes": data.len()}), false))
+            let arrival_sequence = worker.state.lock().expect("state lock").next_sequence;
+            Ok((
+                json!({"acceptedBytes": data.len(), "arrivalSequence": arrival_sequence}),
+                false,
+            ))
         }
         "resize" => {
             if worker.mode != "pty" {
@@ -1816,7 +1962,7 @@ fn main() -> Result<(), String> {
             listener.local_addr().map_err(|error| error.to_string())?
         ),
         token: bootstrap.worker_control_token.clone(),
-        protocol_version: 2,
+        protocol_version: 3,
     };
     write_atomic(
         &descriptor_path,
@@ -1896,8 +2042,25 @@ fn main() -> Result<(), String> {
     let containment = match verify_containment(child.id()) {
         Ok(containment) => containment,
         Err(error) => {
-            terminate_child_and_wait(&mut child);
+            #[cfg(unix)]
+            let cleanup = cleanup_unverified_spawn(&mut child);
+            #[cfg(not(unix))]
+            {
+                terminate_child_and_wait(&mut child);
+            }
+            #[cfg(unix)]
+            let _ = write_atomic(
+                &session_directory.join("spawn-failure.json"),
+                &serde_json::to_string(&SpawnFailureReceipt {
+                    termination_confirmed: cleanup.confirmed,
+                    message: cleanup.message.clone(),
+                })
+                .expect("spawn failure receipt serializes"),
+            );
             let _ = remove_file(&descriptor_path);
+            #[cfg(unix)]
+            return Err(format!("{error}; {}", cleanup.message));
+            #[cfg(not(unix))]
             return Err(error);
         }
     };
@@ -1943,7 +2106,9 @@ fn main() -> Result<(), String> {
             .collect(),
         output_directory,
         max_output_bytes: bootstrap.max_output_bytes.min(MAX_OUTPUT_BYTES),
-        deadline: SystemTime::now() + Duration::from_secs(bootstrap.timeout_seconds),
+        deadline: bootstrap
+            .timeout_seconds
+            .map(|seconds| SystemTime::now() + Duration::from_secs(seconds)),
         containment,
         mode: bootstrap.mode.clone(),
     });
