@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::fs::remove_dir_all;
 use std::fs::{File, create_dir_all, remove_file, rename};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -420,8 +422,8 @@ fn monitor(worker: Arc<Worker>) {
             update_reader_drain(&worker);
             let terminal = {
                 let state = worker.state.lock().expect("state lock");
-                state.output_incomplete
-                    || (state.termination_confirmed && state.stdout_eof && state.stderr_eof)
+                state.termination_confirmed
+                    && (state.output_incomplete || (state.stdout_eof && state.stderr_eof))
             };
             if terminal {
                 return;
@@ -474,6 +476,14 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
 mod tests {
     use super::*;
 
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected read failure"))
+        }
+    }
+
     #[test]
     fn reader_error_is_not_eof_or_complete_output() {
         let mut state = State {
@@ -502,6 +512,75 @@ mod tests {
         update_reader_drain_state(&mut state);
         assert!(state.output_incomplete);
         assert!(!output_complete(&state));
+    }
+
+    #[test]
+    fn reader_error_keeps_monitoring_a_live_child_until_timeout() {
+        #[cfg(unix)]
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("start child");
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "ping -n 31 127.0.0.1 > NUL"])
+            .spawn()
+            .expect("start child");
+        let output_directory = std::env::temp_dir().join(format!(
+            "opencode-pty-worker-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        create_dir_all(&output_directory).expect("create output directory");
+        let worker = Arc::new(Worker {
+            child: Mutex::new(child),
+            state: Mutex::new(State {
+                started_at: now(),
+                ..State::default()
+            }),
+            secrets: Vec::new(),
+            output_directory: output_directory.clone(),
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            deadline: SystemTime::now() - Duration::from_millis(1),
+        });
+        reader(worker.clone(), FailingReader, true);
+        for _ in 0..50 {
+            if worker
+                .state
+                .lock()
+                .expect("state lock")
+                .stdout_reader_error
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            worker
+                .state
+                .lock()
+                .expect("state lock")
+                .stdout_reader_error
+                .is_some()
+        );
+        assert!(
+            worker
+                .child
+                .lock()
+                .expect("child lock")
+                .try_wait()
+                .expect("check child")
+                .is_none()
+        );
+        monitor(worker.clone());
+        let result = wait_for_final_snapshot(&worker);
+        assert_eq!(result["status"], "lost");
+        assert_eq!(result["timedOut"], true);
+        assert_eq!(result["terminationConfirmed"], true);
+        remove_dir_all(output_directory).ok();
     }
 }
 

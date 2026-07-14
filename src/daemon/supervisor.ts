@@ -723,7 +723,7 @@ export class SessionSupervisor {
       await this.storage.writeSession(record)
       throw new ProcessError(String(error))
     }
-    record.pid = started.reference.pid
+    record.pid = (await started.client.snapshot()).pid
     record.worker = started.reference
     record.status = 'running'
     record.updatedAt = new Date().toISOString()

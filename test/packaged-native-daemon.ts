@@ -12,17 +12,88 @@ const workerPath = join(
   `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
 )
 let daemon: ReturnType<typeof Bun.spawn> | undefined
+let executing: Promise<{ ok: boolean; result?: unknown; error?: unknown }> | undefined
+let executeAbort: AbortController | undefined
+let childPid: number | undefined
+let workerPid: number | undefined
+let active:
+  | {
+      descriptor: { endpoint: string; token: string }
+      owner: Record<string, string>
+      id: string
+    }
+  | undefined
+
+async function waitForExit(child: ReturnType<typeof Bun.spawn>, name: string) {
+  const exited = await Promise.race([
+    child.exited.then(() => true),
+    Bun.sleep(5000).then(() => false),
+  ])
+  if (!exited) throw new Error(`${name} did not exit within 5 seconds.`)
+}
+
+async function waitForExecution() {
+  if (!executing) return
+  const settled = await Promise.race([
+    executing.catch(() => undefined).then(() => true),
+    Bun.sleep(5000).then(() => false),
+  ])
+  if (!settled) throw new Error('Packaged exec RPC did not settle within 5 seconds.')
+}
+
+async function assertStopped(pid: number, name: string) {
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+      if (process.platform === 'win32') {
+        const processInfo = Bun.spawn({
+          cmd: ['tasklist.exe', '/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+          stdout: 'pipe',
+          stderr: 'ignore',
+        })
+        const output = await new Response(processInfo.stdout).text()
+        if (!output.includes(`"${pid}"`)) return
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return
+      throw error
+    }
+    await Bun.sleep(25)
+  }
+  throw new Error(`${name} survived shutdown (PID ${pid}).`)
+}
+
+async function stopPid(pid: number | undefined, name: string) {
+  if (!pid) return
+  try {
+    process.kill(pid, 'SIGKILL')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+  await assertStopped(pid, name)
+}
 
 async function removeTemporary(path: string) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  let failure: unknown
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       await rm(path, { recursive: true, force: true })
       return
-    } catch {
+    } catch (error) {
+      failure = error
+      if (process.platform === 'win32') {
+        const removed = Bun.spawn({
+          cmd: ['cmd.exe', '/C', 'rmdir', '/S', '/Q', path],
+          stdout: 'ignore',
+          stderr: 'ignore',
+        })
+        if ((await removed.exited) === 0) return
+      }
       await Bun.sleep(100)
     }
   }
-  // ponytail: Windows can retain npm package handles after child exit; the OS temp directory cleans this up.
+  throw new Error(`Could not remove temporary directory: ${path}: ${failure}`)
 }
 
 async function startDaemon(installed: string) {
@@ -51,6 +122,7 @@ async function startDaemon(installed: string) {
     }
   }
   child.kill()
+  await waitForExit(child, 'Packaged daemon')
   throw new Error('Packaged daemon did not start.')
 }
 
@@ -72,7 +144,11 @@ async function rpc(
 
 try {
   await stat(workerPath)
-  const packed = Bun.spawn({ cmd: ['npm', 'pack', '--pack-destination', packageDirectory] })
+  const packed = Bun.spawn({
+    cmd: ['npm', 'pack', '--pack-destination', packageDirectory],
+    stdout: 'ignore',
+    stderr: 'inherit',
+  })
   if ((await packed.exited) !== 0) throw new Error('npm pack failed.')
   const archive = (await Array.fromAsync(new Bun.Glob('*.tgz').scan({ cwd: packageDirectory })))[0]
   if (!archive) throw new Error('npm pack produced no archive.')
@@ -80,6 +156,8 @@ try {
   const installed = join(installedRoot, 'node_modules', 'opencode-pty')
   const installedPackage = Bun.spawn({
     cmd: ['npm', 'install', '--prefix', installedRoot, join(packageDirectory, archive)],
+    stdout: 'ignore',
+    stderr: 'inherit',
   })
   if ((await installedPackage.exited) !== 0) throw new Error('npm install failed.')
 
@@ -93,8 +171,8 @@ try {
       .update(`${secret}\0packaged-native\0${root}`)
       .digest('hex'),
   }
-  const executeAbort = new AbortController()
-  const executing = rpc(
+  executeAbort = new AbortController()
+  executing = rpc(
     started.descriptor,
     'exec',
     {
@@ -116,7 +194,15 @@ try {
     if (!id) await Bun.sleep(25)
   }
   if (!id) throw new Error('Packaged native exec was not recorded.')
-  let workerPid: number | undefined
+  active = { descriptor: started.descriptor, owner, id: id.id }
+  for (let attempt = 0; attempt < 100 && !childPid; attempt += 1) {
+    const snapshot = await rpc(started.descriptor, 'get', { id: id.id }, owner)
+    const pid = (snapshot.result as { pid?: number } | undefined)?.pid
+    if (Number.isInteger(pid) && (pid ?? 0) > 0) childPid = pid
+    if (!childPid) await Bun.sleep(25)
+  }
+  if (!Number.isInteger(childPid)) throw new Error('Packaged native child PID was not recorded.')
+  const confirmedChildPid = childPid as number
   for (let attempt = 0; attempt < 100 && !workerPid; attempt += 1) {
     try {
       const firstRecord = JSON.parse(
@@ -130,12 +216,13 @@ try {
   const confirmedWorkerPid = workerPid as number
 
   daemon.kill('SIGKILL')
-  await Promise.race([daemon.exited, Bun.sleep(5000)])
+  await waitForExit(daemon, 'First packaged daemon')
   executeAbort.abort()
-  void executing.catch(() => undefined)
+  await waitForExecution()
   await rm(join(stateDirectory, 'daemon.json'), { force: true })
   started = await startDaemon(installed)
   daemon = started.child
+  active.descriptor = started.descriptor
   const stopped = await rpc(started.descriptor, 'stop', { id: id.id }, owner)
   if (
     !stopped.ok ||
@@ -143,21 +230,30 @@ try {
       true
   )
     throw new Error('Reconnected packaged daemon did not stop native exec.')
-  await Bun.sleep(100)
-  try {
-    process.kill(confirmedWorkerPid, 0)
-    throw new Error('Native worker survived packaged daemon shutdown.')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-  }
+  const terminal = await rpc(started.descriptor, 'get', { id: id.id }, owner)
+  if (
+    !terminal.ok ||
+    (terminal.result as { terminationConfirmed?: boolean } | undefined)?.terminationConfirmed !==
+      true
+  )
+    throw new Error('Reconnected packaged daemon did not record native exec termination.')
+  await assertStopped(confirmedChildPid, 'Native exec child')
+  await assertStopped(confirmedWorkerPid, 'Native worker')
   await stat(join(stateDirectory, 'sessions', id.id, 'worker.json')).then(
     () => Promise.reject(new Error('Native worker descriptor survived shutdown.')),
     () => undefined
   )
 } finally {
-  daemon?.kill('SIGKILL')
-  void removeTemporary(packageDirectory)
-  void removeTemporary(stateDirectory)
+  executeAbort?.abort()
+  await waitForExecution()
+  if (daemon) {
+    if (daemon.exitCode === null && active)
+      await rpc(active.descriptor, 'stop', { id: active.id }, active.owner).catch(() => undefined)
+    if (daemon.exitCode === null) daemon.kill('SIGKILL')
+    await waitForExit(daemon, 'Packaged daemon cleanup')
+  }
+  await stopPid(childPid, 'Native exec child cleanup')
+  await stopPid(workerPid, 'Native worker cleanup')
+  await removeTemporary(packageDirectory)
+  await removeTemporary(stateDirectory)
 }
-
-process.exit(0)
