@@ -444,7 +444,8 @@ export class DaemonStorage {
         validText(value.endpoint) &&
         validNonnegativeInteger(value.protocolVersion) &&
         value.protocolVersion >= 1 &&
-        value.protocolVersion <= 3
+        value.protocolVersion <= 4 &&
+        (value.tokenFingerprint === undefined || validText(value.tokenFingerprint))
       )
     }
     const validContainment = (containment: unknown): boolean => {
@@ -497,6 +498,7 @@ export class DaemonStorage {
         typeof value.termSignalSent === 'boolean' &&
         typeof value.killSignalSent === 'boolean' &&
         typeof value.rootExited === 'boolean' &&
+        (value.directChildExited === undefined || typeof value.directChildExited === 'boolean') &&
         validContainment(value.containment)
       )
     }
@@ -528,6 +530,7 @@ export class DaemonStorage {
         typeof value.terminationRequested !== 'boolean') ||
       (value.terminationConfirmed !== undefined &&
         typeof value.terminationConfirmed !== 'boolean') ||
+      (value.directChildExited !== undefined && typeof value.directChildExited !== 'boolean') ||
       !validOptionalInteger(value.exitCode) ||
       (value.exitSignal !== undefined &&
         !validNonnegativeInteger(value.exitSignal) &&

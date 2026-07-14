@@ -116,15 +116,23 @@ function activeStatus(record: SessionRecord): boolean {
 }
 
 function containmentDrained(
-  record: Pick<SessionRecord, 'containment' | 'terminationConfirmed'>
+  record: Pick<SessionRecord, 'containment' | 'terminationConfirmed' | 'directChildExited'>
 ): boolean {
   return (
     !record.containment ||
     record.containment.status === 'posix_best_effort_empty' ||
     record.containment.status === 'windows_job_empty' ||
-    // macOS only proves direct-child exit; it never claims descendant drain.
-    (process.platform === 'darwin' && record.terminationConfirmed) ||
     record.containment.status === 'not_applicable'
+  )
+}
+
+function terminalDirectChild(
+  record: Pick<SessionRecord, 'containment' | 'terminationConfirmed' | 'directChildExited'>
+): boolean {
+  return (
+    record.terminationConfirmed &&
+    (containmentDrained(record) ||
+      (process.platform === 'darwin' && record.directChildExited === true))
   )
 }
 
@@ -241,6 +249,7 @@ export class SessionSupervisor {
         record.containment.rootIdentityVerified ??= false
         record.containment.observedEscapedDescendants ??= []
       }
+      if (record.termination) record.termination.directChildExited ??= record.termination.rootExited
       record.mode ??= 'pty'
       record.ownerProjectDirectory ??= record.workdir
       record.ownerCapabilityHash ??= ''
@@ -252,7 +261,8 @@ export class SessionSupervisor {
         record.status === 'timed_out' ||
         record.status === 'spawn_failed' ||
         record.status === 'output_limited'
-      if (record.worker && record.worker.protocolVersion !== 3) {
+      record.directChildExited ??= record.terminationConfirmed
+      if (record.worker && record.worker.protocolVersion !== 4) {
         record.status = 'lost'
         record.terminationConfirmed = false
         record.exitReason = {
@@ -340,6 +350,7 @@ export class SessionSupervisor {
       timedOut: false,
       terminationRequested: false,
       terminationConfirmed: false,
+      directChildExited: false,
       nextSequence: 0,
       firstRetainedSequence: 0,
       outputBytes: 0,
@@ -527,6 +538,7 @@ export class SessionSupervisor {
       timedOut: false,
       terminationRequested: false,
       terminationConfirmed: false,
+      directChildExited: false,
       nextSequence: 0,
       firstRetainedSequence: 0,
       outputBytes: 0,
@@ -797,13 +809,16 @@ export class SessionSupervisor {
   }
 
   private nativeTerminal(result: WorkerSnapshot): boolean {
+    if (result.status === 'lost') return true
     return (
       result.terminationConfirmed &&
       result.status !== 'running' &&
-      containmentDrained({
+      (containmentDrained({
         containment: result.containment,
         terminationConfirmed: result.terminationConfirmed,
-      })
+        directChildExited: result.directChildExited,
+      }) ||
+        (process.platform === 'darwin' && result.directChildExited))
     )
   }
 
@@ -884,6 +899,7 @@ export class SessionSupervisor {
     record.exitSignal = result.exitSignal ?? undefined
     record.terminationRequested = result.terminationRequested
     record.terminationConfirmed = result.terminationConfirmed
+    record.directChildExited = result.directChildExited
     record.containment = result.containment
     record.termination = result.termination
     record.storageFailure = result.storageFailure ?? undefined
@@ -1075,6 +1091,7 @@ export class SessionSupervisor {
       return {
         requested: true,
         terminationConfirmed: record.terminationConfirmed,
+        directChildExited: record.directChildExited,
         containment: record.containment,
         termination: record.termination,
       }
@@ -1084,6 +1101,7 @@ export class SessionSupervisor {
     return {
       requested: false,
       terminationConfirmed: record.terminationConfirmed,
+      directChildExited: record.directChildExited,
       containment: record.containment,
       termination: record.termination,
     }
@@ -1100,15 +1118,17 @@ export class SessionSupervisor {
         if (
           !result.terminationConfirmed ||
           result.status === 'running' ||
-          !containmentDrained({
+          (!containmentDrained({
             containment: result.containment,
             terminationConfirmed: result.terminationConfirmed,
-          })
+            directChildExited: result.directChildExited,
+          }) &&
+            !(process.platform === 'darwin' && result.directChildExited))
         )
           return false
       } catch {
         // A completed worker may have already removed its listener; its persisted terminal record is authoritative.
-        if (!record.terminationConfirmed || !containmentDrained(record)) return false
+        if (!terminalDirectChild(record)) return false
       }
     }
     this.nativeWorkers.delete(id)
@@ -1389,14 +1409,14 @@ export class SessionSupervisor {
   }
 
   private isTerminal(record: SessionRecord): boolean {
-    return record.terminationConfirmed && containmentDrained(record)
+    return terminalDirectChild(record)
   }
 
   private incompatibleWorker(record: SessionRecord): boolean {
     return (
       record.status === 'lost' &&
       record.worker?.protocolVersion !== undefined &&
-      record.worker.protocolVersion !== 3
+      record.worker.protocolVersion !== 4
     )
   }
 
@@ -1416,6 +1436,7 @@ export class SessionSupervisor {
       timedOut: record.timedOut,
       terminationRequested: record.terminationRequested,
       terminationConfirmed: record.terminationConfirmed,
+      directChildExited: record.directChildExited,
       containment: record.containment,
       termination: record.termination,
       exitCode: record.exitCode,

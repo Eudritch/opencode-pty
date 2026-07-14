@@ -24,6 +24,7 @@ export interface WorkerReference {
   startIdentity: string
   processIdentity: string
   endpoint: string
+  tokenFingerprint?: string
   protocolVersion: number
   executable?: string
 }
@@ -66,8 +67,12 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
     typeof descriptor.endpoint === 'string' &&
     typeof descriptor.token === 'string' &&
     descriptor.token.length >= 16 &&
-    descriptor.protocolVersion === 3
+    descriptor.protocolVersion === 4
   )
+}
+
+function tokenFingerprint(token: string): string {
+  return new Bun.CryptoHasher('sha256').update(token).digest('hex')
 }
 
 function workerCommand(): string[] {
@@ -123,14 +128,7 @@ async function processIdentity(pid: number): Promise<string | null> {
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW === '1')
     throw new Error('injected worker identity probe failure')
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL === '1') return null
-  if (process.platform === 'darwin') {
-    try {
-      process.kill(pid, 0)
-      return `posix:${pid}:unavailable`
-    } catch {
-      return null
-    }
-  }
+  if (process.platform === 'darwin') return null
   if (process.platform !== 'win32') {
     try {
       const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
@@ -314,8 +312,7 @@ export class WorkerClient {
           descriptor.pid === child.pid &&
           descriptor.token === workerControlToken &&
           descriptor.startIdentity === workerId &&
-          identity !== null &&
-          descriptor.processIdentity === identity
+          (identity === null || descriptor.processIdentity === identity)
         ) {
           // The command is not eligible to spawn before the authenticated start frame.
           const input = child.stdin
@@ -366,7 +363,7 @@ export class WorkerClient {
     }
     try {
       identity = await processIdentity(child.pid)
-      if (!identity)
+      if (!identity && process.platform !== 'darwin')
         throw new Error('native_worker_unavailable: worker identity verification failed.')
       const input = child.stdin
       if (!input || typeof input === 'number')
@@ -383,12 +380,22 @@ export class WorkerClient {
           descriptor.pid !== child.pid ||
           descriptor.token !== workerControlToken ||
           descriptor.startIdentity !== workerId ||
-          descriptor.processIdentity !== identity
+          (identity !== null && descriptor.processIdentity !== identity)
         ) {
           throw new Error('native_worker_unavailable: worker descriptor verification failed.')
         }
         client = new WorkerClient(descriptor, { child, stdout, token: workerControlToken })
         await client.control('start')
+        const health = await client.health()
+        if (
+          health.protocolVersion !== descriptor.protocolVersion ||
+          health.pid !== descriptor.pid ||
+          health.processIdentity !== descriptor.processIdentity
+        )
+          throw new Error(
+            'native_worker_unavailable: authenticated worker identity verification failed.'
+          )
+        identity = descriptor.processIdentity
         for (let attempt = 0; attempt < 50; attempt += 1) {
           try {
             await client.snapshot()
@@ -399,6 +406,7 @@ export class WorkerClient {
                 startIdentity: descriptor.startIdentity,
                 processIdentity: descriptor.processIdentity,
                 endpoint: descriptor.endpoint,
+                tokenFingerprint: tokenFingerprint(descriptor.token),
                 protocolVersion: descriptor.protocolVersion,
                 executable: command[0],
               },
@@ -444,12 +452,19 @@ export class WorkerClient {
         descriptor.pid !== reference.pid ||
         descriptor.startIdentity !== reference.startIdentity ||
         descriptor.processIdentity !== reference.processIdentity ||
-        descriptor.endpoint !== reference.endpoint
+        descriptor.endpoint !== reference.endpoint ||
+        !reference.tokenFingerprint ||
+        tokenFingerprint(descriptor.token) !== reference.tokenFingerprint
       )
         return null
-      if ((await processIdentity(descriptor.pid)) !== descriptor.processIdentity) return null
       const client = new WorkerClient(descriptor)
-      await client.call('health')
+      const health = await client.health()
+      if (
+        health.protocolVersion !== descriptor.protocolVersion ||
+        health.pid !== reference.pid ||
+        health.processIdentity !== reference.processIdentity
+      )
+        return null
       return client
     } catch {
       return null
@@ -458,6 +473,14 @@ export class WorkerClient {
 
   async snapshot(): Promise<WorkerSnapshot> {
     return this.call('snapshot')
+  }
+
+  private async health(): Promise<{
+    protocolVersion: number
+    pid: number
+    processIdentity: string
+  }> {
+    return this.call('health')
   }
 
   async wait(timeoutMs: number): Promise<WorkerSnapshot> {
@@ -587,6 +610,7 @@ export interface WorkerSnapshot {
   timedOut: boolean
   terminationRequested: boolean
   terminationConfirmed: boolean
+  directChildExited: boolean
   storageFailure?: string
   stdoutEof: boolean
   stderrEof: boolean

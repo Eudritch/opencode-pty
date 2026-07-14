@@ -9,7 +9,7 @@ export function formatSessionInfo(session: PTYSessionInfo): string[] {
     session.timeoutSeconds !== undefined ? ` | timeout: ${session.timeoutSeconds}s` : ''
   const outputInfo = session.outputTruncated ? ' (older output truncated)' : ''
   const containment = session.containment
-    ? `  Containment: ${session.containment.status} | root verified: ${session.containment.rootIdentityVerified ? 'yes' : 'no'} | group: ${session.containment.observedGroupPids.join(',') || 'none'} | session: ${session.containment.observedSessionPids.join(',') || 'none'} | escaped: ${session.containment.observedEscapedDescendants?.map(({ pid, startIdentity }) => `${pid}:${startIdentity}`).join(',') || session.containment.observedEscapedDescendantPids.join(',') || 'none'}`
+    ? `  Containment: ${session.containment.status} | direct child exited: ${session.directChildExited ? 'yes' : 'no'} | root verified: ${session.containment.rootIdentityVerified ? 'yes' : 'no'} | group: ${session.containment.observedGroupPids.join(',') || 'none'} | session: ${session.containment.observedSessionPids.join(',') || 'none'} | escaped: ${session.containment.observedEscapedDescendants?.map(({ pid, startIdentity }) => `${pid}:${startIdentity}`).join(',') || session.containment.observedEscapedDescendantPids.join(',') || 'none'}`
     : ''
   return [
     `[${escapeXml(session.id)}] ${escapeXml(session.title)}`,

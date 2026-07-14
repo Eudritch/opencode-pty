@@ -53,14 +53,7 @@ async function stopOwnedCommand(child: Child, name: string) {
       stderr: 'pipe',
     })
     await Promise.race([killer.exited, Bun.sleep(5000).then(() => killer.kill())])
-  } else {
-    try {
-      // The command was started through setsid, so this targets only its process group.
-      process.kill(-child.pid, 'SIGKILL')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-    }
-  }
+  } else child.kill('SIGKILL')
   await waitForExit(child, name)
 }
 

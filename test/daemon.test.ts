@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
+import { WorkerClient as NativeWorkerClient } from '../src/daemon/worker-client.ts'
 import {
   effectiveMaxOutputBytes,
   ProcessError,
@@ -1553,6 +1554,48 @@ test('native worker identity and ready-output failures close the owned worker be
   }
 }, 10_000)
 
+test('worker recovery rejects an authenticated health identity mismatch', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-recovery-'))
+  roots.push(root)
+  const token = 'a'.repeat(32)
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: () =>
+      Response.json({
+        ok: true,
+        result: { protocolVersion: 4, pid: 123, processIdentity: 'different-worker' },
+      }),
+  })
+  const sessionDirectory = join(root, 'session')
+  await mkdir(sessionDirectory)
+  await writeFile(
+    join(sessionDirectory, 'worker.json'),
+    JSON.stringify({
+      pid: 123,
+      startIdentity: 'worker-id',
+      processIdentity: 'expected-worker',
+      endpoint: server.url.origin,
+      token,
+      protocolVersion: 4,
+    })
+  )
+  try {
+    expect(
+      await NativeWorkerClient.reconnect(sessionDirectory, {
+        pid: 123,
+        startIdentity: 'worker-id',
+        processIdentity: 'expected-worker',
+        endpoint: server.url.origin,
+        tokenFingerprint: new Bun.CryptoHasher('sha256').update(token).digest('hex'),
+        protocolVersion: 4,
+      })
+    ).toBeNull()
+  } finally {
+    server.stop(true)
+  }
+})
+
 test('native worker accepts a split readiness frame and immediate post-resume exit', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-split-ready-'))
   roots.push(root)
@@ -1747,14 +1790,16 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
     if (process.platform === 'linux') {
       expect(stopped).toMatchObject({
         result: {
-          containment: { status: 'posix_best_effort_empty' },
+          containment: { status: 'posix_processes_remaining' },
+          terminationConfirmed: false,
         },
       })
     } else {
       expect(stopped).toMatchObject({
         result: {
           containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
-          termination: { termSignalSent: false, killSignalSent: false },
+          directChildExited: true,
+          termination: { termSignalSent: true, killSignalSent: true, directChildExited: true },
         },
       })
     }
@@ -1772,7 +1817,7 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
             result: {
               timedOut: true,
               containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
-              termination: { termSignalSent: false, killSignalSent: false },
+              termination: { termSignalSent: true, killSignalSent: true, directChildExited: true },
             },
           }
     )
@@ -1802,10 +1847,15 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
       expect(escapedStop).toMatchObject({
         result: { containment: { status: 'posix_escape_observed' } },
       })
+    if (process.platform === 'darwin') {
+      expect(await processGone(escapedPid)).toBeFalse()
+      process.kill(escapedPid, 'SIGKILL')
+      escapedPid = 0
+    }
     await escaped
   } finally {
     try {
-      if (process.platform === 'darwin' && directChildPid) {
+      if (directChildPid) {
         try {
           process.kill(directChildPid, 'SIGKILL')
         } catch (error) {
@@ -1823,6 +1873,35 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
     }
   }
 }, 15_000)
+
+test('macOS normal direct-child completion is readable and cleanable without descendant confirmation', async () => {
+  if (process.platform !== 'darwin') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-macos-normal-'))
+  roots.push(root)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  try {
+    const result = await supervisor.nativeExec({
+      command: process.execPath,
+      args: ['-e', "console.log('macos-normal')"],
+      parentSessionId: 'macos',
+      timeoutSeconds: 2,
+      workdir: root,
+    })
+    expect(result).toMatchObject({ stdout: 'macos-normal\n', terminationConfirmed: true })
+    expect(await supervisor.get(result.session.id)).toMatchObject({
+      status: 'exited',
+      directChildExited: true,
+      containment: { status: 'posix_containment_unknown' },
+    })
+    expect(await supervisor.cleanup(result.session.id)).toBeTrue()
+  } finally {
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
 
 test('native PTY writes, resizes, rejects exec resize, and recovers after daemon restart', async () => {
   if (process.platform === 'win32') return

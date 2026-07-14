@@ -39,6 +39,7 @@ export const ptyKill = tool({
       `<pty_stop>`,
       `${action}: ${escapeXml(args.id)}${cleanupNote}`,
       `Termination confirmed: ${stop.terminationConfirmed ? 'yes' : 'no'}`,
+      `Direct child exited: ${stop.directChildExited ? 'yes' : 'no'}`,
       stop.containment
         ? `Containment: ${escapeXml(stop.containment.status)}; group=${stop.containment.observedGroupPids.join(',') || 'none'}; session=${stop.containment.observedSessionPids.join(',') || 'none'}; escaped=${stop.containment.observedEscapedDescendantPids.join(',') || 'none'}`
         : '',

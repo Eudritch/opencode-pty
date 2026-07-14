@@ -1,0 +1,20 @@
+name: native-posix
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lifecycle:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: cargo build --locked --workspace
+      - run: cargo test --locked --workspace
+      - run: bun test test/daemon.test.ts --test-name-pattern 'worker recovery rejects|native exec POSIX containment|macOS normal direct-child'

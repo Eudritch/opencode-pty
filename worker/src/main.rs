@@ -119,8 +119,72 @@ fn process_identity() -> Result<String, String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn process_identity() -> Result<String, String> {
-    // macOS has no /proc start-time identity. Its containment result remains unavailable.
+    #[cfg(target_os = "macos")]
+    {
+        darwin_process_identity(std::process::id())
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(format!("posix:{}:unavailable", std::process::id()))
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdInfo {
+    flags: u32,
+    status: u32,
+    xstatus: u32,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    ruid: u32,
+    rgid: u32,
+    svuid: u32,
+    svgid: u32,
+    _reserved: u32,
+    comm: [u8; 17],
+    name: [u8; 33],
+    nfiles: u32,
+    pgid: u32,
+    pjobc: u32,
+    e_tdev: u32,
+    tpgid: u32,
+    nice: i32,
+    start_seconds: u64,
+    start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: i32,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffersize: i32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_process_identity(pid: u32) -> Result<String, String> {
+    const PROC_PIDTBSDINFO: i32 = 3;
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let read = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdInfo).cast(),
+            std::mem::size_of::<ProcBsdInfo>() as i32,
+        )
+    };
+    if read != std::mem::size_of::<ProcBsdInfo>() as i32 || info.pid != pid {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(format!(
+        "darwin:{pid}:{}:{}",
+        info.start_seconds, info.start_microseconds
+    ))
 }
 
 #[cfg(windows)]
@@ -233,6 +297,7 @@ struct TerminationResult {
     term_signal_sent: bool,
     kill_signal_sent: bool,
     root_exited: bool,
+    direct_child_exited: bool,
     containment: ContainmentReport,
 }
 
@@ -1473,68 +1538,24 @@ fn containment_report(containment: &Containment) -> ContainmentReport {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn signal_group(group: u32, signal: i32) -> std::io::Result<()> {
-    if unsafe { libc::kill(-(group as i32), signal) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn signal_contained(containment: &Containment, signal: i32) -> (bool, ContainmentReport) {
-    signal_contained_with(containment, signal, linux_processes, signal_group)
-}
-
-#[cfg(target_os = "linux")]
-fn signal_contained_with<S, G>(
-    containment: &Containment,
-    signal: i32,
-    scan: S,
-    send_group: G,
-) -> (bool, ContainmentReport)
-where
-    S: FnOnce() -> Result<ProcessScan, String>,
-    G: FnOnce(u32, i32) -> std::io::Result<()>,
-{
-    // Do not reuse a display snapshot: group IDs are PID-derived and must be checked at send time.
-    let report = match scan() {
-        Ok(scan) => containment_report_from_scan(containment, &scan),
-        Err(_) => containment_report(containment),
-    };
-    let Some(group) = containment.process_group_id else {
-        return (false, report);
-    };
-    if report.status == "posix_containment_unknown" || !report.root_identity_verified {
-        return (false, report);
-    }
-    (send_group(group, signal).is_ok(), report)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn signal_contained(containment: &Containment, signal: i32) -> (bool, ContainmentReport) {
-    let _ = (containment, signal);
-    (false, containment_report(containment))
-}
-
 fn containment_drained(report: &ContainmentReport) -> bool {
     report.status == "posix_best_effort_empty"
         || report.status == "windows_job_empty"
         || report.status == "not_applicable"
-        // macOS has no process identity scan. A reaped direct child is terminal, but descendant
-        // containment remains deliberately unavailable.
-        || (cfg!(all(unix, not(target_os = "linux")))
-            && report.status == "posix_containment_unknown")
 }
 
 fn refresh_termination_confirmed(worker: &Arc<Worker>) -> ContainmentReport {
     let report = containment_report(&worker.containment);
     let mut state = worker.state.lock().expect("state lock");
-    state.termination_confirmed = state.root_exited && containment_drained(&report);
+    state.termination_confirmed = state.root_exited
+        && (containment_drained(&report) || cfg!(all(unix, not(target_os = "linux"))));
     report
+}
+
+#[cfg(unix)]
+fn signal_direct_child(child: &mut Child, signal: i32) -> bool {
+    // An unreaped child cannot have its PID reused. Keep this handle locked through signal/reap.
+    unsafe { libc::kill(child.id() as i32, signal) == 0 }
 }
 
 fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
@@ -1549,11 +1570,11 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
     }
     #[cfg(unix)]
     {
-        let (term_sent, before_term) = signal_contained(&worker.containment, libc::SIGTERM);
-        if !term_sent {
-            // Child is a handle we created, unlike a PID/group lookup; it is safe to reap the root.
-            let _ = worker.child.lock().expect("child lock").kill();
-        }
+        // The Child handle is ours and cannot be redirected by PID/group reuse. POSIX provides no
+        // safe descendant handle, so containment scans remain evidence rather than enforcement.
+        let term_sent =
+            signal_direct_child(&mut worker.child.lock().expect("child lock"), libc::SIGTERM);
+        let before_term = containment_report(&worker.containment);
         let deadline = SystemTime::now() + TERMINATION_GRACE;
         while SystemTime::now() < deadline {
             observe_exit(worker);
@@ -1567,10 +1588,9 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let (kill_sent, before_kill) = signal_contained(&worker.containment, libc::SIGKILL);
-        if !kill_sent {
-            let _ = worker.child.lock().expect("child lock").kill();
-        }
+        let kill_sent =
+            signal_direct_child(&mut worker.child.lock().expect("child lock"), libc::SIGKILL);
+        let before_kill = containment_report(&worker.containment);
         let deadline = SystemTime::now() + TERMINATION_HARD_TIMEOUT;
         while SystemTime::now() < deadline {
             observe_exit(worker);
@@ -1596,6 +1616,7 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
             term_signal_sent: term_sent,
             kill_signal_sent: kill_sent,
             root_exited,
+            direct_child_exited: root_exited,
             containment: report,
         });
     }
@@ -1623,6 +1644,7 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
             term_signal_sent: sent,
             kill_signal_sent: sent,
             root_exited,
+            direct_child_exited: root_exited,
             containment: report,
         });
     }
@@ -1728,7 +1750,7 @@ fn terminate_and_wait(worker: &Arc<Worker>, reason: &str) {
 
 #[cfg(unix)]
 fn terminate_child_and_wait(child: &mut Child) {
-    let _ = child.kill();
+    let _ = signal_direct_child(child, libc::SIGKILL);
     let _ = child.wait();
 }
 
@@ -1753,13 +1775,9 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
             known_members: Mutex::new(BTreeMap::new()),
             escaped_members: Mutex::new(BTreeMap::new()),
         };
-        let (sent, _) = signal_contained(&containment, libc::SIGTERM);
-        if sent {
-            thread::sleep(TERMINATION_GRACE);
-            let _ = signal_contained(&containment, libc::SIGKILL);
-        } else {
-            let _ = child.kill();
-        }
+        let _ = signal_direct_child(child, libc::SIGTERM);
+        thread::sleep(TERMINATION_GRACE);
+        let _ = signal_direct_child(child, libc::SIGKILL);
         let _ = child.wait();
         let report = containment_report(&containment);
         return SpawnCleanup {
@@ -1788,14 +1806,10 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
 
 #[cfg(unix)]
 fn terminate_contained_child_and_wait(child: &mut Child, containment: &Containment) {
-    let (term_sent, _) = signal_contained(containment, libc::SIGTERM);
-    if term_sent {
-        thread::sleep(TERMINATION_GRACE);
-        let _ = signal_contained(containment, libc::SIGKILL);
-    } else {
-        // macOS cannot verify group identity; this owned handle is still safe to terminate.
-        let _ = child.kill();
-    }
+    let _ = containment;
+    let _ = signal_direct_child(child, libc::SIGTERM);
+    thread::sleep(TERMINATION_GRACE);
+    let _ = signal_direct_child(child, libc::SIGKILL);
     let _ = child.wait();
 }
 
@@ -1815,6 +1829,11 @@ fn child_start_identity(pid: u32) -> Result<String, String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn child_start_identity(pid: u32) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        darwin_process_identity(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(format!("posix:{pid}:unavailable"))
 }
 
@@ -2331,9 +2350,12 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
     let containment_unavailable = containment.status == "posix_containment_unknown"
         || containment.status == "windows_job_unknown";
     let macos_direct_exit = cfg!(all(unix, not(target_os = "linux"))) && state.root_exited;
-    let status = if (terminal || (state.root_exited && containment_unavailable))
+    let containment_unresolved =
+        state.root_exited && !containment_drained(&containment) && !macos_direct_exit;
+    let status = if (terminal || containment_unresolved)
         && (state.storage_failure.is_some()
             || state.output_incomplete
+            || containment_unresolved
             || (containment_unavailable && !macos_direct_exit))
     {
         "lost"
@@ -2351,6 +2373,7 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "exitSignal": state.exit_signal, "exitReason": state.exit_reason,
         "startedAt": state.started_at, "exitedAt": state.exited_at, "timedOut": state.timed_out,
         "terminationRequested": state.termination_requested, "terminationConfirmed": state.termination_confirmed,
+        "directChildExited": state.root_exited,
         "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
         "readerFailure": if reader_failure.is_empty() { Value::Null } else { Value::String(reader_failure) },
         "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
@@ -2641,7 +2664,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn newly_unreadable_candidate_prevents_confirmation_and_signaling() {
+    fn newly_unreadable_candidate_prevents_confirmation() {
         let containment = test_containment();
         let report = containment_report_from_scan(
             &containment,
@@ -2657,25 +2680,15 @@ mod tests {
             },
         );
         assert_eq!(report.status, "posix_containment_unknown");
-        let (sent, report) = signal_contained_with(
-            &containment,
-            libc::SIGTERM,
-            || {
-                Ok(ProcessScan {
-                    processes: vec![ProcessInfo {
-                        pid: 10,
-                        ppid: 1,
-                        pgid: 10,
-                        sid: 10,
-                        start_time: "root".into(),
-                    }],
-                    unreadable_pids: BTreeSet::from([12]),
-                })
-            },
-            |_, _| panic!("must not signal with an unreadable candidate"),
-        );
-        assert!(!sent);
-        assert_eq!(report.status, "posix_containment_unknown");
+        assert!(!containment_drained(&report));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_enforcement_never_uses_negative_process_group_signals() {
+        let source = include_str!("main.rs");
+        let forbidden = ["kill(", "-(group"].concat();
+        assert!(!source.contains(&forbidden));
     }
 
     #[cfg(target_os = "linux")]
@@ -2765,7 +2778,17 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             message: "missing operation".into(),
         })?;
     match operation {
-        "health" => Ok((json!({"protocolVersion": 3}), false)),
+        "health" => Ok((
+            json!({
+                "protocolVersion": 4,
+                "pid": std::process::id(),
+                "processIdentity": process_identity().map_err(|message| WorkerError {
+                    code: "process",
+                    message,
+                })?,
+            }),
+            false,
+        )),
         "snapshot" => Ok((snapshot(worker), false)),
         "write" => {
             let data = request
@@ -3071,7 +3094,7 @@ fn main() -> Result<(), String> {
             listener.local_addr().map_err(|error| error.to_string())?
         ),
         token: bootstrap.worker_control_token.clone(),
-        protocol_version: 3,
+        protocol_version: 4,
     };
     write_atomic(
         &descriptor_path,

@@ -32,6 +32,7 @@ export interface PTYSessionInfo {
   timedOut: boolean
   terminationRequested: boolean
   terminationConfirmed: boolean
+  directChildExited?: boolean
   containment?: ContainmentReport
   termination?: import('../../daemon/types.ts').TerminationResult
   exitCode?: number

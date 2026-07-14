@@ -62,6 +62,7 @@ export interface TerminationResult {
   termSignalSent: boolean
   killSignalSent: boolean
   rootExited: boolean
+  directChildExited: boolean
   containment: ContainmentReport
 }
 
@@ -129,6 +130,7 @@ export interface WorkerReference {
   startIdentity: string
   processIdentity: string
   endpoint: string
+  tokenFingerprint?: string
   protocolVersion: number
   executable?: string
 }
@@ -160,6 +162,8 @@ export interface SessionRecord {
   timedOut: boolean
   terminationRequested: boolean
   terminationConfirmed: boolean
+  // Direct-child exit is distinct from descendant containment drain on POSIX.
+  directChildExited?: boolean
   exitCode?: number
   exitSignal?: number | string
   exitReason?: ExitReason
@@ -241,6 +245,7 @@ export interface WriteResult {
 export interface StopResult {
   requested: boolean
   terminationConfirmed: boolean
+  directChildExited?: boolean
   containment?: ContainmentReport
   termination?: TerminationResult
 }
