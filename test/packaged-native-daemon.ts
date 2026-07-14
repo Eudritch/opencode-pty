@@ -10,8 +10,6 @@ const platform =
     ? 'linux-x64-gnu'
     : `${process.platform}-${process.arch}`
 const supportedPlatforms = new Set(['linux-x64-gnu', 'win32-x64', 'darwin-arm64'])
-// ponytail: Windows ConPTY/Job ownership is not shipped; package smoke must not claim it works.
-if (process.platform === 'win32') (process.exit as (code?: number) => void)(0)
 let daemon: ReturnType<typeof Bun.spawn> | undefined
 let installed: string | undefined
 let executing: Promise<{ ok: boolean; result?: unknown; error?: unknown }> | undefined
@@ -161,6 +159,8 @@ async function startDaemon(installed: string) {
     env: {
       ...process.env,
       PTY_DAEMON_DIR: stateDirectory,
+      PTY_NATIVE_WORKER_PATH: '',
+      PTY_NATIVE_WORKER_DEV: '',
     },
     stdout: 'ignore',
     stderr: 'pipe',
@@ -251,6 +251,15 @@ try {
       .update(`${secret}\0packaged-native\0${root}`)
       .digest('hex'),
   }
+  if (process.platform === 'win32') {
+    const pty = await rpc(
+      started.descriptor,
+      'spawn',
+      { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] },
+      owner
+    )
+    if (pty.ok) throw new Error(`Windows packaged PTY did not fail closed: ${JSON.stringify(pty)}`)
+  }
   executeAbort = new AbortController()
   executing = rpc(
     started.descriptor,
@@ -275,26 +284,49 @@ try {
   }
   if (!id) throw new Error('Packaged native exec was not recorded.')
   active = { descriptor: started.descriptor, owner, id: id.id }
-  let worker: { pid: number; startIdentity: string; processIdentity: string } | undefined
+  let worker:
+    | { pid: number; startIdentity: string; processIdentity: string; executable: string }
+    | undefined
   for (let attempt = 0; attempt < 100 && !worker; attempt += 1) {
     try {
       const firstRecord = JSON.parse(
         await readFile(join(stateDirectory, 'sessions', id.id, 'session.json'), 'utf8')
-      ) as { worker?: { pid?: number; startIdentity?: string; processIdentity?: string } }
+      ) as {
+        worker?: {
+          pid?: number
+          startIdentity?: string
+          processIdentity?: string
+          executable?: string
+        }
+      }
       if (
         Number.isInteger(firstRecord.worker?.pid) &&
         typeof firstRecord.worker?.startIdentity === 'string' &&
-        typeof firstRecord.worker?.processIdentity === 'string'
+        typeof firstRecord.worker?.processIdentity === 'string' &&
+        typeof firstRecord.worker?.executable === 'string'
       )
         worker = firstRecord.worker as {
           pid: number
           startIdentity: string
           processIdentity: string
+          executable: string
         }
     } catch {}
     if (!worker) await Bun.sleep(25)
   }
   if (!worker) throw new Error('Packaged native worker identity was not recorded.')
+  const packagedWorker = join(
+    installedRoot,
+    'node_modules',
+    '@eudritch',
+    `opencode-pty-worker-${platform}`,
+    'bin',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  if (worker.executable !== packagedWorker)
+    throw new Error(
+      `Native worker was not resolved from the packed optional package: ${worker.executable}`
+    )
   const observedIdentity = await processIdentity(worker.pid)
   if (observedIdentity && observedIdentity !== worker.processIdentity)
     throw new Error(

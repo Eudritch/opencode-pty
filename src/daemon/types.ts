@@ -25,6 +25,7 @@ export interface SpawnCleanup {
   requested: boolean
   terminationConfirmed: boolean
   method: 'shutdown' | 'rollback' | 'kill' | 'none'
+  directChildStarted?: boolean
   directChildPid?: number
   message?: string
 }
@@ -126,6 +127,7 @@ export interface WorkerReference {
   processIdentity: string
   endpoint: string
   protocolVersion: number
+  executable?: string
 }
 
 export interface SessionRecord {

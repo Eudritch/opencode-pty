@@ -356,16 +356,23 @@ export class SessionSupervisor {
         rows: 40,
       })
     } catch (error) {
-      record.status = 'spawn_failed'
-      record.terminationConfirmed = true
+      const cleanup =
+        error instanceof WorkerStartError
+          ? error.cleanup
+          : { requested: false, terminationConfirmed: false, method: 'none' as const }
+      record.status = cleanup.terminationConfirmed ? 'spawn_failed' : 'lost'
+      record.terminationRequested = cleanup.requested
+      record.terminationConfirmed = cleanup.terminationConfirmed
       record.exitReason = {
         kind: 'spawn_error',
         message: error instanceof Error ? error.message : String(error),
+        cleanup,
       }
       record.updatedAt = new Date().toISOString()
       await this.storage.writeSession(record)
       throw new ProcessError(
-        `Failed to spawn PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
+        `Failed to spawn PTY '${id}': ${error instanceof Error ? error.message : String(error)}`,
+        { cleanup }
       )
     }
     const initial = await started.client.snapshot()
@@ -409,8 +416,8 @@ export class SessionSupervisor {
     if (!worker || record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
     let afterSequence: number
     try {
-      // The worker returns the cursor held while it accepted input, so an immediate reply is not
-      // hidden by a later snapshot.
+      // The worker returns the cursor immediately after accepting input, excluding prior output
+      // while preserving an immediate reply.
       afterSequence = (await worker.write(data)).arrivalSequence
     } catch (error) {
       throw new ProcessError(

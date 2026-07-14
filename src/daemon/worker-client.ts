@@ -25,6 +25,7 @@ export interface WorkerReference {
   processIdentity: string
   endpoint: string
   protocolVersion: number
+  executable?: string
 }
 
 export interface WorkerBootstrap {
@@ -258,8 +259,9 @@ export class WorkerClient {
     )
     if (payload.byteLength > 1024 * 1024)
       throw new Error('native_worker_unavailable: bootstrap too large.')
+    const command = workerCommand()
     const child = Bun.spawn({
-      cmd: workerCommand(),
+      cmd: command,
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'inherit',
@@ -267,23 +269,45 @@ export class WorkerClient {
     let identity: string | null = null
     let client: WorkerClient | undefined
     const cleanup = async (): Promise<SpawnCleanup> => {
-      if (client) return client.rollback()
       try {
         const receipt = JSON.parse(
           await readFile(join(bootstrap.sessionDirectory, 'spawn-failure.json'), 'utf8')
-        ) as { terminationConfirmed?: unknown; message?: unknown }
+        ) as {
+          workerId?: unknown
+          workerPid?: unknown
+          workerProcessIdentity?: unknown
+          workerControlToken?: unknown
+          directChildStarted?: unknown
+          directChildPid?: unknown
+          terminationConfirmed?: unknown
+          message?: unknown
+        }
         if (
+          receipt.workerId === workerId &&
+          receipt.workerPid === child.pid &&
+          receipt.workerProcessIdentity === identity &&
+          receipt.workerControlToken === workerControlToken &&
+          typeof receipt.directChildStarted === 'boolean' &&
+          (receipt.directChildStarted
+            ? Number.isSafeInteger(receipt.directChildPid) && (receipt.directChildPid as number) > 0
+            : receipt.directChildPid === null || receipt.directChildPid === undefined) &&
           typeof receipt.terminationConfirmed === 'boolean' &&
           typeof receipt.message === 'string'
-        ) {
+        )
           return {
-            requested: true,
+            requested: receipt.directChildStarted,
             terminationConfirmed: receipt.terminationConfirmed,
-            method: 'rollback',
+            method: receipt.directChildStarted ? 'rollback' : 'none',
+            directChildStarted: receipt.directChildStarted,
+            ...(receipt.directChildStarted &&
+            Number.isSafeInteger(receipt.directChildPid) &&
+            (receipt.directChildPid as number) > 0
+              ? { directChildPid: receipt.directChildPid as number }
+              : {}),
             message: receipt.message,
           }
-        }
       } catch {}
+      if (client) return client.rollback()
       try {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
         if (
@@ -376,6 +400,7 @@ export class WorkerClient {
                 processIdentity: descriptor.processIdentity,
                 endpoint: descriptor.endpoint,
                 protocolVersion: descriptor.protocolVersion,
+                executable: command[0],
               },
             }
           } catch {

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, realpathSync, watch } from 'node:fs'
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -943,6 +943,87 @@ test('sendWait observes an immediate response after accepted input', async () =>
   }
 })
 
+test('sendWait excludes drained pre-acceptance output and observes its immediate reply', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-buffered-'))
+  roots.push(root)
+  const marker = join(root, 'buffered')
+  let watcher: ReturnType<typeof watch> | undefined
+  const markerReady = new Promise<void>((resolve, reject) => {
+    watcher = watch(root, (_event, filename) => {
+      if (filename !== 'buffered') return
+      watcher?.close()
+      resolve()
+    })
+    watcher.on('error', reject)
+  })
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const session = await supervisor.spawn({
+    command: process.execPath,
+    args: [
+      '-e',
+      `process.stdin.setRawMode(true); process.stdout.write('old\\n'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new\\n'))`,
+    ],
+    env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'pause_terminal_reader_until_write' },
+    parentSessionId: 'parent',
+    workdir: root,
+  })
+  try {
+    await markerReady
+    expect(existsSync(marker)).toBeTrue()
+    await expect(
+      supervisor.sendWait(session.id, 'x', { kind: 'output', regex: 'old|new' }, 1)
+    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'new' })
+  } finally {
+    watcher?.close()
+    await supervisor.stop(session.id).catch(() => undefined)
+    await supervisor.flush()
+  }
+})
+
+test('sendWait flushes a held redaction tail before its input boundary', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-redaction-tail-'))
+  roots.push(root)
+  const marker = join(root, 'buffered')
+  let watcher: ReturnType<typeof watch> | undefined
+  const markerReady = new Promise<void>((resolve, reject) => {
+    watcher = watch(root, (_event, filename) => {
+      if (filename !== 'buffered') return
+      watcher?.close()
+      resolve()
+    })
+    watcher.on('error', reject)
+  })
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const session = await supervisor.spawn({
+    command: process.execPath,
+    args: [
+      '-e',
+      `process.stdin.setRawMode(true); process.stdout.write('old-match'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new-match\\n'))`,
+    ],
+    env: {
+      API_TOKEN: 'tail-secret',
+      OPENCODE_PTY_NATIVE_WORKER_FAULT: 'pause_terminal_reader_until_write',
+    },
+    parentSessionId: 'parent',
+    workdir: root,
+  })
+  try {
+    await markerReady
+    await expect(
+      supervisor.sendWait(session.id, 'x', { kind: 'output', regex: 'old-match|new-match' }, 1)
+    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'new-match' })
+    expect((await supervisor.read(session.id)).lines.join('\n')).not.toContain('tail-secret')
+  } finally {
+    watcher?.close()
+    await supervisor.stop(session.id).catch(() => undefined)
+    await supervisor.flush()
+  }
+})
+
 test('exec output remains separately recoverable after restart', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-record-'))
   roots.push(root)
@@ -1173,6 +1254,43 @@ test('native startup failures clean up the direct child and report the proven ou
       exitReason: { kind: 'spawn_error', cleanup: { terminationConfirmed: true } },
     })
 
+    const commandFailure = await rpc(
+      descriptor,
+      'exec',
+      {
+        command: join(root, 'does-not-exist'),
+        args: [],
+        timeoutSeconds: 2,
+      },
+      context
+    ).then((response) => response.json())
+    expect(commandFailure).toMatchObject({
+      ok: false,
+      error: {
+        code: 'process',
+        spawnFailure: {
+          cleanup: {
+            requested: false,
+            terminationConfirmed: true,
+            method: 'none',
+            directChildStarted: false,
+          },
+        },
+      },
+    })
+    const commandRecord = (await storage.loadSessions()).find(
+      (record) =>
+        record.exitReason?.kind === 'spawn_error' &&
+        record.exitReason.cleanup?.directChildStarted === false
+    )
+    expect(commandRecord).toMatchObject({
+      status: 'spawn_failed',
+      pid: 0,
+      terminationRequested: false,
+      terminationConfirmed: true,
+      exitReason: { cleanup: { directChildStarted: false } },
+    })
+
     const readinessFailure = await rpc(
       descriptor,
       'exec',
@@ -1213,6 +1331,55 @@ test('native startup failures clean up the direct child and report the proven ou
         cleanup: { requested: true, terminationConfirmed: true, method: 'rollback' },
       },
     })
+    if (process.platform === 'linux' || process.platform === 'darwin') {
+      const containmentFailure = await rpc(
+        descriptor,
+        'exec',
+        {
+          command: process.execPath,
+          args: ['-e', 'setInterval(() => {}, 1000)'],
+          env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'unverified_containment' },
+          timeoutSeconds: 2,
+        },
+        context
+      ).then((response) => response.json())
+      if (process.platform === 'linux')
+        expect(containmentFailure).toMatchObject({
+          error: {
+            spawnFailure: {
+              cleanup: { requested: true, terminationConfirmed: true, method: 'rollback' },
+            },
+          },
+        })
+      else
+        expect(containmentFailure).toMatchObject({
+          error: {
+            spawnFailure: {
+              cleanup: { requested: true, terminationConfirmed: false, method: 'rollback' },
+            },
+          },
+        })
+      const containmentRecord = (await storage.loadSessions()).find(
+        (record) =>
+          record.exitReason?.kind === 'spawn_error' &&
+          record.exitReason.message.includes('injected containment verification failure')
+      )
+      expect(containmentRecord).toMatchObject(
+        process.platform === 'linux'
+          ? {
+              status: 'spawn_failed',
+              terminationRequested: true,
+              terminationConfirmed: true,
+              exitReason: { cleanup: { directChildPid: expect.any(Number) } },
+            }
+          : {
+              status: 'lost',
+              terminationRequested: true,
+              terminationConfirmed: false,
+              exitReason: { cleanup: { directChildPid: expect.any(Number) } },
+            }
+      )
+    }
   } finally {
     await server.stop()
     if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED

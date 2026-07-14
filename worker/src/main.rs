@@ -215,6 +215,14 @@ struct Worker {
     child: Mutex<Child>,
     #[cfg(unix)]
     terminal: Option<Mutex<File>>,
+    // Serializes terminal reads with input acceptance so the cursor is taken immediately after
+    // the terminal accepts input, excluding earlier output without missing an immediate reply.
+    #[cfg(unix)]
+    arrival: Mutex<()>,
+    #[cfg(unix)]
+    terminal_redaction_tail: Mutex<String>,
+    #[cfg(unix)]
+    pause_terminal_reader_until_write: AtomicBool,
     state: Mutex<State>,
     secrets: Vec<String>,
     output_directory: PathBuf,
@@ -227,13 +235,19 @@ struct Worker {
 #[cfg(unix)]
 struct SpawnCleanup {
     confirmed: bool,
+    direct_child_pid: u32,
     message: String,
 }
 
-#[cfg(unix)]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SpawnFailureReceipt {
+    worker_id: String,
+    worker_pid: u32,
+    worker_process_identity: String,
+    worker_control_token: String,
+    direct_child_started: bool,
+    direct_child_pid: Option<u32>,
     termination_confirmed: bool,
     message: String,
 }
@@ -318,6 +332,20 @@ fn redact(mut data: String, secrets: &[String]) -> String {
     data
 }
 
+fn redact_tail(tail: String, secrets: &[String]) -> String {
+    let characters: Vec<_> = tail.chars().collect();
+    for secret in secrets {
+        let secret: Vec<_> = secret.chars().collect();
+        if characters.len() >= 4
+            && characters.len() < secret.len()
+            && characters == secret[..characters.len()]
+        {
+            return "[REDACTED]".into();
+        }
+    }
+    redact(tail, secrets)
+}
+
 fn redact_stream(data: String, tail: &mut String, secrets: &[String], finish: bool) -> String {
     let combined = format!("{tail}{data}");
     let hold = if finish {
@@ -354,7 +382,7 @@ fn redact_stream(data: String, tail: &mut String, secrets: &[String], finish: bo
     *tail = combined[byte..].to_string();
     let mut redacted = redact(safe, secrets);
     if finish {
-        redacted.push_str(&redact(std::mem::take(tail), secrets));
+        redacted.push_str(&redact_tail(std::mem::take(tail), secrets));
     }
     redacted
 }
@@ -373,6 +401,32 @@ fn write_atomic(path: &Path, data: &str) -> std::io::Result<()> {
     drop(file);
     rename(&temporary, path)?;
     private_file(path)
+}
+
+fn write_spawn_failure(
+    session_directory: &Path,
+    bootstrap: &Bootstrap,
+    descriptor: &Descriptor,
+    direct_child_started: bool,
+    direct_child_pid: Option<u32>,
+    termination_confirmed: bool,
+    message: &str,
+) -> Result<(), String> {
+    write_atomic(
+        &session_directory.join("spawn-failure.json"),
+        &serde_json::to_string(&SpawnFailureReceipt {
+            worker_id: bootstrap.worker_id.clone(),
+            worker_pid: std::process::id(),
+            worker_process_identity: descriptor.process_identity.clone(),
+            worker_control_token: bootstrap.worker_control_token.clone(),
+            direct_child_started,
+            direct_child_pid,
+            termination_confirmed,
+            message: message.into(),
+        })
+        .expect("spawn failure receipt serializes"),
+    )
+    .map_err(|error| format!("could not persist spawn failure receipt: {error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -947,6 +1001,7 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
             terminate_child_and_wait(child);
             return SpawnCleanup {
                 confirmed: false,
+                direct_child_pid: pid,
                 message: "spawn containment could not verify the child identity; root was reaped but descendants are unknown".into(),
             };
         };
@@ -969,6 +1024,7 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
         let report = containment_report(&containment);
         return SpawnCleanup {
             confirmed: containment_drained(&report),
+            direct_child_pid: pid,
             message: if containment_drained(&report) {
                 "unverified spawn session was terminated".into()
             } else {
@@ -984,6 +1040,7 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
         terminate_child_and_wait(child);
         SpawnCleanup {
             confirmed: false,
+            direct_child_pid: child.id(),
             message: "spawn containment verification is unavailable; direct child was reaped but descendants are unknown".into(),
         }
     }
@@ -1058,6 +1115,9 @@ fn pty_child(command: &mut Command, cols: u16, rows: u16) -> Result<(Child, File
     }
     // openpty returned owned descriptors; every Command stream gets its own duplicate.
     let master = unsafe { File::from_raw_fd(master) };
+    if unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
     let slave = unsafe { File::from_raw_fd(slave) };
     let slave_fd = slave.as_raw_fd();
     let stdin = slave.try_clone().map_err(|error| error.to_string())?;
@@ -1340,6 +1400,88 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
     });
 }
 
+#[cfg(unix)]
+fn append_terminal_output(worker: &Arc<Worker>, data: String, finish: bool) {
+    let mut tail = worker
+        .terminal_redaction_tail
+        .lock()
+        .expect("terminal redaction tail lock");
+    append_output(
+        worker,
+        true,
+        redact_stream(data, &mut tail, &worker.secrets, finish),
+    );
+}
+
+#[cfg(unix)]
+fn flush_terminal_redaction_tail(worker: &Arc<Worker>) {
+    append_terminal_output(worker, String::new(), true);
+}
+
+#[cfg(unix)]
+fn terminal_reader(worker: Arc<Worker>, mut terminal: File) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let arrival = worker.arrival.lock().expect("arrival lock");
+            if worker
+                .pause_terminal_reader_until_write
+                .load(Ordering::Acquire)
+            {
+                drop(arrival);
+                thread::yield_now();
+                continue;
+            }
+            match terminal.read(&mut buffer) {
+                Ok(0) => {
+                    append_terminal_output(&worker, String::new(), true);
+                    mark_reader_eof(&worker, true);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    append_terminal_output(&worker, String::new(), true);
+                    if error.raw_os_error() == Some(libc::EIO) {
+                        mark_reader_eof(&worker, true);
+                    } else {
+                        let mut state = worker.state.lock().expect("state lock");
+                        mark_reader_failure(&mut state, true, error.to_string());
+                    }
+                    return;
+                }
+                Ok(size) => append_terminal_output(
+                    &worker,
+                    String::from_utf8_lossy(&buffer[..size]).into_owned(),
+                    false,
+                ),
+            }
+            drop(arrival);
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+}
+
+#[cfg(unix)]
+fn drain_terminal(worker: &Arc<Worker>, terminal: &mut File) {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match terminal.read(&mut buffer) {
+            Ok(0) | Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
+            Err(error) => {
+                let mut state = worker.state.lock().expect("state lock");
+                mark_reader_failure(&mut state, true, error.to_string());
+                return;
+            }
+            Ok(size) => append_terminal_output(
+                worker,
+                String::from_utf8_lossy(&buffer[..size]).into_owned(),
+                false,
+            ),
+        }
+    }
+}
+
 fn monitor(worker: Arc<Worker>) {
     thread::spawn(move || {
         loop {
@@ -1440,6 +1582,33 @@ mod tests {
     }
 
     #[test]
+    fn redaction_tail_flushes_before_an_input_boundary() {
+        let mut tail = String::new();
+        assert_eq!(
+            redact_stream(
+                "old-match".into(),
+                &mut tail,
+                &["tail-secret".into()],
+                false
+            ),
+            ""
+        );
+        assert_eq!(
+            redact_stream(String::new(), &mut tail, &["tail-secret".into()], true),
+            "old-match"
+        );
+        assert!(tail.is_empty());
+        assert_eq!(
+            redact_stream("tail-sec".into(), &mut tail, &["tail-secret".into()], false),
+            ""
+        );
+        assert_eq!(
+            redact_stream(String::new(), &mut tail, &["tail-secret".into()], true),
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
     fn reader_drain_timeout_marks_output_incomplete() {
         let mut state = State {
             termination_confirmed: true,
@@ -1475,6 +1644,12 @@ mod tests {
             child: Mutex::new(child),
             #[cfg(unix)]
             terminal: None,
+            #[cfg(unix)]
+            arrival: Mutex::new(()),
+            #[cfg(unix)]
+            terminal_redaction_tail: Mutex::new(String::new()),
+            #[cfg(unix)]
+            pause_terminal_reader_until_write: AtomicBool::new(false),
             state: Mutex::new(State {
                 started_at: now(),
                 ..State::default()
@@ -1738,11 +1913,10 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             }
             #[cfg(unix)]
             if let Some(terminal) = &worker.terminal {
-                // Hold the journal cursor across terminal acceptance. A reader cannot append
-                // between this boundary and the write, so immediate replies remain waitable.
-                let state = worker.state.lock().expect("state lock");
-                let arrival_sequence = state.next_sequence;
+                let _arrival = worker.arrival.lock().expect("arrival lock");
                 let mut terminal = terminal.lock().expect("terminal lock");
+                drain_terminal(worker, &mut terminal);
+                flush_terminal_redaction_tail(worker);
                 terminal
                     .write_all(data.as_bytes())
                     .map_err(|error| WorkerError {
@@ -1753,6 +1927,10 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                     code: "process",
                     message: error.to_string(),
                 })?;
+                let arrival_sequence = worker.state.lock().expect("state lock").next_sequence;
+                worker
+                    .pause_terminal_reader_until_write
+                    .store(false, Ordering::Release);
                 return Ok((
                     json!({"acceptedBytes": data.len(), "arrivalSequence": arrival_sequence}),
                     false,
@@ -2013,35 +2191,79 @@ fn main() -> Result<(), String> {
         .env_clear()
         .envs(&bootstrap.env);
     #[cfg(unix)]
-    let (mut child, terminal) = if bootstrap.mode == "pty" {
+    let spawned = if bootstrap.mode == "pty" {
         pty_child(
             &mut command,
             bootstrap.cols.unwrap_or(120).clamp(1, 1000),
             bootstrap.rows.unwrap_or(40).clamp(1, 1000),
         )
-        .map(|(child, terminal)| (child, Some(terminal)))?
+        .map(|(child, terminal)| (child, Some(terminal)))
     } else {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         contain_child(&mut command);
-        (command.spawn().map_err(|error| error.to_string())?, None)
+        command
+            .spawn()
+            .map(|child| (child, None))
+            .map_err(|error| error.to_string())
     };
     #[cfg(not(unix))]
-    let mut child = {
+    let spawned = {
         if bootstrap.mode == "pty" {
-            return Err("native PTY is unavailable on this platform".into());
+            Err("native PTY is unavailable on this platform".into())
+        } else {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command.spawn().map_err(|error| error.to_string())
         }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command.spawn().map_err(|error| error.to_string())?
     };
-    let containment = match verify_containment(child.id()) {
+    #[cfg(unix)]
+    let (mut child, terminal) = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            write_spawn_failure(
+                &session_directory,
+                &bootstrap,
+                &descriptor,
+                false,
+                None,
+                true,
+                &error,
+            )?;
+            let _ = remove_file(&descriptor_path);
+            return Err(error);
+        }
+    };
+    #[cfg(not(unix))]
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            write_spawn_failure(
+                &session_directory,
+                &bootstrap,
+                &descriptor,
+                false,
+                None,
+                true,
+                &error,
+            )?;
+            let _ = remove_file(&descriptor_path);
+            return Err(error);
+        }
+    };
+    let containment = match if bootstrap.fault.as_deref() == Some("unverified_containment") {
+        Err("injected containment verification failure".into())
+    } else {
+        verify_containment(child.id())
+    } {
         Ok(containment) => containment,
         Err(error) => {
+            #[cfg(not(unix))]
+            let child_pid = child.id();
             #[cfg(unix)]
             let cleanup = cleanup_unverified_spawn(&mut child);
             #[cfg(not(unix))]
@@ -2049,14 +2271,25 @@ fn main() -> Result<(), String> {
                 terminate_child_and_wait(&mut child);
             }
             #[cfg(unix)]
-            let _ = write_atomic(
-                &session_directory.join("spawn-failure.json"),
-                &serde_json::to_string(&SpawnFailureReceipt {
-                    termination_confirmed: cleanup.confirmed,
-                    message: cleanup.message.clone(),
-                })
-                .expect("spawn failure receipt serializes"),
-            );
+            write_spawn_failure(
+                &session_directory,
+                &bootstrap,
+                &descriptor,
+                true,
+                Some(cleanup.direct_child_pid),
+                cleanup.confirmed,
+                &cleanup.message,
+            )?;
+            #[cfg(not(unix))]
+            write_spawn_failure(
+                &session_directory,
+                &bootstrap,
+                &descriptor,
+                true,
+                Some(child_pid),
+                true,
+                &error,
+            )?;
             let _ = remove_file(&descriptor_path);
             #[cfg(unix)]
             return Err(format!("{error}; {}", cleanup.message));
@@ -2071,9 +2304,29 @@ fn main() -> Result<(), String> {
             Some(stdout) => stdout,
             None => {
                 #[cfg(unix)]
-                terminate_contained_child_and_wait(&mut child, &containment);
+                let cleanup = cleanup_unverified_spawn(&mut child);
                 #[cfg(not(unix))]
                 terminate_child_and_wait(&mut child);
+                #[cfg(unix)]
+                write_spawn_failure(
+                    &session_directory,
+                    &bootstrap,
+                    &descriptor,
+                    true,
+                    Some(cleanup.direct_child_pid),
+                    cleanup.confirmed,
+                    &cleanup.message,
+                )?;
+                #[cfg(not(unix))]
+                write_spawn_failure(
+                    &session_directory,
+                    &bootstrap,
+                    &descriptor,
+                    true,
+                    Some(child.id()),
+                    true,
+                    "missing stdout",
+                )?;
                 let _ = remove_file(&descriptor_path);
                 return Err("missing stdout".into());
             }
@@ -2082,9 +2335,29 @@ fn main() -> Result<(), String> {
             Some(stderr) => stderr,
             None => {
                 #[cfg(unix)]
-                terminate_contained_child_and_wait(&mut child, &containment);
+                let cleanup = cleanup_unverified_spawn(&mut child);
                 #[cfg(not(unix))]
                 terminate_child_and_wait(&mut child);
+                #[cfg(unix)]
+                write_spawn_failure(
+                    &session_directory,
+                    &bootstrap,
+                    &descriptor,
+                    true,
+                    Some(cleanup.direct_child_pid),
+                    cleanup.confirmed,
+                    &cleanup.message,
+                )?;
+                #[cfg(not(unix))]
+                write_spawn_failure(
+                    &session_directory,
+                    &bootstrap,
+                    &descriptor,
+                    true,
+                    Some(child.id()),
+                    true,
+                    "missing stderr",
+                )?;
                 let _ = remove_file(&descriptor_path);
                 return Err("missing stderr".into());
             }
@@ -2095,6 +2368,14 @@ fn main() -> Result<(), String> {
         child: Mutex::new(child),
         #[cfg(unix)]
         terminal: terminal.map(Mutex::new),
+        #[cfg(unix)]
+        arrival: Mutex::new(()),
+        #[cfg(unix)]
+        terminal_redaction_tail: Mutex::new(String::new()),
+        #[cfg(unix)]
+        pause_terminal_reader_until_write: AtomicBool::new(
+            bootstrap.fault.as_deref() == Some("pause_terminal_reader_until_write"),
+        ),
         state: Mutex::new(State {
             started_at: now(),
             ..State::default()
@@ -2115,15 +2396,32 @@ fn main() -> Result<(), String> {
     if bootstrap.mode == "pty" {
         #[cfg(unix)]
         {
-            let terminal = worker
+            let terminal = match worker
                 .terminal
                 .as_ref()
                 .expect("PTY terminal")
                 .lock()
                 .expect("terminal lock")
                 .try_clone()
-                .map_err(|error| error.to_string())?;
-            reader(worker.clone(), terminal, true);
+            {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    let mut child = worker.child.lock().expect("child lock");
+                    let cleanup = cleanup_unverified_spawn(&mut child);
+                    write_spawn_failure(
+                        &session_directory,
+                        &bootstrap,
+                        &descriptor,
+                        true,
+                        Some(cleanup.direct_child_pid),
+                        cleanup.confirmed,
+                        &cleanup.message,
+                    )?;
+                    let _ = remove_file(&descriptor_path);
+                    return Err(error.to_string());
+                }
+            };
+            terminal_reader(worker.clone(), terminal);
             mark_reader_eof(&worker, false); // A PTY intentionally has one merged output stream.
         }
     } else {

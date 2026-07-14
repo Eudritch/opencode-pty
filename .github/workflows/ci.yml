@@ -78,13 +78,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.0
       - run: bun ci
       - run: cargo build --locked --workspace
-      - name: Run full daemon/package suite
+      - name: Run daemon suite
         run: bun unittest
       - name: Lint native worker
         run: cargo clippy --locked --workspace -- -D warnings
       - run: bun build:prod
-      - name: Exercise native exec from the packed artifact
-        run: bun test/packaged-native-daemon.ts
+      - name: Packaged-worker smoke (assert Windows PTY fails closed)
+        run: bun package:smoke
       - name: Pack and import the artifact
         if: runner.os == 'Linux'
         run: |

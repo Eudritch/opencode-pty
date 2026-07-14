@@ -41,11 +41,11 @@ jobs:
       - run: bun ci
       - name: Build native worker
         run: cargo build --locked --release --workspace
-      - name: Run full daemon/package suite
+      - name: Run daemon suite
         run: bun unittest
       - run: bun build:prod
-      - name: Exercise native exec from the packed artifact
-        run: bun test/packaged-native-daemon.ts
+      - name: Packaged-worker smoke (assert Windows PTY fails closed)
+        run: bun package:smoke
       - name: Pack platform worker artifact
         shell: pwsh
         run: |-

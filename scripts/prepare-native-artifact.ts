@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { cp, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const platforms = {
@@ -20,7 +20,6 @@ const binary = join(
   `opencode-pty-worker${platform.os === 'win32' ? '.exe' : ''}`
 )
 await stat(binary)
-await rm(output, { recursive: true, force: true })
 await mkdir(join(output, 'bin'), { recursive: true })
 await cp(binary, join(output, 'bin', `opencode-pty-worker${platform.os === 'win32' ? '.exe' : ''}`))
 await writeFile(
