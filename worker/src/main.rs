@@ -475,27 +475,8 @@ fn containment_report_from_scan(
         observed_escaped_descendants: observed_escapes(containment),
         verified_at: now(),
     };
-    let relevant_pids = {
-        let known = containment
-            .known_members
-            .lock()
-            .expect("containment members lock");
-        let escapes = containment
-            .escaped_members
-            .lock()
-            .expect("escaped members lock");
-        known
-            .keys()
-            .chain(escapes.keys())
-            .copied()
-            .chain(std::iter::once(containment.root_pid))
-            .collect::<BTreeSet<_>>()
-    };
-    if scan
-        .unreadable_pids
-        .iter()
-        .any(|pid| relevant_pids.contains(pid))
-    {
+    // Every numeric /proc entry is a potential new group or session member until identified.
+    if !scan.unreadable_pids.is_empty() {
         return report(
             "posix_containment_unknown",
             false,
@@ -1277,7 +1258,7 @@ mod tests {
             },
         });
         reader(worker.clone(), FailingReader, true);
-        for _ in 0..50 {
+        for _ in 0..1_000 {
             if worker
                 .state
                 .lock()
@@ -1374,13 +1355,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unreadable_candidate_and_scan_to_signal_change_are_fail_closed() {
+    fn newly_unreadable_candidate_prevents_confirmation_and_signaling() {
         let containment = test_containment();
         let report = containment_report_from_scan(
             &containment,
             &ProcessScan {
-                processes: Vec::new(),
-                unreadable_pids: BTreeSet::from([11]),
+                processes: vec![ProcessInfo {
+                    pid: 10,
+                    ppid: 1,
+                    pgid: 10,
+                    sid: 10,
+                    start_time: "root".into(),
+                }],
+                unreadable_pids: BTreeSet::from([12]),
             },
         );
         assert_eq!(report.status, "posix_containment_unknown");
@@ -1394,12 +1381,12 @@ mod tests {
                         ppid: 1,
                         pgid: 10,
                         sid: 10,
-                        start_time: "reused".into(),
+                        start_time: "root".into(),
                     }],
-                    unreadable_pids: BTreeSet::new(),
+                    unreadable_pids: BTreeSet::from([12]),
                 })
             },
-            |_, _| panic!("must not signal after identity changes"),
+            |_, _| panic!("must not signal with an unreadable candidate"),
         );
         assert!(!sent);
         assert_eq!(report.status, "posix_containment_unknown");

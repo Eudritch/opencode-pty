@@ -464,7 +464,8 @@ export class DaemonStorage {
         (value.processGroupId === null || validOptionalInteger(value.processGroupId)) &&
         (value.sessionId === null || validOptionalInteger(value.sessionId)) &&
         validText(value.rootStartIdentity) &&
-        (value.rootIdentityVerified === undefined || typeof value.rootIdentityVerified === 'boolean') &&
+        (value.rootIdentityVerified === undefined ||
+          typeof value.rootIdentityVerified === 'boolean') &&
         [
           value.observedGroupPids,
           value.observedSessionPids,

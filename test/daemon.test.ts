@@ -1446,31 +1446,46 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
       if (!record) await Bun.sleep(20)
     }
     expect(record?.containment).toMatchObject({
-       platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
+      platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
       rootPid: record?.pid,
       processGroupId: record?.pid,
       sessionId: record?.pid,
     })
-    expect(
-      await rpc(descriptor, 'stop', { id: record?.id }, context).then((response) => response.json())
-    ).toMatchObject({
-      result: {
-        containment: {
-          status:
-            process.platform === 'linux'
-              ? 'posix_best_effort_empty'
-               : 'posix_containment_unknown',
+    const stopped = await rpc(descriptor, 'stop', { id: record?.id }, context).then((response) =>
+      response.json()
+    )
+    if (process.platform === 'linux') {
+      expect(stopped).toMatchObject({
+        result: {
+          containment: { status: 'posix_best_effort_empty' },
         },
-      },
-    })
+      })
+    } else {
+      expect(stopped).toMatchObject({
+        result: {
+          containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
+          termination: { termSignalSent: false, killSignalSent: false },
+        },
+      })
+    }
     await running
 
     const termIgnoring = await run("process.on('SIGTERM',()=>{});setInterval(()=>{},1000)").then(
       (response) => response.json()
     )
-    expect(termIgnoring).toMatchObject({
-      result: { timedOut: true, termination: { killSignalSent: true } },
-    })
+    expect(termIgnoring).toMatchObject(
+      process.platform === 'linux'
+        ? {
+            result: { timedOut: true, termination: { termSignalSent: true, killSignalSent: true } },
+          }
+        : {
+            result: {
+              timedOut: true,
+              containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
+              termination: { termSignalSent: false, killSignalSent: false },
+            },
+          }
+    )
 
     const escaped = run(
       "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});console.log(child.pid);setInterval(()=>{},1000)"

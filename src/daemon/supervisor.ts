@@ -649,16 +649,16 @@ export class SessionSupervisor {
           : this.exitReason(child.exitCode, child.signalCode ?? undefined)
     record.outputBytes = out.bytes + err.bytes
     record.outputTruncated = out.limited || err.limited
-      record.execOutput = {
-        stdout: out.data,
-        stderr: err.data,
-        stdoutBytes: out.bytes,
-        stderrBytes: err.bytes,
-        stdoutTruncated: out.limited,
-        stderrTruncated: err.limited,
-        containment: record.containment,
-        termination: record.termination,
-      }
+    record.execOutput = {
+      stdout: out.data,
+      stderr: err.data,
+      stdoutBytes: out.bytes,
+      stderrBytes: err.bytes,
+      stdoutTruncated: out.limited,
+      stderrTruncated: err.limited,
+      containment: record.containment,
+      termination: record.termination,
+    }
     record.terminationConfirmed = !stillRunning
     record.exitedAt = exitedAt
     record.updatedAt = exitedAt
@@ -1016,14 +1016,22 @@ export class SessionSupervisor {
     )
   }
 
-  async rawOutput(
-    id: string
-  ): Promise<{ raw: string; byteLength: number; containment?: SessionRecord['containment']; termination?: SessionRecord['termination'] } | null> {
+  async rawOutput(id: string): Promise<{
+    raw: string
+    byteLength: number
+    containment?: SessionRecord['containment']
+    termination?: SessionRecord['termination']
+  } | null> {
     await this.flush()
     const record = this.records.get(id)
     if (!record) return null
     const raw = await this.storage.readOutput(id)
-    return { raw, byteLength: Buffer.byteLength(raw), containment: record.containment, termination: record.termination }
+    return {
+      raw,
+      byteLength: Buffer.byteLength(raw),
+      containment: record.containment,
+      termination: record.termination,
+    }
   }
 
   async execOutput(id: string): Promise<import('./types.ts').ExecOutput | null> {
