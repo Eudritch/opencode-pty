@@ -267,6 +267,8 @@ jobs:
 
       - name: Publish to npm
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        env:
+          NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY: ${{ secrets.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           bun native:publish native-artifacts "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
