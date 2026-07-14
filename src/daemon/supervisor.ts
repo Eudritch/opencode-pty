@@ -151,18 +151,27 @@ function environmentProfile(env: Record<string, string>, inherited: boolean): En
   }
 }
 
-function runtimeEnvironment(
+export function runtimeEnvironment(
   requested: Record<string, string> | undefined,
-  inherit: boolean
+  inherit: boolean,
+  source: NodeJS.ProcessEnv = process.env,
+  windows = process.platform === 'win32'
 ): Record<string, string> {
+  const isPath = (key: string) => (windows ? key.toUpperCase() === 'PATH' : key === 'PATH')
+  const trustedPath = Object.entries(source).find(([key]) => isPath(key))?.[1]
   const base = inherit
-    ? process.env
+    ? source
     : Object.fromEntries(
-        Object.entries(process.env).filter(
-          ([key]) => SAFE_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_')
+        Object.entries(source).filter(
+          ([key]) => isPath(key) || SAFE_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_')
         )
       )
-  return { ...base, ...requested } as Record<string, string>
+  const environment = Object.fromEntries(
+    [...Object.entries(base), ...Object.entries(requested ?? {})].filter(([key]) => !isPath(key))
+  ) as Record<string, string>
+  // ponytail: command lookup gets only the daemon's PATH; callers cannot redirect an allowed bare command.
+  if (trustedPath !== undefined) environment.PATH = trustedPath
+  return environment
 }
 
 export class OutputRedactor {

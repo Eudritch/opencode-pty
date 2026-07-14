@@ -8,6 +8,7 @@ import { DaemonStorage } from '../src/daemon/storage.ts'
 import {
   effectiveMaxOutputBytes,
   ProcessError,
+  runtimeEnvironment,
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
@@ -47,6 +48,22 @@ if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_PATH ??= nativeW
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+})
+
+test('runtime environment keeps a single trusted PATH despite caller overrides', () => {
+  const environment = runtimeEnvironment(
+    { PATH: '.', Path: 'also-malicious', CUSTOM: 'preserved' },
+    false,
+    { Path: 'trusted-path', HOME: 'trusted-home' },
+    true
+  )
+
+  expect(environment).toMatchObject({
+    PATH: 'trusted-path',
+    HOME: 'trusted-home',
+    CUSTOM: 'preserved',
+  })
+  expect(Object.keys(environment).filter((key) => key.toUpperCase() === 'PATH')).toEqual(['PATH'])
 })
 
 function record(

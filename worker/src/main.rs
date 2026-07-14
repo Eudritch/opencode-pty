@@ -497,17 +497,7 @@ fn resolve_windows_executable(
     let extensions = if command_path.extension().is_some() {
         vec![String::new()]
     } else {
-        let extensions = windows_environment_value(env, "PATHEXT")
-            .unwrap_or(".COM;.EXE")
-            .split(';')
-            .filter(|extension| matches!(extension.to_ascii_uppercase().as_str(), ".COM" | ".EXE"))
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if extensions.is_empty() {
-            vec![".COM".into(), ".EXE".into()]
-        } else {
-            extensions
-        }
+        vec![".COM".into(), ".EXE".into()]
     };
     for entry in windows_environment_value(env, "PATH")
         .unwrap_or_default()
