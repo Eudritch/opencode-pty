@@ -658,6 +658,7 @@ export class SessionSupervisor {
       timedOut: record.timedOut,
       outputLimited: record.outputTruncated,
       terminationConfirmed: record.terminationConfirmed,
+      containment: record.containment,
       startedAt: now,
       exitedAt,
     }
@@ -736,7 +737,10 @@ export class SessionSupervisor {
       await this.storage.writeSession(record)
       throw new ProcessError(String(error), { cleanup })
     }
-    record.pid = (await started.client.snapshot()).pid
+    const initial = await started.client.snapshot()
+    record.pid = initial.pid
+    record.containment = initial.containment
+    record.termination = initial.termination
     record.worker = started.reference
     record.status = 'running'
     record.updatedAt = new Date().toISOString()
@@ -850,6 +854,8 @@ export class SessionSupervisor {
     record.exitSignal = result.exitSignal ?? undefined
     record.terminationRequested = result.terminationRequested
     record.terminationConfirmed = result.terminationConfirmed
+    record.containment = result.containment
+    record.termination = result.termination
     record.storageFailure = result.storageFailure ?? undefined
     if (result.storageFailure || result.readerFailure || result.outputIncomplete)
       record.exitReason = {
@@ -895,6 +901,8 @@ export class SessionSupervisor {
       timedOut: record.timedOut,
       outputLimited: record.outputTruncated,
       terminationConfirmed: record.terminationConfirmed,
+      containment: record.containment,
+      termination: record.termination,
       startedAt: record.startedAt ?? record.createdAt,
       exitedAt: record.exitedAt ?? record.updatedAt,
     }
@@ -1005,13 +1013,23 @@ export class SessionSupervisor {
       await this.storage.writeSession(record)
       const result = await native.stop()
       await this.finalizeNative(record, native, result)
-      return { requested: true, terminationConfirmed: record.terminationConfirmed }
+      return {
+        requested: true,
+        terminationConfirmed: record.terminationConfirmed,
+        containment: record.containment,
+        termination: record.termination,
+      }
     }
     const active = this.active.get(id)
     if (!active) {
       const record = this.records.get(id)
       if (!record) throw new Error(`PTY session '${id}' not found.`)
-      return { requested: false, terminationConfirmed: record.terminationConfirmed }
+      return {
+        requested: false,
+        terminationConfirmed: record.terminationConfirmed,
+        containment: record.containment,
+        termination: record.termination,
+      }
     }
     if (active.record.terminationRequested) {
       return { requested: true, terminationConfirmed: false }

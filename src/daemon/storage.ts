@@ -445,6 +445,45 @@ export class DaemonStorage {
         value.protocolVersion === 1
       )
     }
+    const validContainment = (containment: unknown): boolean => {
+      if (containment === undefined) return true
+      if (!containment || typeof containment !== 'object') return false
+      const value = containment as Record<string, unknown>
+      return (
+        ['linux_proc', 'posix_verification_unavailable', 'not_applicable'].includes(
+          String(value.platform)
+        ) &&
+        [
+          'posix_best_effort_empty',
+          'posix_processes_remaining',
+          'posix_escape_observed',
+          'posix_verification_unavailable',
+          'not_applicable',
+        ].includes(String(value.status)) &&
+        validNonnegativeInteger(value.rootPid) &&
+        (value.processGroupId === null || validOptionalInteger(value.processGroupId)) &&
+        (value.sessionId === null || validOptionalInteger(value.sessionId)) &&
+        validText(value.rootStartIdentity) &&
+        [
+          value.observedGroupPids,
+          value.observedSessionPids,
+          value.observedEscapedDescendantPids,
+        ].every((pids) => Array.isArray(pids) && pids.every(validNonnegativeInteger)) &&
+        validTimestamp(value.verifiedAt)
+      )
+    }
+    const validTermination = (termination: unknown): boolean => {
+      if (termination === undefined || termination === null) return true
+      if (!termination || typeof termination !== 'object') return false
+      const value = termination as Record<string, unknown>
+      return (
+        typeof value.requested === 'boolean' &&
+        typeof value.termSignalSent === 'boolean' &&
+        typeof value.killSignalSent === 'boolean' &&
+        typeof value.rootExited === 'boolean' &&
+        validContainment(value.containment)
+      )
+    }
     if (
       value.id !== id ||
       !validText(value.title) ||
@@ -493,6 +532,8 @@ export class DaemonStorage {
       !validEnvironment(value.environment) ||
       !validExecOutput(value.execOutput) ||
       !validWorker(value.worker) ||
+      !validContainment(value.containment) ||
+      !validTermination(value.termination) ||
       !validOptionalText(value.storageFailure) ||
       !validWait(value.lastWaitResult)
     ) {

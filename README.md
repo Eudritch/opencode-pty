@@ -36,7 +36,7 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 
 The installed OpenCode plugin SDK (1.3.13) exposes config reads and permission hooks, but no callable evaluator or prompt request API for a tool. Before every `pty_spawn` and `shell_exec`, this plugin reads OpenCode's merged config and locally applies the documented ruleset: global `permission` rules are evaluated in declaration order, then `agent.<agent>.permission` rules in declaration order, with the last matching rule winning. Thus an agent deny overrides a global allow, and an agent allow overrides a global deny. Only an effective matching `allow` permits a command; absent, unmatched, `ask`, unreadable, malformed, and `deny` rules deny it. Rules match the executable followed by the complete argv using OpenCode wildcards. External directories use canonical containment and require an effective matching `external_directory` allow for the resolved path. This is not an authoritative OpenCode permission invocation.
 
-This tranche does not provide Job Objects/cgroups, terminal emulation, signed binaries, OS CPU/memory limits, or native descendant-process termination guarantees. Native termination is direct-child only. PTY sessions remain legacy Bun/bun-pty sessions: they are not worker-contained and have no worker recovery until native ConPTY/POSIX PTY support is added.
+On Linux native `shell_exec` runs its child in a fresh POSIX session/process group. Timeout, output caps, rollback, and stop send `SIGTERM` to that group, then `SIGKILL` after a bounded grace period. Linux reports its `/proc` scan in `containment`/`termination`; only `posix_best_effort_empty` means that scan observed no remaining group or session members. It is not an absolute containment guarantee: a child can call `setsid`, and observed escapes are reported when still attributable. macOS reports verification unavailable conservatively. PTY sessions remain legacy Bun/bun-pty sessions: they are not worker-contained. This does not provide Windows Job Objects, cgroups, terminal emulation, signed binaries, or OS CPU/memory limits.
 
 ## Setup
 
@@ -59,7 +59,7 @@ This tranche does not provide Job Objects/cgroups, terminal emulation, signed bi
 
 Output is an append-only, session-local UTF-8 chunk journal. Callbacks are coalesced into bounded 64 KiB UTF-8 segments and retained output is capped at the configured value (up to 64 MiB), so fragmented output cannot create unbounded files. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
 
-The daemon `diagnostics` RPC reports active Bun-enforced limits and explicitly reports that native containment and process-tree termination are unavailable. It intentionally exposes no secret values or global session data.
+The daemon `diagnostics` RPC reports whether Linux native exec containment is enabled and whether `/proc` verification is available. It never claims PTY containment or Windows Job Objects.
 
 ## Development
 

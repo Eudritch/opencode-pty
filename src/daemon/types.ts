@@ -33,6 +33,32 @@ export interface SpawnFailure {
   cleanup: SpawnCleanup
 }
 
+export interface ContainmentReport {
+  platform: 'linux_proc' | 'posix_verification_unavailable' | 'not_applicable'
+  status:
+    | 'posix_best_effort_empty'
+    | 'posix_processes_remaining'
+    | 'posix_escape_observed'
+    | 'posix_verification_unavailable'
+    | 'not_applicable'
+  rootPid: number
+  processGroupId?: number
+  sessionId?: number
+  rootStartIdentity: string
+  observedGroupPids: number[]
+  observedSessionPids: number[]
+  observedEscapedDescendantPids: number[]
+  verifiedAt: string
+}
+
+export interface TerminationResult {
+  requested: boolean
+  termSignalSent: boolean
+  killSignalSent: boolean
+  rootExited: boolean
+  containment: ContainmentReport
+}
+
 export type ExecutionMode = 'pty' | 'exec'
 
 export type SessionLifecycle = 'conversation' | 'persistent'
@@ -73,6 +99,8 @@ export interface ExecResult {
   timedOut: boolean
   outputLimited: boolean
   terminationConfirmed: boolean
+  containment?: ContainmentReport
+  termination?: TerminationResult
   startedAt: string
   exitedAt: string
 }
@@ -133,6 +161,8 @@ export interface SessionRecord {
   outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
   execOutput?: ExecOutput
   worker?: WorkerReference
+  containment?: ContainmentReport
+  termination?: TerminationResult
   storageFailure?: string
   lastWaitResult?: WaitResult
 }
@@ -200,6 +230,8 @@ export interface WriteResult {
 export interface StopResult {
   requested: boolean
   terminationConfirmed: boolean
+  containment?: ContainmentReport
+  termination?: TerminationResult
 }
 
 export interface DaemonDiagnostics {
@@ -213,5 +245,10 @@ export interface DaemonDiagnostics {
     maxExecRuntimeSeconds: number
   }
   environment: { inheritEnabled: boolean; defaultProfile: 'safe' }
-  platform: { nativeContainment: false; processTreeTermination: false }
+  platform: {
+    nativeContainment: boolean
+    processTreeTermination: boolean
+    ptyContainment: false
+    containmentVerification: 'linux_proc' | 'unavailable'
+  }
 }

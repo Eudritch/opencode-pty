@@ -1414,6 +1414,100 @@ test('native RPC loss after command start reaps the direct child before persisti
   }
 }, 10_000)
 
+test('native exec POSIX containment creates a fresh session, drains groups, escalates, and reports escapes', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-posix-'))
+  roots.push(root)
+  const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker')
+  await stat(workerPath)
+  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-posix', root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-posix')
+  let escapedPid = 0
+  try {
+    const descriptor = await server.start()
+    const run = async (script: string) =>
+      rpc(
+        descriptor,
+        'exec',
+        { command: process.execPath, args: ['-e', script], timeoutSeconds: 3 },
+        context
+      )
+    const running = run(
+      "const {spawn}=require('node:child_process');spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});setInterval(()=>{},1000)"
+    )
+    let record: SessionRecord | undefined
+    for (let attempt = 0; attempt < 50 && !record; attempt += 1) {
+      record = (await storage.loadSessions()).find((entry) => entry.mode === 'exec')
+      if (!record) await Bun.sleep(20)
+    }
+    expect(record?.containment).toMatchObject({
+      platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
+      rootPid: record?.pid,
+      processGroupId: record?.pid,
+      sessionId: record?.pid,
+    })
+    expect(
+      await rpc(descriptor, 'stop', { id: record?.id }, context).then((response) => response.json())
+    ).toMatchObject({
+      result: {
+        containment: {
+          status:
+            process.platform === 'linux'
+              ? 'posix_best_effort_empty'
+              : 'posix_verification_unavailable',
+        },
+      },
+    })
+    await running
+
+    const termIgnoring = await run("process.on('SIGTERM',()=>{});setInterval(()=>{},1000)").then(
+      (response) => response.json()
+    )
+    expect(termIgnoring).toMatchObject({
+      result: { timedOut: true, termination: { killSignalSent: true } },
+    })
+
+    const escaped = run(
+      "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});console.log(child.pid);setInterval(()=>{},1000)"
+    )
+    let escapedRecord: SessionRecord | undefined
+    for (let attempt = 0; attempt < 50 && !escapedRecord; attempt += 1) {
+      escapedRecord = (await storage.loadSessions()).find(
+        (entry) => entry.mode === 'exec' && entry.id !== record?.id
+      )
+      if (!escapedRecord) await Bun.sleep(20)
+    }
+    for (let attempt = 0; attempt < 50 && !escapedPid; attempt += 1) {
+      escapedPid = Number(
+        (await storage.loadSessions())
+          .find((entry) => entry.id === escapedRecord?.id)
+          ?.execOutput?.stdout.trim()
+      )
+      if (!escapedPid) await Bun.sleep(20)
+    }
+    const escapedStop = await rpc(descriptor, 'stop', { id: escapedRecord?.id }, context).then(
+      (response) => response.json()
+    )
+    if (process.platform === 'linux')
+      expect(escapedStop).toMatchObject({
+        result: { containment: { status: 'posix_escape_observed' } },
+      })
+    await escaped
+  } finally {
+    if (escapedPid) process.kill(escapedPid, 'SIGKILL')
+    await server.stop()
+    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 15_000)
+
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
   expect(escapeXml(`ok\u0000\u001f\ud800😀`)).toBe('ok���😀')

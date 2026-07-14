@@ -17,6 +17,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const TERMINATION_HARD_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +56,7 @@ struct Control {
     token: String,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_identity() -> Result<String, String> {
     let pid = std::process::id();
     let stat = std::fs::read_to_string("/proc/self/stat").map_err(|error| error.to_string())?;
@@ -64,6 +68,12 @@ fn process_identity() -> Result<String, String> {
         .collect::<Vec<_>>();
     let start_time = fields.get(19).ok_or("missing /proc/self/stat start time")?;
     Ok(format!("posix:{pid}:{start_time}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_identity() -> Result<String, String> {
+    // macOS has no /proc start-time identity. Its containment result remains unavailable.
+    Ok(format!("posix:{}:unavailable", std::process::id()))
 }
 
 #[cfg(windows)]
@@ -130,6 +140,39 @@ struct State {
     stderr_reader_error: Option<String>,
     reader_drain_deadline: Option<SystemTime>,
     output_incomplete: bool,
+    termination: Option<TerminationResult>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContainmentReport {
+    platform: String,
+    status: String,
+    root_pid: u32,
+    process_group_id: Option<u32>,
+    session_id: Option<u32>,
+    root_start_identity: String,
+    observed_group_pids: Vec<u32>,
+    observed_session_pids: Vec<u32>,
+    observed_escaped_descendant_pids: Vec<u32>,
+    verified_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminationResult {
+    requested: bool,
+    term_signal_sent: bool,
+    kill_signal_sent: bool,
+    root_exited: bool,
+    containment: ContainmentReport,
+}
+
+struct Containment {
+    root_pid: u32,
+    process_group_id: Option<u32>,
+    session_id: Option<u32>,
+    root_start_identity: String,
 }
 
 struct Worker {
@@ -139,6 +182,7 @@ struct Worker {
     output_directory: PathBuf,
     max_output_bytes: usize,
     deadline: SystemTime,
+    containment: Containment,
 }
 
 struct WorkerError {
@@ -277,16 +321,256 @@ fn write_atomic(path: &Path, data: &str) -> std::io::Result<()> {
     private_file(path)
 }
 
-fn mark_termination(worker: &Arc<Worker>, reason: &str) {
-    let mut state = worker.state.lock().expect("state lock");
-    if state.termination_requested {
-        return;
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ProcessInfo {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    sid: u32,
+    start_time: String,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_processes() -> Result<Vec<ProcessInfo>, String> {
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir("/proc").map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, tail)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields = tail.split_whitespace().collect::<Vec<_>>();
+        let Some(ppid) = fields.get(1).and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(pgid) = fields.get(2).and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(sid) = fields.get(3).and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        let Some(start_time) = fields.get(19) else {
+            continue;
+        };
+        processes.push(ProcessInfo {
+            pid,
+            ppid,
+            pgid,
+            sid,
+            start_time: (*start_time).into(),
+        });
     }
-    state.termination_requested = true;
-    state.exit_reason = Some(reason.into());
-    state.timed_out = reason == "timeout";
-    drop(state);
-    let _ = worker.child.lock().expect("child lock").kill();
+    Ok(processes)
+}
+
+#[cfg(target_os = "linux")]
+fn containment_report(containment: &Containment) -> ContainmentReport {
+    let empty = || ContainmentReport {
+        platform: "linux_proc".into(),
+        status: "posix_best_effort_empty".into(),
+        root_pid: containment.root_pid,
+        process_group_id: containment.process_group_id,
+        session_id: containment.session_id,
+        root_start_identity: containment.root_start_identity.clone(),
+        observed_group_pids: Vec::new(),
+        observed_session_pids: Vec::new(),
+        observed_escaped_descendant_pids: Vec::new(),
+        verified_at: now(),
+    };
+    let Ok(processes) = linux_processes() else {
+        return ContainmentReport {
+            platform: "linux_proc".into(),
+            status: "posix_verification_unavailable".into(),
+            root_pid: containment.root_pid,
+            process_group_id: containment.process_group_id,
+            session_id: containment.session_id,
+            root_start_identity: containment.root_start_identity.clone(),
+            observed_group_pids: Vec::new(),
+            observed_session_pids: Vec::new(),
+            observed_escaped_descendant_pids: Vec::new(),
+            verified_at: now(),
+        };
+    };
+    let root = processes.iter().find(|process| {
+        process.pid == containment.root_pid
+            && format!("posix:{}:{}", process.pid, process.start_time)
+                == containment.root_start_identity
+    });
+    let group = containment
+        .process_group_id
+        .map(|pgid| {
+            processes
+                .iter()
+                .filter(|process| process.pgid == pgid)
+                .map(|process| process.pid)
+                .collect()
+        })
+        .unwrap_or_default();
+    let session = containment
+        .session_id
+        .map(|sid| {
+            processes
+                .iter()
+                .filter(|process| process.sid == sid)
+                .map(|process| process.pid)
+                .collect()
+        })
+        .unwrap_or_default();
+    let escaped = if let Some(root) = root {
+        let mut descendants = vec![root.pid];
+        let mut index = 0;
+        while index < descendants.len() {
+            let parent = descendants[index];
+            descendants.extend(
+                processes
+                    .iter()
+                    .filter(|process| process.ppid == parent && !descendants.contains(&process.pid))
+                    .map(|process| process.pid),
+            );
+            index += 1;
+        }
+        descendants
+            .iter()
+            .copied()
+            .filter(|pid| !group.contains(pid) && !session.contains(pid))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    ContainmentReport {
+        platform: "linux_proc".into(),
+        status: if !escaped.is_empty() {
+            "posix_escape_observed".into()
+        } else if group.is_empty() && session.is_empty() {
+            "posix_best_effort_empty".into()
+        } else {
+            "posix_processes_remaining".into()
+        },
+        root_pid: containment.root_pid,
+        process_group_id: containment.process_group_id,
+        session_id: containment.session_id,
+        root_start_identity: containment.root_start_identity.clone(),
+        observed_group_pids: group,
+        observed_session_pids: session,
+        observed_escaped_descendant_pids: escaped,
+        verified_at: now(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn containment_report(containment: &Containment) -> ContainmentReport {
+    ContainmentReport {
+        platform: if cfg!(unix) {
+            "posix_verification_unavailable"
+        } else {
+            "not_applicable"
+        }
+        .into(),
+        status: if cfg!(unix) {
+            "posix_verification_unavailable"
+        } else {
+            "not_applicable"
+        }
+        .into(),
+        root_pid: containment.root_pid,
+        process_group_id: containment.process_group_id,
+        session_id: containment.session_id,
+        root_start_identity: containment.root_start_identity.clone(),
+        observed_group_pids: Vec::new(),
+        observed_session_pids: Vec::new(),
+        observed_escaped_descendant_pids: Vec::new(),
+        verified_at: now(),
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(group: u32, signal: i32) -> std::io::Result<()> {
+    if unsafe { libc::kill(-(group as i32), signal) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
+    {
+        let mut state = worker.state.lock().expect("state lock");
+        if state.termination_requested {
+            return;
+        }
+        state.termination_requested = true;
+        state.exit_reason = Some(reason.into());
+        state.timed_out = reason == "timeout";
+    }
+    #[cfg(unix)]
+    {
+        let group = worker.containment.process_group_id;
+        let before_term = containment_report(&worker.containment);
+        let term_sent = group.is_some_and(|group| signal_group(group, libc::SIGTERM).is_ok());
+        let deadline = SystemTime::now() + TERMINATION_GRACE;
+        while SystemTime::now() < deadline {
+            observe_exit(worker);
+            if worker
+                .state
+                .lock()
+                .expect("state lock")
+                .termination_confirmed
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let before_kill = containment_report(&worker.containment);
+        let kill_sent = before_kill.status != "posix_best_effort_empty"
+            && group.is_some_and(|group| signal_group(group, libc::SIGKILL).is_ok());
+        let deadline = SystemTime::now() + TERMINATION_HARD_TIMEOUT;
+        while SystemTime::now() < deadline {
+            observe_exit(worker);
+            if containment_report(&worker.containment).status == "posix_best_effort_empty" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        observe_exit(worker);
+        let root_exited = worker
+            .state
+            .lock()
+            .expect("state lock")
+            .termination_confirmed;
+        let mut report = containment_report(&worker.containment);
+        let escapes = if before_term.observed_escaped_descendant_pids.is_empty() {
+            before_kill.observed_escaped_descendant_pids
+        } else {
+            before_term.observed_escaped_descendant_pids
+        };
+        if !escapes.is_empty() {
+            report.status = "posix_escape_observed".into();
+            report.observed_escaped_descendant_pids = escapes;
+        }
+        worker.state.lock().expect("state lock").termination = Some(TerminationResult {
+            requested: true,
+            term_signal_sent: term_sent,
+            kill_signal_sent: kill_sent,
+            root_exited,
+            containment: report,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = worker.child.lock().expect("child lock").kill();
+    }
+}
+
+fn mark_termination(worker: &Arc<Worker>, reason: &str) {
+    terminate_contained(worker, reason);
 }
 
 fn exit_signal(status: &ExitStatus) -> Option<String> {
@@ -336,15 +620,89 @@ fn observe_exit(worker: &Arc<Worker>) {
 
 fn terminate_and_wait(worker: &Arc<Worker>, reason: &str) {
     mark_termination(worker, reason);
-    let exit = worker.child.lock().expect("child lock").wait();
-    if let Ok(exit) = exit {
-        record_exit(worker, exit);
+    if !worker
+        .state
+        .lock()
+        .expect("state lock")
+        .termination_confirmed
+    {
+        let exit = worker.child.lock().expect("child lock").wait();
+        if let Ok(exit) = exit {
+            record_exit(worker, exit);
+        }
     }
 }
 
 fn terminate_child_and_wait(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn terminate_contained_child_and_wait(child: &mut Child, containment: &Containment) {
+    if let Some(group) = containment.process_group_id {
+        let _ = signal_group(group, libc::SIGTERM);
+        thread::sleep(TERMINATION_GRACE);
+        let _ = signal_group(group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "linux")]
+fn child_start_identity(pid: u32) -> Result<String, String> {
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| error.to_string())?;
+    let fields = stat
+        .rsplit_once(')')
+        .ok_or("invalid child /proc stat")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let start_time = fields.get(19).ok_or("missing child start time")?;
+    Ok(format!("posix:{pid}:{start_time}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn child_start_identity(pid: u32) -> Result<String, String> {
+    Ok(format!("posix:{pid}:unavailable"))
+}
+
+#[cfg(unix)]
+fn contain_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+fn verify_containment(pid: u32) -> Result<Containment, String> {
+    let pgid = unsafe { libc::getpgid(pid as i32) };
+    let sid = unsafe { libc::getsid(pid as i32) };
+    if pgid < 1 || sid < 1 || pgid as u32 != pid || sid as u32 != pid {
+        return Err("fresh POSIX session/process group verification failed".into());
+    }
+    Ok(Containment {
+        root_pid: pid,
+        process_group_id: Some(pgid as u32),
+        session_id: Some(sid as u32),
+        root_start_identity: child_start_identity(pid)?,
+    })
+}
+
+#[cfg(not(unix))]
+fn verify_containment(pid: u32) -> Result<Containment, String> {
+    Ok(Containment {
+        root_pid: pid,
+        process_group_id: None,
+        session_id: None,
+        root_start_identity: format!("process:{pid}"),
+    })
 }
 
 fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
@@ -543,6 +901,7 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
         "readerFailure": if reader_failure.is_empty() { Value::Null } else { Value::String(reader_failure) },
         "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
+        "containment": containment_report(&worker.containment), "termination": state.termination,
     })
 }
 
@@ -618,6 +977,12 @@ mod tests {
             output_directory: output_directory.clone(),
             max_output_bytes: MAX_OUTPUT_BYTES,
             deadline: SystemTime::now() - Duration::from_millis(1),
+            containment: Containment {
+                root_pid: 0,
+                process_group_id: None,
+                session_id: None,
+                root_start_identity: "test".into(),
+            },
         });
         reader(worker.clone(), FailingReader, true);
         for _ in 0..50 {
@@ -937,6 +1302,8 @@ fn main() -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    contain_child(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -944,9 +1311,20 @@ fn main() -> Result<(), String> {
             return Err(error.to_string());
         }
     };
+    let containment = match verify_containment(child.id()) {
+        Ok(containment) => containment,
+        Err(error) => {
+            terminate_child_and_wait(&mut child);
+            let _ = remove_file(&descriptor_path);
+            return Err(error);
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            #[cfg(unix)]
+            terminate_contained_child_and_wait(&mut child, &containment);
+            #[cfg(not(unix))]
             terminate_child_and_wait(&mut child);
             let _ = remove_file(&descriptor_path);
             return Err("missing stdout".into());
@@ -955,6 +1333,9 @@ fn main() -> Result<(), String> {
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
+            #[cfg(unix)]
+            terminate_contained_child_and_wait(&mut child, &containment);
+            #[cfg(not(unix))]
             terminate_child_and_wait(&mut child);
             let _ = remove_file(&descriptor_path);
             return Err("missing stderr".into());
@@ -974,6 +1355,7 @@ fn main() -> Result<(), String> {
         output_directory,
         max_output_bytes: bootstrap.max_output_bytes.min(MAX_OUTPUT_BYTES),
         deadline: SystemTime::now() + Duration::from_secs(bootstrap.timeout_seconds),
+        containment,
     });
     reader(worker.clone(), stdout, true);
     reader(worker.clone(), stderr, false);

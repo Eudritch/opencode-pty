@@ -1,6 +1,6 @@
 import { access, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { SpawnCleanup } from './types.ts'
+import type { ContainmentReport, SpawnCleanup, TerminationResult } from './types.ts'
 
 function readyTimeout(value: string | undefined): number {
   const timeout = Number(value ?? 5000)
@@ -86,6 +86,14 @@ async function processIdentity(pid: number): Promise<string | null> {
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW === '1')
     throw new Error('injected worker identity probe failure')
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL === '1') return null
+  if (process.platform === 'darwin') {
+    try {
+      process.kill(pid, 0)
+      return `posix:${pid}:unavailable`
+    } catch {
+      return null
+    }
+  }
   if (process.platform !== 'win32') {
     try {
       const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
@@ -499,4 +507,6 @@ export interface WorkerSnapshot {
   outputComplete: boolean
   outputIncomplete: boolean
   readerFailure?: string
+  containment: ContainmentReport
+  termination?: TerminationResult
 }

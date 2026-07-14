@@ -451,7 +451,14 @@ export class DaemonServer implements Disposable {
         maxExecRuntimeSeconds: MAX_EXEC_RUNTIME_SECONDS,
       },
       environment: { inheritEnabled: true, defaultProfile: 'safe' },
-      platform: { nativeContainment: false, processTreeTermination: false },
+      platform: {
+        nativeContainment:
+          process.platform === 'linux' && process.env.PTY_NATIVE_WORKER_ENABLED === '1',
+        processTreeTermination:
+          process.platform === 'linux' && process.env.PTY_NATIVE_WORKER_ENABLED === '1',
+        ptyContainment: false,
+        containmentVerification: process.platform === 'linux' ? 'linux_proc' : 'unavailable',
+      },
     }
   }
 

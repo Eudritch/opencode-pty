@@ -1,5 +1,6 @@
 import type {
   ExecOutput,
+  ContainmentReport,
   ExecutionMode,
   ExitReason,
   SessionLifecycle,
@@ -31,6 +32,7 @@ export interface PTYSessionInfo {
   timedOut: boolean
   terminationRequested: boolean
   terminationConfirmed: boolean
+  containment?: ContainmentReport
   exitCode?: number
   exitSignal?: number | string
   exitReason?: ExitReason
