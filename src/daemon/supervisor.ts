@@ -1,4 +1,6 @@
 import { spawn, type IPty } from 'bun-pty'
+import { realpathSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
 import {
   type ExecResult,
@@ -18,6 +20,8 @@ const DEFAULT_MAX_OUTPUT_BYTES =
     ? configuredOutputLimit
     : 1000000
 const OUTPUT_CHUNK_BYTES = 64 * 1024
+const TERMINATION_GRACE_MS = 250
+const TERMINATION_HARD_KILL_MS = 1000
 
 interface ActiveSession {
   record: SessionRecord
@@ -31,8 +35,9 @@ interface ExecOptions extends SpawnOptions {
 
 interface PendingWait {
   condition: WaitCondition
-  resolve: (result: WaitResult) => void
+  settle: (result: WaitResult) => void
   timer: ReturnType<typeof setTimeout>
+  settled: boolean
 }
 
 export class ProcessError extends Error {}
@@ -114,6 +119,16 @@ function activeStatus(record: SessionRecord): boolean {
   return record.status === 'starting' || record.status === 'running' || record.status === 'stopping'
 }
 
+function canonicalWorkdir(workdir: string | undefined): string {
+  return realpathSync(resolve(workdir ?? process.cwd()))
+}
+
+function canonicalEnv(env: Record<string, string> | undefined): string {
+  return JSON.stringify(
+    Object.entries(env ?? {}).sort(([left], [right]) => left.localeCompare(right))
+  )
+}
+
 export class SessionSupervisor {
   private readonly active = new Map<string, ActiveSession>()
   private readonly records = new Map<string, SessionRecord>()
@@ -178,7 +193,7 @@ export class SessionSupervisor {
       mode: 'pty',
       name: options.name,
       idempotencyKey: options.idempotencyKey,
-      workdir: options.workdir ?? process.cwd(),
+      workdir: canonicalWorkdir(options.workdir),
       env: options.env,
       status: 'starting',
       pid: 0,
@@ -261,8 +276,16 @@ export class SessionSupervisor {
     condition: WaitCondition,
     timeoutSeconds: number
   ): Promise<WaitResult> {
+    await this.flush()
+    this.validateWait(condition, timeoutSeconds)
+    const record = this.recordFor(id)
+    const afterSequence = record.nextSequence
     await this.write(id, data)
-    return this.wait(id, condition, timeoutSeconds)
+    return this.wait(
+      id,
+      { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
+      timeoutSeconds
+    )
   }
 
   async wait(id: string, condition: WaitCondition, timeoutSeconds: number): Promise<WaitResult> {
@@ -274,22 +297,30 @@ export class SessionSupervisor {
     if (!activeStatus(record)) return this.finishWait(record, this.waitEnded(record, condition))
     return new Promise<WaitResult>((resolve) => {
       const timer = setTimeout(() => {
-        this.removeWait(id, pending)
-        void this.finishWait(record, {
+        pending.settle({
           satisfied: false,
           reason: 'deadline',
           observedAt: new Date().toISOString(),
           outputTruncated: record.outputTruncated,
-        }).then(resolve)
+        })
       }, timeoutSeconds * 1000)
-      const pending: PendingWait = { condition, resolve, timer }
+      const pending: PendingWait = {
+        condition,
+        timer,
+        settled: false,
+        settle: (result) => {
+          if (pending.settled) return
+          pending.settled = true
+          this.removeWait(id, pending)
+          void this.finishWait(record, result).then(resolve)
+        },
+      }
       const pendingWaits = this.waits.get(id) ?? []
       pendingWaits.push(pending)
       this.waits.set(id, pendingWaits)
       void this.waitMatch(record, condition).then(async (result) => {
         if (!result) return
-        this.removeWait(id, pending)
-        resolve(await this.finishWait(record, result))
+        pending.settle(result)
       })
     })
   }
@@ -314,7 +345,7 @@ export class SessionSupervisor {
       command: options.command,
       args,
       mode: 'exec',
-      workdir: options.workdir ?? process.cwd(),
+      workdir: canonicalWorkdir(options.workdir),
       env: options.env,
       status: 'starting',
       pid: 0,
@@ -359,44 +390,103 @@ export class SessionSupervisor {
     record.updatedAt = new Date().toISOString()
     await this.storage.writeSession(record)
     const limit = Math.min(options.maxOutputBytes ?? this.maxOutputBytes, this.maxOutputBytes)
+    let termination: Promise<void> | undefined
+    const stopReading: Array<() => void> = []
+    const terminate = (reason: 'timeout' | 'output_limit') => {
+      if (termination) return termination
+      record.timedOut ||= reason === 'timeout'
+      record.status = reason === 'timeout' ? 'timed_out' : 'output_limited'
+      record.exitReason = reason === 'timeout' ? { kind: 'timeout' } : { kind: 'output_limit' }
+      record.terminationRequested = true
+      record.updatedAt = new Date().toISOString()
+      termination = (async () => {
+        await this.storage.writeSession(record)
+        try {
+          child.kill()
+        } catch {
+          record.exitReason =
+            reason === 'timeout'
+              ? { kind: 'timeout', message: 'Failed to terminate exec.' }
+              : { kind: 'output_limit', message: 'Failed to terminate exec.' }
+          await this.storage.writeSession(record)
+          return
+        }
+        await Promise.race([child.exited.then(() => undefined), Bun.sleep(TERMINATION_GRACE_MS)])
+        if (child.exitCode === null) {
+          try {
+            child.kill('SIGKILL')
+          } catch {}
+          await Promise.race([
+            child.exited.then(() => undefined),
+            Bun.sleep(TERMINATION_HARD_KILL_MS),
+          ])
+        }
+      })()
+      return termination
+    }
     const stdout = this.collectExecOutput(
       typeof child.stdout === 'object' ? child.stdout : null,
       limit,
-      child
+      () => terminate('output_limit'),
+      (stop) => {
+        stopReading.push(stop)
+      }
     )
     const stderr = this.collectExecOutput(
       typeof child.stderr === 'object' ? child.stderr : null,
       limit,
-      child
+      () => terminate('output_limit'),
+      (stop) => {
+        stopReading.push(stop)
+      }
     )
     const deadline = setTimeout(() => {
       if (child.exitCode === null) {
-        record.timedOut = true
-        record.status = 'timed_out'
-        record.exitReason = { kind: 'timeout' }
-        record.terminationRequested = true
-        child.kill()
+        void terminate('timeout')
       }
     }, options.timeoutSeconds * 1000)
-    await child.exited
+    await Promise.race([
+      child.exited,
+      new Promise<void>((resolve) =>
+        setTimeout(
+          resolve,
+          (options.timeoutSeconds ?? 0) * 1000 + TERMINATION_GRACE_MS + TERMINATION_HARD_KILL_MS
+        )
+      ),
+    ])
     clearTimeout(deadline)
+    if (child.exitCode === null)
+      stopReading.forEach((stop) => {
+        stop()
+      })
     const [out, err] = await Promise.all([stdout, stderr])
     const exitedAt = new Date().toISOString()
     record.exitCode = child.exitCode ?? undefined
     record.exitSignal = child.signalCode ?? undefined
+    const stillRunning = child.exitCode === null
     record.status = record.timedOut
       ? 'timed_out'
       : out.limited || err.limited
         ? 'output_limited'
         : 'exited'
-    record.exitReason = record.timedOut
-      ? { kind: 'timeout' }
-      : out.limited || err.limited
-        ? { kind: 'output_limit' }
-        : this.exitReason(child.exitCode, child.signalCode ?? undefined)
+    record.exitReason = stillRunning
+      ? { kind: 'unknown' }
+      : record.timedOut
+        ? { kind: 'timeout' }
+        : out.limited || err.limited
+          ? { kind: 'output_limit' }
+          : this.exitReason(child.exitCode, child.signalCode ?? undefined)
     record.outputBytes = out.bytes + err.bytes
     record.outputTruncated = out.limited || err.limited
-    record.terminationConfirmed = true
+    record.execOutput = {
+      stdout: out.data,
+      stderr: err.data,
+      stdoutBytes: out.bytes,
+      stderrBytes: err.bytes,
+      stdoutTruncated: out.limited,
+      stderrTruncated: err.limited,
+    }
+    record.terminationConfirmed = !stillRunning
     record.exitedAt = exitedAt
     record.updatedAt = exitedAt
     await this.storage.writeSession(record)
@@ -408,6 +498,7 @@ export class SessionSupervisor {
       exitSignal: record.exitSignal,
       timedOut: record.timedOut,
       outputLimited: record.outputTruncated,
+      terminationConfirmed: record.terminationConfirmed,
       startedAt: now,
       exitedAt,
     }
@@ -477,6 +568,12 @@ export class SessionSupervisor {
     if (!record) return null
     const raw = await this.storage.readOutput(id)
     return { raw, byteLength: Buffer.byteLength(raw) }
+  }
+
+  async execOutput(id: string) {
+    await this.flush()
+    const record = this.records.get(id)
+    return record?.execOutput ?? null
   }
 
   async stop(id: string): Promise<StopResult> {
@@ -604,8 +701,8 @@ export class SessionSupervisor {
     active.record.terminationConfirmed = true
     active.record.updatedAt = new Date().toISOString()
     active.record.exitedAt = active.record.updatedAt
-    this.resolveExitWaits(active.record)
     this.enqueuePersist(() => this.storage.writeSession(active.record))
+    this.resolveExitWaits(active.record)
   }
 
   private async outputFor(id: string): Promise<string> {
@@ -638,19 +735,15 @@ export class SessionSupervisor {
         activeStatus(record) &&
         record.mode === 'pty' &&
         record.parentSessionId === options.parentSessionId &&
-        record.parentAgent === options.parentAgent &&
-        record.workdir === (options.workdir ?? process.cwd()) &&
+        record.workdir === canonicalWorkdir(options.workdir) &&
         record.idempotencyKey === options.idempotencyKey
     )
     if (!existing) return undefined
     if (
       existing.command !== options.command ||
       JSON.stringify(existing.args) !== JSON.stringify(args) ||
-      JSON.stringify(existing.env ?? {}) !== JSON.stringify(options.env ?? {}) ||
-      existing.timeoutSeconds !== options.timeoutSeconds ||
-      existing.name !== options.name ||
-      existing.description !== options.description ||
-      existing.title !== (options.title ?? `${options.command} ${args.join(' ')}`.trim())
+      canonicalEnv(existing.env) !== canonicalEnv(options.env) ||
+      existing.timeoutSeconds !== options.timeoutSeconds
     ) {
       throw new Error(
         'Idempotency key matches an active PTY with a different command or specification.'
@@ -679,11 +772,18 @@ export class SessionSupervisor {
   ): Promise<WaitResult | undefined> {
     if (condition.kind === 'exit') return activeStatus(record) ? undefined : this.exitWait(record)
     const output = await this.outputFor(record.id)
+    const after = condition.afterSequence ?? record.firstRetainedSequence
+    const scoped =
+      after <= record.firstRetainedSequence
+        ? output
+        : Buffer.from(output)
+            .subarray(after - record.firstRetainedSequence)
+            .toString('utf8')
     const matched = condition.literal
-      ? output.includes(condition.literal)
+      ? scoped.includes(condition.literal)
         ? condition.literal
         : undefined
-      : safeRegex(condition.regex ?? '').exec(output)?.[0]
+      : safeRegex(condition.regex ?? '').exec(scoped)?.[0]
     return matched === undefined
       ? undefined
       : {
@@ -714,7 +814,8 @@ export class SessionSupervisor {
   private async finishWait(record: SessionRecord, result: WaitResult): Promise<WaitResult> {
     record.lastWaitResult = result
     record.updatedAt = new Date().toISOString()
-    await this.storage.writeSession(record)
+    this.enqueuePersist(() => this.storage.writeSession(record))
+    await this.persistQueue
     return result
   }
 
@@ -727,8 +828,7 @@ export class SessionSupervisor {
         .map(async (wait) => {
           const result = await this.waitMatch(record, wait.condition)
           if (!result) return
-          this.removeWait(record.id, wait)
-          wait.resolve(await this.finishWait(record, result))
+          wait.settle(result)
         })
     )
   }
@@ -739,10 +839,7 @@ export class SessionSupervisor {
     void this.persistQueue.then(async () => {
       for (const wait of [...(this.waits.get(record.id) ?? [])]) {
         const matched = await this.waitMatch(record, wait.condition)
-        this.removeWait(record.id, wait)
-        wait.resolve(
-          await this.finishWait(record, matched ?? this.waitEnded(record, wait.condition))
-        )
+        wait.settle(matched ?? this.waitEnded(record, wait.condition))
       }
     })
   }
@@ -759,37 +856,60 @@ export class SessionSupervisor {
   private async collectExecOutput(
     stream: ReadableStream<Uint8Array> | null,
     limit: number,
-    process: ReturnType<typeof Bun.spawn>
+    terminate: () => Promise<void>,
+    registerStop: (stop: () => void) => void
   ): Promise<{ data: string; bytes: number; limited: boolean }> {
     if (!stream) return { data: '', bytes: 0, limited: false }
     const reader = stream.getReader()
     const decoder = new TextDecoder()
+    let stopped = false
+    let stop: (() => void) | undefined
+    const stoppedReading = new Promise<void>((resolve) => {
+      stop = () => {
+        stopped = true
+        resolve()
+      }
+    })
+    registerStop(() => stop?.())
     let bytes = 0
     let data = ''
     let limited = false
     try {
       while (true) {
-        const { done, value } = await reader.read()
+        const read = await Promise.race([
+          reader.read(),
+          stoppedReading.then(() => ({ done: true })),
+        ])
+        const { done } = read
         if (done) break
+        if (!('value' in read)) break
+        const value = read.value
         const remaining = limit - bytes
         if (remaining <= 0) {
           limited = true
-          if (process.exitCode === null) process.kill()
+          void terminate()
           continue
         }
-        const kept = value.byteLength <= remaining ? value : value.slice(0, remaining)
+        const kept = value.byteLength <= remaining ? value : this.utf8Prefix(value, remaining)
         bytes += kept.byteLength
         data += decoder.decode(kept, { stream: true })
         if (kept.byteLength !== value.byteLength) {
           limited = true
-          if (process.exitCode === null) process.kill()
+          void terminate()
         }
       }
       data += decoder.decode()
       return { data, bytes, limited }
     } finally {
+      if (stopped) await reader.cancel().catch(() => undefined)
       reader.releaseLock()
     }
+  }
+
+  private utf8Prefix(value: Uint8Array, limit: number): Uint8Array {
+    let end = Math.min(value.byteLength, limit)
+    while (end > 0 && ((value[end] ?? 0) & 0xc0) === 0x80) end -= 1
+    return value.slice(0, end)
   }
 
   private exitReason(exitCode: number | null, signal?: number | string): ExitReason {
@@ -836,6 +956,7 @@ export class SessionSupervisor {
       firstRetainedSequence: record.firstRetainedSequence,
       outputTruncated: record.outputTruncated,
       lastWaitResult: record.lastWaitResult,
+      execOutput: record.execOutput,
     }
   }
 }

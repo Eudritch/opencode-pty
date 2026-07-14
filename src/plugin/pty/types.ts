@@ -1,4 +1,4 @@
-import type { ExecutionMode, ExitReason, WaitResult } from '../../daemon/types.ts'
+import type { ExecOutput, ExecutionMode, ExitReason, WaitResult } from '../../daemon/types.ts'
 
 export type PTYStatus =
   | 'starting'
@@ -37,6 +37,7 @@ export interface PTYSessionInfo {
   firstRetainedSequence?: number
   outputTruncated?: boolean
   lastWaitResult?: WaitResult
+  execOutput?: ExecOutput
 }
 
 export interface SpawnOptions {

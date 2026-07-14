@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { escapeXml } from '../xml.ts'
 
 const waitArgs = {
   id: tool.schema.string().describe('PTY session ID'),
@@ -25,7 +26,7 @@ function condition(args: { literal?: string; regex?: string; exit?: boolean }) {
 }
 
 function format(result: Awaited<ReturnType<typeof manager.wait>>): string {
-  return `<pty_wait satisfied="${result.satisfied}" reason="${result.reason}" matched="${result.matched ?? ''}" exit_code="${result.exitCode ?? 'unknown'}" output_truncated="${result.outputTruncated}"/>`
+  return `<pty_wait satisfied="${result.satisfied}" reason="${escapeXml(result.reason)}" matched="${escapeXml(result.matched ?? '')}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" output_truncated="${result.outputTruncated}"/>`
 }
 
 export const ptyWait = tool({

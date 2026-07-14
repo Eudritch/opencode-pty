@@ -1,6 +1,7 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
 import DESCRIPTION from './kill.txt'
+import { escapeXml } from '../xml.ts'
 
 export const ptyKill = tool({
   description: DESCRIPTION,
@@ -33,10 +34,10 @@ export const ptyKill = tool({
 
     return [
       `<pty_stop>`,
-      `${action}: ${args.id}${cleanupNote}`,
+      `${action}: ${escapeXml(args.id)}${cleanupNote}`,
       `Termination confirmed: ${stop.terminationConfirmed ? 'yes' : 'no'}`,
-      `Title: ${session.title}`,
-      `Command: ${session.command} ${session.args.join(' ')}`,
+      `Title: ${escapeXml(session.title)}`,
+      `Command: ${escapeXml(session.command)} ${escapeXml(session.args.join(' '))}`,
       `Final line count: ${session.lineCount}`,
       `</pty_stop>`,
     ].join('\n')

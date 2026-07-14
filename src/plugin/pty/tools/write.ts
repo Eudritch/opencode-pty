@@ -1,5 +1,6 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
+import { escapeXml } from '../xml.ts'
 import DESCRIPTION from './write.txt'
 
 const ETX = String.fromCharCode(3)
@@ -57,6 +58,6 @@ export const ptyWrite = tool({
       .replace(new RegExp(ETX, 'g'), '^C')
       .replace(/\n/g, '\\n')
       .replace(/\r/g, '\\r')
-    return `Accepted ${result.acceptedBytes} UTF-8 bytes (${result.acceptedCharacters} characters) for ${args.id}: "${displayPreview}"`
+    return `Accepted ${result.acceptedBytes} UTF-8 bytes (${result.acceptedCharacters} characters) for ${escapeXml(args.id)}: "${escapeXml(displayPreview)}"`
   },
 })

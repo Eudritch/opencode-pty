@@ -2,6 +2,7 @@ import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
 import { authorizeSpawn } from '../permissions.ts'
 import DESCRIPTION from './spawn.txt'
+import { escapeXml } from '../xml.ts'
 
 export const ptySpawn = tool({
   description: DESCRIPTION,
@@ -61,10 +62,10 @@ export const ptySpawn = tool({
 
     const output = [
       `<pty_spawned>`,
-      `ID: ${info.id}`,
-      `Title: ${info.title}`,
-      `Command: ${info.command} ${info.args.join(' ')}`,
-      `Workdir: ${info.workdir}`,
+      `ID: ${escapeXml(info.id)}`,
+      `Title: ${escapeXml(info.title)}`,
+      `Command: ${escapeXml(info.command)} ${escapeXml(info.args.join(' '))}`,
+      `Workdir: ${escapeXml(info.workdir)}`,
       `PID: ${info.pid}`,
       `Status: ${info.status}`,
       `TimeoutSeconds: ${info.timeoutSeconds ?? 'none'}`,

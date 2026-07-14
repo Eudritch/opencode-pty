@@ -9,6 +9,7 @@ import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types
 import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine } from '../src/plugin/pty/formatters.ts'
 import { authorizeSpawn, initPermissions } from '../src/plugin/pty/permissions.ts'
+import { escapeXml } from '../src/plugin/pty/xml.ts'
 
 const roots: string[] = []
 
@@ -198,6 +199,50 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     maxOutputBytes: 8,
   })
   expect(limited).toMatchObject({ outputLimited: true, stdout: 'xxxxxxxx' })
+  expect(await supervisor.execOutput(limited.session.id)).toMatchObject({
+    stdout: 'xxxxxxxx',
+    stderr: '',
+    stdoutBytes: 8,
+    stdoutTruncated: true,
+  })
+})
+
+test('exec force-kills after grace and reports bounded, truthful termination state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-kill-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const started = Date.now()
+  const result = await supervisor.exec({
+    command: process.execPath,
+    args: [
+      '-e',
+      process.platform === 'win32'
+        ? 'setInterval(() => {}, 1000)'
+        : "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+    ],
+    parentSessionId: 'parent',
+    timeoutSeconds: 1,
+  })
+  expect(Date.now() - started).toBeLessThan(3000)
+  expect(result.timedOut).toBeTrue()
+  if (process.platform !== 'win32') expect(result.terminationConfirmed).toBeTrue()
+})
+
+test('exec truncation preserves complete UTF-8 text', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-utf8-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const result = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', "process.stdout.write('A😀B')"],
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+    maxOutputBytes: 4,
+  })
+  expect(result.stdout).toBe('A')
+  expect(Buffer.byteLength(result.stdout)).toBe(1)
 })
 
 test('PTY idempotency reuses only an active matching owner and spec', async () => {
@@ -217,10 +262,37 @@ test('PTY idempotency reuses only an active matching owner and spec', async () =
   const first = await supervisor.spawn(options)
   const reused = await supervisor.spawn(options)
   expect(reused.id).toBe(first.id)
+  expect(
+    (await supervisor.spawn({ ...options, title: 'renamed', description: 'changed presentation' }))
+      .id
+  ).toBe(first.id)
   await expect(supervisor.spawn({ ...options, args: ['-e', 'process.exit()'] })).rejects.toThrow(
     'different command or specification'
   )
   await supervisor.stop(first.id)
+  await Bun.sleep(25)
+  await supervisor.flush()
+})
+
+test('PTY idempotency canonicalizes environment order and scopes only by parent and workdir', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const base = {
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 5000)'],
+    parentSessionId: 'owner',
+    workdir: root,
+    idempotencyKey: 'same',
+    env: { A: '1', Z: '2' },
+  }
+  const first = await supervisor.spawn(base)
+  expect((await supervisor.spawn({ ...base, env: { Z: '2', A: '1' } })).id).toBe(first.id)
+  const other = await supervisor.spawn({ ...base, parentSessionId: 'other' })
+  expect(other.id).not.toBe(first.id)
+  await supervisor.stop(first.id)
+  await supervisor.stop(other.id)
   await Bun.sleep(25)
   await supervisor.flush()
 })
@@ -240,6 +312,7 @@ test('daemon waits for output, exit, and deadline without plugin polling', async
     parentSessionId: 'parent',
     workdir: root,
   })
+  await Bun.sleep(50)
   await expect(
     supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
   ).resolves.toMatchObject({
@@ -270,6 +343,62 @@ test('daemon waits for output, exit, and deadline without plugin polling', async
   await supervisor.stop(running.id)
   await Bun.sleep(25)
   await supervisor.flush()
+})
+
+test('sendWait ignores output before its durable write cursor and wait settles one race winner', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const session = await supervisor.spawn({
+    command: process.execPath,
+    args: [
+      '-e',
+      "setTimeout(() => console.log('old ready'), 50); setTimeout(() => console.log('new ready'), 500); setTimeout(() => process.exit(0), 800)",
+    ],
+    parentSessionId: 'parent',
+    workdir: root,
+  })
+  await Bun.sleep(200)
+  const result = await supervisor.sendWait(
+    session.id,
+    'go\n',
+    { kind: 'output', literal: 'new ready' },
+    2
+  )
+  expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'new ready' })
+  const exit = await supervisor.wait(session.id, { kind: 'exit' }, 2)
+  expect(exit).toMatchObject({ satisfied: true, reason: 'exit', exitCode: 0 })
+  expect((await supervisor.get(session.id))?.lastWaitResult).toMatchObject({ reason: 'exit' })
+})
+
+test('exec output remains separately recoverable after restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-record-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const result = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', "process.stdout.write('out'); process.stderr.write('err')"],
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+  })
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  expect(await recovered.execOutput(result.session.id)).toEqual({
+    stdout: 'out',
+    stderr: 'err',
+    stdoutBytes: 3,
+    stderrBytes: 3,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+  })
+})
+
+test('tool output XML escaping covers text and attributes', () => {
+  expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
+  expect(formatLine('<output>', 1)).toContain('&lt;output&gt;')
 })
 
 test('client preserves a healthy incompatible daemon descriptor', async () => {

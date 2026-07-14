@@ -1,6 +1,7 @@
 import { tool } from '@opencode-ai/plugin'
 import { manager } from '../manager.ts'
 import { authorizeSpawn } from '../permissions.ts'
+import { escapeXml } from '../xml.ts'
 
 export const shellExec = tool({
   description:
@@ -25,12 +26,12 @@ export const shellExec = tool({
       parentAgent: ctx.agent,
     })
     return [
-      `<shell_exec id="${result.session.id}" status="${result.session.status}" exit_code="${result.exitCode ?? 'unknown'}" timed_out="${result.timedOut}" output_limited="${result.outputLimited}">`,
+      `<shell_exec id="${escapeXml(result.session.id)}" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" output_limited="${result.outputLimited}" termination_confirmed="${result.terminationConfirmed}">`,
       '<stdout>',
-      result.stdout,
+      escapeXml(result.stdout),
       '</stdout>',
       '<stderr>',
-      result.stderr,
+      escapeXml(result.stderr),
       '</stderr>',
       '</shell_exec>',
     ].join('\n')

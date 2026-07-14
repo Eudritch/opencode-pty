@@ -7,7 +7,7 @@ export type ExitReason =
   | { kind: 'signal'; signal: string }
   | { kind: 'timeout'; message?: string }
   | { kind: 'spawn_error'; message: string }
-  | { kind: 'output_limit' }
+  | { kind: 'output_limit'; message?: string }
   | { kind: 'unknown' }
 
 export type DaemonStatus =
@@ -22,7 +22,9 @@ export type DaemonStatus =
 
 export type ExecutionMode = 'pty' | 'exec'
 
-export type WaitCondition = { kind: 'exit' } | { kind: 'output'; literal?: string; regex?: string }
+export type WaitCondition =
+  | { kind: 'exit' }
+  | { kind: 'output'; literal?: string; regex?: string; afterSequence?: number }
 
 export interface WaitResult {
   satisfied: boolean
@@ -42,8 +44,18 @@ export interface ExecResult {
   exitSignal?: number | string
   timedOut: boolean
   outputLimited: boolean
+  terminationConfirmed: boolean
   startedAt: string
   exitedAt: string
+}
+
+export interface ExecOutput {
+  stdout: string
+  stderr: string
+  stdoutBytes: number
+  stderrBytes: number
+  stdoutTruncated: boolean
+  stderrTruncated: boolean
 }
 
 export interface SessionRecord {
@@ -80,6 +92,7 @@ export interface SessionRecord {
   lineCount: number
   outputHasPartialLine: boolean
   outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
+  execOutput?: ExecOutput
   lastWaitResult?: WaitResult
 }
 

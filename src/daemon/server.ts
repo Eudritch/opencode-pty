@@ -172,6 +172,8 @@ export class DaemonServer implements Disposable {
         return this.get(request.payload)
       case 'rawOutput':
         return this.rawOutput(request.payload)
+      case 'execOutput':
+        return this.execOutput(request.payload)
       case 'stop':
         return this.stopSession(request.payload)
       case 'cleanup':
@@ -208,6 +210,12 @@ export class DaemonServer implements Disposable {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['id'])
     return this.supervisor.rawOutput(this.requiredString(value, 'id'))
+  }
+
+  private execOutput(payload: unknown) {
+    const value = this.objectPayload(payload)
+    this.onlyFields(value, ['id'])
+    return this.supervisor.execOutput(this.requiredString(value, 'id'))
   }
 
   private stopSession(payload: unknown) {

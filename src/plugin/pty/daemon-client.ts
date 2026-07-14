@@ -105,6 +105,10 @@ export class DaemonClient {
     return this.call('rawOutput', { id })
   }
 
+  async getExecOutput(id: string) {
+    return this.call('execOutput', { id })
+  }
+
   async stop(id: string): Promise<StopResult> {
     return this.call('stop', { id })
   }
