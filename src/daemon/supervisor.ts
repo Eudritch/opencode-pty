@@ -1063,22 +1063,28 @@ export class SessionSupervisor {
         if (done) break
         if (!('value' in read)) break
         const value = read.value
+        const redacted = redactor.write(decoder.decode(value, { stream: true }))
         const remaining = limit - bytes
-        if (remaining <= 0) {
+        const kept = this.utf8Prefix(Buffer.from(redacted), Math.max(0, remaining))
+        bytes += kept.byteLength
+        data += Buffer.from(kept).toString('utf8')
+        if (kept.byteLength !== Buffer.byteLength(redacted)) {
           limited = true
           void terminate()
-          continue
+          break
         }
-        const kept = value.byteLength <= remaining ? value : this.utf8Prefix(value, remaining)
+      }
+      if (!limited) {
+        const redacted = redactor.write(decoder.decode()) + redactor.finish()
+        const remaining = limit - bytes
+        const kept = this.utf8Prefix(Buffer.from(redacted), Math.max(0, remaining))
         bytes += kept.byteLength
-        data += redactor.write(decoder.decode(kept, { stream: true }))
-        if (kept.byteLength !== value.byteLength) {
+        data += Buffer.from(kept).toString('utf8')
+        if (kept.byteLength !== Buffer.byteLength(redacted)) {
           limited = true
           void terminate()
         }
       }
-      data += redactor.write(decoder.decode())
-      data += redactor.finish()
       return { data, bytes, limited }
     } finally {
       if (stopped) await reader.cancel().catch(() => undefined)

@@ -763,6 +763,32 @@ test('exec truncation preserves complete UTF-8 text', async () => {
   expect(Buffer.byteLength(result.stdout)).toBe(1)
 })
 
+test('exec truncation redacts a secret that crosses the output cap', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-redaction-limit-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const result = await supervisor.exec({
+    command: process.execPath,
+    args: ['-e', "process.stdout.write('before-super-secret-value-after')"],
+    env: { API_TOKEN: 'super-secret-value' },
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+    maxOutputBytes: 12,
+  })
+  const recovered = new SessionSupervisor(storage)
+  await recovered.initialize()
+  const durable = await recovered.execOutput(result.session.id)
+
+  expect(result).toMatchObject({ outputLimited: true, stdout: 'before-[REDA' })
+  expect(durable).toMatchObject({ stdout: 'before-[REDA', stdoutBytes: 12, stdoutTruncated: true })
+  for (const output of [result.stdout, durable?.stdout]) {
+    expect(output).not.toContain('super')
+    expect(output).not.toContain('secret')
+  }
+})
+
 test('PTY idempotency reuses only an active matching owner and spec', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-'))
   roots.push(root)
