@@ -1,7 +1,11 @@
-import { access, readFile } from 'node:fs/promises'
+import { access, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import type { SpawnCleanup } from './types.ts'
 
-const READY_TIMEOUT_MS = 5000
+function readyTimeout(value: string | undefined): number {
+  const timeout = Number(value ?? 5000)
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : 5000
+}
 
 export interface WorkerDescriptor {
   pid: number
@@ -32,6 +36,16 @@ export interface WorkerBootstrap {
   timeoutSeconds: number
   maxOutputBytes: number
   mode: 'exec'
+  fault?: string
+}
+
+export class WorkerStartError extends Error {
+  constructor(
+    message: string,
+    readonly cleanup: SpawnCleanup
+  ) {
+    super(message)
+  }
 }
 
 function validDescriptor(value: unknown): value is WorkerDescriptor {
@@ -66,6 +80,40 @@ function workerCommand(): string[] {
   )
 }
 
+async function processIdentity(pid: number): Promise<string | null> {
+  if (process.platform !== 'win32') {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
+      const fields = stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .split(/\s+/)
+      return fields[19] ? `posix:${pid}:${fields[19]}` : null
+    } catch {
+      return null
+    }
+  }
+  const probe = Bun.spawn({
+    cmd: [
+      'powershell.exe',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      `$process = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($process) { [Console]::Write("windows:${pid}:$($process.StartTime.ToFileTimeUtc())") }`,
+    ],
+    stdout: 'pipe',
+    stderr: 'ignore',
+  })
+  const output = (await new Response(probe.stdout).text()).trim()
+  await probe.exited
+  return output || null
+}
+
+async function exited(child: ReturnType<typeof Bun.spawn>, identity: string): Promise<boolean> {
+  await Promise.race([child.exited, Bun.sleep(2000)])
+  return (await processIdentity(child.pid)) !== identity
+}
+
 export class WorkerClient {
   private constructor(private readonly descriptor: WorkerDescriptor) {}
 
@@ -76,42 +124,131 @@ export class WorkerClient {
     const workerControlToken =
       crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '')
     const workerId = crypto.randomUUID()
+    const payload = Buffer.from(
+      JSON.stringify({
+        ...bootstrap,
+        fault: bootstrap.env.OPENCODE_PTY_NATIVE_WORKER_FAULT,
+        workerControlToken,
+        workerId,
+      }),
+      'utf8'
+    )
+    if (payload.byteLength > 1024 * 1024)
+      throw new Error('native_worker_unavailable: bootstrap too large.')
     const child = Bun.spawn({
       cmd: workerCommand(),
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'inherit',
     })
-    const payload = Buffer.from(
-      JSON.stringify({ ...bootstrap, workerControlToken, workerId }),
-      'utf8'
-    )
-    if (payload.byteLength > 1024 * 1024)
-      throw new Error('native_worker_unavailable: bootstrap too large.')
-    await child.stdin.write(
-      Buffer.concat([Buffer.from(Uint32Array.of(payload.byteLength).buffer).swap32(), payload])
-    )
-    await child.stdin.end()
-    const reader = child.stdout.getReader()
-    const ready = await Promise.race([
-      reader.read().then(({ value }) => new TextDecoder().decode(value).includes('{"ready":true}')),
-      Bun.sleep(READY_TIMEOUT_MS).then(() => false),
-    ])
-    reader.releaseLock()
-    if (!ready) throw new Error('native_worker_unavailable: worker did not become ready.')
-    const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
-    if (descriptor.token !== workerControlToken || descriptor.startIdentity !== workerId) {
-      throw new Error('native_worker_unavailable: worker descriptor verification failed.')
+    const identity = await processIdentity(child.pid)
+    const cleanup = async (): Promise<SpawnCleanup> => {
+      try {
+        const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
+        if (
+          descriptor.pid === child.pid &&
+          descriptor.token === workerControlToken &&
+          descriptor.startIdentity === workerId &&
+          identity !== null &&
+          descriptor.processIdentity === identity
+        ) {
+          const client = new WorkerClient(descriptor)
+          const directChildPid = (await client.snapshot()).pid
+          await client.shutdown()
+          return {
+            requested: true,
+            terminationConfirmed: await exited(child, identity),
+            method: 'shutdown',
+            directChildPid,
+          }
+        }
+      } catch {}
+      if (!identity) {
+        return {
+          requested: false,
+          terminationConfirmed: child.exitCode !== null,
+          method: 'none',
+          message: 'Worker identity could not be verified.',
+        }
+      }
+      const current = await processIdentity(child.pid)
+      if (current !== identity) {
+        return { requested: false, terminationConfirmed: true, method: 'none' }
+      }
+      try {
+        child.kill()
+      } catch (error) {
+        return {
+          requested: false,
+          terminationConfirmed: false,
+          method: 'none',
+          message: String(error),
+        }
+      }
+      return {
+        requested: true,
+        terminationConfirmed: await exited(child, identity),
+        method: 'kill',
+      }
     }
-    return {
-      client: new WorkerClient(descriptor),
-      reference: {
-        pid: descriptor.pid,
-        startIdentity: descriptor.startIdentity,
-        processIdentity: descriptor.processIdentity,
-        endpoint: descriptor.endpoint,
-        protocolVersion: descriptor.protocolVersion,
-      },
+    try {
+      if (!identity)
+        throw new Error('native_worker_unavailable: worker identity verification failed.')
+      await child.stdin.write(
+        Buffer.concat([Buffer.from(Uint32Array.of(payload.byteLength).buffer).swap32(), payload])
+      )
+      await child.stdin.end()
+      const reader = child.stdout.getReader()
+      const ready = await Promise.race([
+        reader
+          .read()
+          .then(({ value }) => new TextDecoder().decode(value).includes('{"ready":true}')),
+        Bun.sleep(readyTimeout(bootstrap.env.OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS)).then(
+          () => false
+        ),
+      ])
+      if (!ready) await reader.cancel().catch(() => undefined)
+      reader.releaseLock()
+      if (ready) {
+        const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
+        if (
+          descriptor.pid !== child.pid ||
+          descriptor.token !== workerControlToken ||
+          descriptor.startIdentity !== workerId ||
+          descriptor.processIdentity !== identity
+        ) {
+          throw new Error('native_worker_unavailable: worker descriptor verification failed.')
+        }
+        return {
+          client: new WorkerClient(descriptor),
+          reference: {
+            pid: descriptor.pid,
+            startIdentity: descriptor.startIdentity,
+            processIdentity: descriptor.processIdentity,
+            endpoint: descriptor.endpoint,
+            protocolVersion: descriptor.protocolVersion,
+          },
+        }
+      }
+      let descriptor: WorkerDescriptor | null = null
+      for (let attempt = 0; attempt < 40 && !descriptor; attempt += 1) {
+        descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json')).catch(
+          () => null
+        )
+        if (!descriptor) await Bun.sleep(25)
+      }
+      if (!descriptor)
+        throw new Error('native_worker_unavailable: worker descriptor is unavailable.')
+      throw new Error('native_worker_unavailable: worker did not become ready.')
+    } catch (error) {
+      const outcome = await cleanup()
+      await rm(join(bootstrap.sessionDirectory, 'worker.json'), { force: true }).catch(
+        () => undefined
+      )
+      throw new WorkerStartError(
+        `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(outcome)}`,
+        outcome
+      )
     }
   }
 

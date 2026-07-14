@@ -19,6 +19,19 @@ import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
 
+async function processGone(pid: number) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      process.kill(pid, 0)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true
+      throw error
+    }
+    await Bun.sleep(25)
+  }
+  return false
+}
+
 const roots: string[] = []
 
 afterEach(async () => {
@@ -1018,6 +1031,13 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
       if (!id) await Bun.sleep(20)
     }
     expect(id).not.toBe('')
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if ((await storage.loadSessions()).find((session) => session.id === id)?.worker) break
+      await Bun.sleep(20)
+    }
+    expect(
+      (await storage.loadSessions()).find((session) => session.id === id)?.worker
+    ).toBeDefined()
     await Bun.sleep(100)
     await first.stop()
     restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-second')
@@ -1107,6 +1127,13 @@ test('native exec uses independent stdout/stderr caps and persists terminal stor
         )?.id ?? ''
       if (!id) await Bun.sleep(20)
     }
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if ((await storage.loadSessions()).find((session) => session.id === id)?.worker) break
+      await Bun.sleep(20)
+    }
+    expect(
+      (await storage.loadSessions()).find((session) => session.id === id)?.worker
+    ).toBeDefined()
     await rm(join(root, 'sessions', id, 'output'), { recursive: true, force: true })
     await writeFile(join(root, 'sessions', id, 'output'), 'not a directory')
     expect(await failing.then((response) => response.json())).toMatchObject({
@@ -1127,6 +1154,102 @@ test('native exec uses independent stdout/stderr caps and persists terminal stor
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
 })
+
+test('native startup failures clean up the direct child and report the proven outcome', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-startup-failure-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-startup-failure', root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-startup-failure')
+  try {
+    const descriptor = await server.start()
+    const descriptorFailure = await rpc(
+      descriptor,
+      'exec',
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'descriptor_write' },
+        timeoutSeconds: 2,
+      },
+      context
+    ).then((response) => response.json())
+    expect(descriptorFailure).toMatchObject({
+      ok: false,
+      error: { code: 'process', spawnFailure: { cleanup: { terminationConfirmed: true } } },
+    })
+    const descriptorRecord = (await storage.loadSessions()).at(-1)
+    expect(descriptorRecord).toMatchObject({
+      status: 'spawn_failed',
+      terminationConfirmed: true,
+      exitReason: { kind: 'spawn_error', cleanup: { terminationConfirmed: true } },
+    })
+
+    const readinessFailure = await rpc(
+      descriptor,
+      'exec',
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        env: {
+          OPENCODE_PTY_NATIVE_WORKER_FAULT: 'missing_ready',
+          OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS: '1000',
+        },
+        timeoutSeconds: 2,
+      },
+      context
+    ).then((response) => response.json())
+    const childPid = (
+      readinessFailure as { error: { spawnFailure: { cleanup: { directChildPid: number } } } }
+    ).error.spawnFailure.cleanup.directChildPid
+    expect(readinessFailure).toMatchObject({
+      ok: false,
+      error: {
+        code: 'process',
+        spawnFailure: {
+          cleanup: {
+            requested: true,
+            terminationConfirmed: true,
+            directChildPid: expect.any(Number),
+          },
+        },
+      },
+    })
+    expect(childPid).toBeNumber()
+    expect(await processGone(childPid)).toBeTrue()
+    const readinessRecord = (await storage.loadSessions()).find(
+      (record) =>
+        record.exitReason?.kind === 'spawn_error' &&
+        record.exitReason.cleanup?.directChildPid === childPid
+    )
+    expect(readinessRecord).toMatchObject({
+      status: 'spawn_failed',
+      terminationRequested: true,
+      terminationConfirmed: true,
+      exitReason: {
+        kind: 'spawn_error',
+        cleanup: { requested: true, terminationConfirmed: true, method: 'shutdown' },
+      },
+    })
+  } finally {
+    await server.stop()
+    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
 
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')

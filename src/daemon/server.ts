@@ -130,7 +130,13 @@ export class DaemonServer implements Disposable {
                     : message.includes('closed')
                       ? 'session_closed'
                       : 'internal'
-      return this.failure(rpcRequest.id, code, message, code === 'not_found' ? 404 : 400)
+      return this.failure(
+        rpcRequest.id,
+        code,
+        message,
+        code === 'not_found' ? 404 : 400,
+        error instanceof ProcessError ? error.spawnFailure : undefined
+      )
     }
   }
 
@@ -654,10 +660,16 @@ export class DaemonServer implements Disposable {
     id: string,
     code: RpcFailure['error']['code'],
     message: string,
-    status: number
+    status: number,
+    spawnFailure?: RpcFailure['error']['spawnFailure']
   ): Response {
-    return Response.json({ id, ok: false, error: { code, message } } satisfies RpcFailure, {
-      status,
-    })
+    return Response.json(
+      {
+        id,
+        ok: false,
+        error: { code, message, ...(spawnFailure ? { spawnFailure } : {}) },
+      } satisfies RpcFailure,
+      { status }
+    )
   }
 }

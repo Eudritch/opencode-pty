@@ -15,7 +15,8 @@ import {
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
 import type { WorkerClient, WorkerSnapshot } from './worker-client.ts'
-import { WorkerClient as NativeWorkerClient } from './worker-client.ts'
+import { WorkerClient as NativeWorkerClient, WorkerStartError } from './worker-client.ts'
+import type { SpawnFailure } from './types.ts'
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1000000
 const MAX_OUTPUT_BYTES = 64 * 1024 * 64
@@ -63,7 +64,14 @@ interface PendingWait {
   settled: boolean
 }
 
-export class ProcessError extends Error {}
+export class ProcessError extends Error {
+  constructor(
+    message: string,
+    readonly spawnFailure?: SpawnFailure
+  ) {
+    super(message)
+  }
+}
 
 export function effectiveMaxOutputBytes(value = process.env.PTY_MAX_OUTPUT_BYTES): number {
   const parsed = Number.parseInt(value ?? '', 10)
@@ -716,12 +724,17 @@ export class SessionSupervisor {
         mode: 'exec',
       })
     } catch (error) {
+      const cleanup =
+        error instanceof WorkerStartError
+          ? error.cleanup
+          : { requested: false, terminationConfirmed: false, method: 'none' as const }
       record.status = 'spawn_failed'
-      record.terminationConfirmed = true
-      record.exitReason = { kind: 'spawn_error', message: String(error) }
+      record.terminationRequested = cleanup.requested
+      record.terminationConfirmed = cleanup.terminationConfirmed
+      record.exitReason = { kind: 'spawn_error', message: String(error), cleanup }
       record.updatedAt = new Date().toISOString()
       await this.storage.writeSession(record)
-      throw new ProcessError(String(error))
+      throw new ProcessError(String(error), { cleanup })
     }
     record.pid = (await started.client.snapshot()).pid
     record.worker = started.reference

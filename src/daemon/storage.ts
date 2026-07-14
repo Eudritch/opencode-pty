@@ -374,7 +374,17 @@ export class DaemonStorage {
         ((value.kind === 'timeout' || value.kind === 'output_limit') &&
           (value.message === undefined || validText(value.message))) ||
         value.kind === 'stopped' ||
-        (value.kind === 'spawn_error' && validText(value.message)) ||
+        (value.kind === 'spawn_error' &&
+          validText(value.message) &&
+          (value.cleanup === undefined ||
+            (typeof value.cleanup === 'object' &&
+              value.cleanup !== null &&
+              typeof value.cleanup.requested === 'boolean' &&
+              typeof value.cleanup.terminationConfirmed === 'boolean' &&
+              ['shutdown', 'kill', 'none'].includes(value.cleanup.method) &&
+              (value.cleanup.directChildPid === undefined ||
+                validNonnegativeInteger(value.cleanup.directChildPid)) &&
+              (value.cleanup.message === undefined || validText(value.cleanup.message))))) ||
         (value.kind === 'unknown' && (value.message === undefined || validText(value.message)))
       )
     }

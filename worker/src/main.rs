@@ -32,6 +32,7 @@ struct Bootstrap {
     timeout_seconds: u64,
     max_output_bytes: usize,
     mode: String,
+    fault: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -324,6 +325,11 @@ fn terminate_and_wait(worker: &Arc<Worker>, reason: &str) {
     if let Ok(exit) = exit {
         record_exit(worker, exit);
     }
+}
+
+fn terminate_child_and_wait(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
@@ -635,6 +641,22 @@ mod tests {
         assert_eq!(result["terminationConfirmed"], true);
         remove_dir_all(output_directory).ok();
     }
+
+    #[test]
+    fn startup_cleanup_waits_for_the_direct_child() {
+        #[cfg(unix)]
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("start child");
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 31 127.0.0.1 > NUL"])
+            .spawn()
+            .expect("start child");
+        terminate_child_and_wait(&mut child);
+        assert!(child.try_wait().expect("check child").is_some());
+    }
 }
 
 fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
@@ -829,6 +851,30 @@ fn main() -> Result<(), String> {
     let session_directory = PathBuf::from(&bootstrap.session_directory);
     let output_directory = session_directory.join("output");
     create_dir_all(&output_directory).map_err(|error| error.to_string())?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let descriptor_path = session_directory.join("worker.json");
+    if bootstrap.fault.as_deref() == Some("descriptor_write") {
+        return Err("injected worker descriptor write failure".into());
+    }
+    let descriptor = Descriptor {
+        pid: std::process::id(),
+        start_identity: bootstrap.worker_id.clone(),
+        process_identity: process_identity()?,
+        endpoint: format!(
+            "http://{}",
+            listener.local_addr().map_err(|error| error.to_string())?
+        ),
+        token: bootstrap.worker_control_token.clone(),
+        protocol_version: 1,
+    };
+    write_atomic(
+        &descriptor_path,
+        &serde_json::to_string(&descriptor).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     let mut command = Command::new(&bootstrap.command);
     command
         .args(&bootstrap.args)
@@ -838,9 +884,29 @@ fn main() -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take().ok_or("missing stdout")?;
-    let stderr = child.stderr.take().ok_or("missing stderr")?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = remove_file(&descriptor_path);
+            return Err(error.to_string());
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_and_wait(&mut child);
+            let _ = remove_file(&descriptor_path);
+            return Err("missing stdout".into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_child_and_wait(&mut child);
+            let _ = remove_file(&descriptor_path);
+            return Err("missing stderr".into());
+        }
+    };
     let worker = Arc::new(Worker {
         child: Mutex::new(child),
         state: Mutex::new(State {
@@ -859,32 +925,22 @@ fn main() -> Result<(), String> {
     reader(worker.clone(), stdout, true);
     reader(worker.clone(), stderr, false);
     monitor(worker.clone());
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
-    let descriptor_path = session_directory.join("worker.json");
-    let descriptor = Descriptor {
-        pid: std::process::id(),
-        start_identity: bootstrap.worker_id,
-        process_identity: process_identity()?,
-        endpoint: format!(
-            "http://{}",
-            listener.local_addr().map_err(|error| error.to_string())?
-        ),
-        token: bootstrap.worker_control_token.clone(),
-        protocol_version: 1,
-    };
-    write_atomic(
-        &descriptor_path,
-        &serde_json::to_string(&descriptor).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    println!("{{\"ready\":true}}");
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
     let shutdown = Arc::new(AtomicBool::new(false));
+    if bootstrap.fault.as_deref() == Some("missing_ready") {
+        thread::sleep(Duration::from_millis(100));
+        // Keep serving so the daemon can authenticate shutdown after its readiness timeout.
+    } else {
+        if let Ok(delay) = std::env::var("OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS")
+            .unwrap_or_default()
+            .parse::<u64>()
+        {
+            thread::sleep(Duration::from_millis(delay));
+        }
+        println!("{{\"ready\":true}}");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+    }
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {

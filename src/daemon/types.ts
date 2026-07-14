@@ -7,7 +7,7 @@ export type ExitReason =
   | { kind: 'signal'; signal: string }
   | { kind: 'timeout'; message?: string }
   | { kind: 'stopped' }
-  | { kind: 'spawn_error'; message: string }
+  | { kind: 'spawn_error'; message: string; cleanup?: SpawnCleanup }
   | { kind: 'output_limit'; message?: string }
   | { kind: 'unknown'; message?: string }
 
@@ -20,6 +20,18 @@ export type DaemonStatus =
   | 'lost'
   | 'spawn_failed'
   | 'output_limited'
+
+export interface SpawnCleanup {
+  requested: boolean
+  terminationConfirmed: boolean
+  method: 'shutdown' | 'kill' | 'none'
+  directChildPid?: number
+  message?: string
+}
+
+export interface SpawnFailure {
+  cleanup: SpawnCleanup
+}
 
 export type ExecutionMode = 'pty' | 'exec'
 
@@ -174,6 +186,7 @@ export interface RpcFailure {
       | 'authorization'
       | 'limit'
     message: string
+    spawnFailure?: SpawnFailure
   }
 }
 
