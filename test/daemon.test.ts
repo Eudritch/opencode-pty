@@ -1676,7 +1676,7 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
         try {
           process.kill(directChildPid, 'SIGKILL')
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+          expect((error as NodeJS.ErrnoException).code).toBe('ESRCH')
         }
         expect(await processGone(directChildPid)).toBeTrue()
       }
