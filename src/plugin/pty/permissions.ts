@@ -1,25 +1,31 @@
 import type { PluginClient } from '../types.ts'
-import { allStructured } from './wildcard.ts'
+import { match } from './wildcard.ts'
 import { realpath } from 'node:fs/promises'
 import { isAbsolute, relative, sep } from 'node:path'
 
 type PermissionAction = 'allow' | 'ask' | 'deny'
-type BashPermissions = PermissionAction | Record<string, PermissionAction>
+type PermissionRule = PermissionAction | Record<string, PermissionAction>
+type PermissionConfig = PermissionAction | Record<string, PermissionRule>
 
-interface PermissionConfig {
-  bash?: BashPermissions
-  external_directory?: PermissionAction
+interface Config {
+  permission?: PermissionConfig
+  agent?: Record<string, { permission?: PermissionConfig }>
 }
 
-export type SpawnAuthorizer = (command: string, args: string[], workdir?: string) => Promise<string>
+export type SpawnAuthorizer = (
+  command: string,
+  args: string[],
+  workdir?: string,
+  agent?: string
+) => Promise<string>
 
 // ponytail: SDK 1.3.13 has no permission evaluator/request API, so this local adapter fails closed.
 export function createSpawnAuthorizer(client: PluginClient, directory: string): SpawnAuthorizer {
-  const config = async (): Promise<PermissionConfig> => {
+  const config = async (): Promise<Config> => {
     try {
       const response = await client.config.get()
       if (response.error || !response.data) throw new Error('unavailable')
-      return (response.data as { permission?: PermissionConfig }).permission ?? {}
+      return parseConfig(response.data)
     } catch {
       throw new Error('PTY spawn denied: permission configuration is unavailable.')
     }
@@ -32,10 +38,9 @@ export function createSpawnAuthorizer(client: PluginClient, directory: string): 
     }
     throw new Error(message)
   }
-  return async (command, args, workdir) => {
-    const bash = (await config()).bash
-    const action =
-      typeof bash === 'object' && bash ? allStructured({ head: command, tail: args }, bash) : bash
+  return async (command, args, workdir, agent) => {
+    const permissions = await config()
+    const action = evaluate(permissions, agent, 'bash', [command, ...args].join(' '))
     if (action !== 'allow') {
       return deny(
         `PTY spawn denied: Command "${[command, ...args].join(' ')}" has no explicit allow rule.`
@@ -52,9 +57,75 @@ export function createSpawnAuthorizer(client: PluginClient, directory: string): 
     const outside =
       pathToWorkdir === '..' || pathToWorkdir.startsWith(`..${sep}`) || isAbsolute(pathToWorkdir)
     if (!outside) return resolvedWorkdir
-    if ((await config()).external_directory === 'allow') return resolvedWorkdir
+    if (evaluate(permissions, agent, 'external_directory', resolvedWorkdir) === 'allow')
+      return resolvedWorkdir
     return deny(
       `PTY spawn denied: Working directory "${workdir}" is outside project directory "${directory}" without explicit external_directory allow.`
     )
   }
+}
+
+function parseConfig(value: unknown): Config {
+  if (!record(value)) throw new Error('invalid')
+  const permission = value.permission === undefined ? undefined : parsePermission(value.permission)
+  if (value.agent === undefined) return { permission }
+  if (!record(value.agent)) throw new Error('invalid')
+  const agent: Config['agent'] = {}
+  for (const [name, definition] of Object.entries(value.agent)) {
+    if (!record(definition)) throw new Error('invalid')
+    agent[name] = {
+      permission:
+        definition.permission === undefined ? undefined : parsePermission(definition.permission),
+    }
+  }
+  return { permission, agent }
+}
+
+function parsePermission(value: unknown): PermissionConfig {
+  if (action(value)) return value
+  if (!record(value)) throw new Error('invalid')
+  const result: Record<string, PermissionRule> = {}
+  for (const [permission, rule] of Object.entries(value)) {
+    if (action(rule)) result[permission] = rule
+    else if (record(rule) && Object.values(rule).every(action))
+      result[permission] = rule as Record<string, PermissionAction>
+    else throw new Error('invalid')
+  }
+  return result
+}
+
+function evaluate(config: Config, agent: string | undefined, permission: string, input: string) {
+  let result: PermissionAction | undefined
+  for (const rules of [config.permission, agent ? config.agent?.[agent]?.permission : undefined]) {
+    if (!rules) continue
+    for (const rule of rulesFor(rules)) {
+      if (match(permission, rule.permission) && match(input, rule.pattern)) result = rule.action
+    }
+  }
+  return result
+}
+
+function* rulesFor(permission: PermissionConfig): Generator<{
+  permission: string
+  pattern: string
+  action: PermissionAction
+}> {
+  if (action(permission)) {
+    yield { permission: '*', pattern: '*', action: permission }
+    return
+  }
+  for (const [key, rule] of Object.entries(permission)) {
+    if (action(rule)) yield { permission: key, pattern: '*', action: rule }
+    else
+      for (const [pattern, action] of Object.entries(rule))
+        yield { permission: key, pattern, action }
+  }
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function action(value: unknown): value is PermissionAction {
+  return value === 'allow' || value === 'ask' || value === 'deny'
 }

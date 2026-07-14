@@ -18,6 +18,7 @@ import type { DaemonStorage } from './storage.ts'
 const DEFAULT_MAX_OUTPUT_BYTES = 1000000
 const MAX_OUTPUT_BYTES = 64 * 1024 * 64
 const OUTPUT_CHUNK_BYTES = 64 * 1024
+const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
 const SAFE_ENVIRONMENT_KEYS = new Set([
@@ -37,7 +38,7 @@ const SENSITIVE_ENVIRONMENT_KEY = /(token|secret|password|credential|api[_-]?key
 interface ActiveSession {
   record: SessionRecord
   process: IPty
-  environment: Record<string, string>
+  redactor: OutputRedactor
   timeout?: ReturnType<typeof setTimeout>
   outputBuffer: string
   outputBufferBytes: number
@@ -180,14 +181,53 @@ function runtimeEnvironment(
   return { ...base, ...requested } as Record<string, string>
 }
 
-function redactOutput(data: string, environment: Record<string, string>): string {
-  let redacted = data
-  for (const [key, value] of Object.entries(environment)) {
-    if (SENSITIVE_ENVIRONMENT_KEY.test(key) && value.length >= 4) {
-      redacted = redacted.replaceAll(value, '[REDACTED]')
+export class OutputRedactor {
+  private readonly secrets: string[]
+  private readonly tailLength: number
+  private tail = ''
+
+  constructor(environment: Record<string, string>) {
+    this.secrets = Object.entries(environment)
+      .filter(([key, value]) => SENSITIVE_ENVIRONMENT_KEY.test(key) && value.length >= 4)
+      .map(([, value]) => value)
+      .sort((left, right) => right.length - left.length)
+    if (this.secrets.some((value) => Buffer.byteLength(value) > MAX_REDACTION_SECRET_BYTES)) {
+      throw new Error(
+        `Sensitive environment values must not exceed ${MAX_REDACTION_SECRET_BYTES} bytes.`
+      )
     }
+    this.tailLength = Math.max(0, ...this.secrets.map((value) => [...value].length - 1))
   }
-  return redacted
+
+  write(data: string): string {
+    const characters = [...(this.tail + data)]
+    const end = Math.max(0, characters.length - this.tailLength)
+    let index = 0
+    let output = ''
+    while (index < end) {
+      const secret = this.secrets.find((value) => startsWith(characters, index, [...value]))
+      if (secret) {
+        output += '[REDACTED]'
+        index += [...secret].length
+      } else {
+        output += characters[index]
+        index += 1
+      }
+    }
+    this.tail = characters.slice(index).join('')
+    return output
+  }
+
+  finish(): string {
+    let output = this.tail
+    for (const secret of this.secrets) output = output.replaceAll(secret, '[REDACTED]')
+    this.tail = ''
+    return output
+  }
+}
+
+function startsWith(characters: string[], index: number, prefix: string[]): boolean {
+  return prefix.every((character, offset) => characters[index + offset] === character)
 }
 
 export class SessionSupervisor {
@@ -248,6 +288,7 @@ export class SessionSupervisor {
     const id = `pty_${crypto.randomUUID()}`
     const now = new Date().toISOString()
     const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
+    const redactor = new OutputRedactor(environment)
     const record: SessionRecord = {
       id,
       title:
@@ -313,14 +354,14 @@ export class SessionSupervisor {
     const active: ActiveSession = {
       record,
       process: ptyProcess,
-      environment,
+      redactor,
       outputBuffer: '',
       outputBufferBytes: 0,
       outputStartSequence: record.nextSequence,
       outputArrivalSequence: record.nextSequence,
     }
     this.active.set(id, active)
-    ptyProcess.onData((data: string) => this.handleOutput(active, redactOutput(data, environment)))
+    ptyProcess.onData((data: string) => this.handleOutput(active, redactor.write(data)))
     ptyProcess.onExit(
       ({ exitCode, signal }: { exitCode: number | null; signal?: number | string }) =>
         this.handleExit(active, exitCode, signal)
@@ -417,6 +458,8 @@ export class SessionSupervisor {
     const now = new Date().toISOString()
     const id = `exec_${crypto.randomUUID()}`
     const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
+    const stdoutRedactor = new OutputRedactor(environment)
+    const stderrRedactor = new OutputRedactor(environment)
     const record: SessionRecord = {
       id,
       title: options.title ?? `${options.command} ${args.join(' ')}`.trim(),
@@ -512,7 +555,8 @@ export class SessionSupervisor {
       () => terminate('output_limit'),
       (stop) => {
         stopReading.push(stop)
-      }
+      },
+      stdoutRedactor
     )
     const stderr = this.collectExecOutput(
       typeof child.stderr === 'object' ? child.stderr : null,
@@ -520,7 +564,8 @@ export class SessionSupervisor {
       () => terminate('output_limit'),
       (stop) => {
         stopReading.push(stop)
-      }
+      },
+      stderrRedactor
     )
     const deadline = setTimeout(() => {
       if (child.exitCode === null) {
@@ -542,8 +587,8 @@ export class SessionSupervisor {
         stop()
       })
     const [capturedOut, capturedErr] = await Promise.all([stdout, stderr])
-    const out = { ...capturedOut, data: redactOutput(capturedOut.data, environment) }
-    const err = { ...capturedErr, data: redactOutput(capturedErr.data, environment) }
+    const out = capturedOut
+    const err = capturedErr
     const exitedAt = new Date().toISOString()
     record.exitCode = child.exitCode ?? undefined
     record.exitSignal = child.signalCode ?? undefined
@@ -814,6 +859,7 @@ export class SessionSupervisor {
     signal?: number | string
   ): void {
     if (active.timeout) clearTimeout(active.timeout)
+    this.handleOutput(active, active.redactor.finish())
     this.persistOutput(active)
     this.active.delete(active.record.id)
     if (active.record.timedOut) {
@@ -989,7 +1035,8 @@ export class SessionSupervisor {
     stream: ReadableStream<Uint8Array> | null,
     limit: number,
     terminate: () => Promise<void>,
-    registerStop: (stop: () => void) => void
+    registerStop: (stop: () => void) => void,
+    redactor: OutputRedactor
   ): Promise<{ data: string; bytes: number; limited: boolean }> {
     if (!stream) return { data: '', bytes: 0, limited: false }
     const reader = stream.getReader()
@@ -1024,13 +1071,14 @@ export class SessionSupervisor {
         }
         const kept = value.byteLength <= remaining ? value : this.utf8Prefix(value, remaining)
         bytes += kept.byteLength
-        data += decoder.decode(kept, { stream: true })
+        data += redactor.write(decoder.decode(kept, { stream: true }))
         if (kept.byteLength !== value.byteLength) {
           limited = true
           void terminate()
         }
       }
-      data += decoder.decode()
+      data += redactor.write(decoder.decode())
+      data += redactor.finish()
       return { data, bytes, limited }
     } finally {
       if (stopped) await reader.cancel().catch(() => undefined)

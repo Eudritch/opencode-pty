@@ -7,6 +7,7 @@ import { DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
 import {
   effectiveMaxOutputBytes,
+  OutputRedactor,
   ProcessError,
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
@@ -376,14 +377,14 @@ test('conversation cleanup excludes persistent sessions and environment values s
   await supervisor.flush()
 })
 
-test('spawn permission adapter fails closed and isolates plugin contexts', async () => {
+test('spawn permission adapter fails closed, applies agent overrides, and isolates plugin contexts', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-'))
   const external = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-external-'))
   roots.push(root, external)
-  const authorizer = (permission: unknown, directory = root) =>
+  const authorizer = (permission: unknown, directory = root, agent?: unknown) =>
     createSpawnAuthorizer(
       {
-        config: { get: async () => ({ data: { permission } }) },
+        config: { get: async () => ({ data: { permission, agent } }) },
         tui: { showToast: async () => {} },
       } as never,
       directory
@@ -407,7 +408,25 @@ test('spawn permission adapter fails closed and isolates plugin contexts', async
   await expect(authorizer({ bash: 'ask' })(process.execPath, [], root)).rejects.toThrow(
     'no explicit allow'
   )
-  await expect(authorizer('allow')(process.execPath, [], root)).rejects.toThrow('no explicit allow')
+  await expect(authorizer('allow')(process.execPath, [], root)).resolves.toBe(root)
+  await expect(
+    authorizer(
+      {
+        bash: { '*': 'allow' },
+      },
+      root,
+      { reviewer: { permission: { bash: { '*': 'deny' } } } }
+    )(process.execPath, [], root, 'reviewer')
+  ).rejects.toThrow('no explicit allow')
+  await expect(
+    authorizer(
+      {
+        bash: { '*': 'deny' },
+      },
+      root,
+      { builder: { permission: { bash: { '*': 'allow' } } } }
+    )(process.execPath, [], root, 'builder')
+  ).resolves.toBe(root)
   const git = authorizer({ bash: { '*': 'deny', 'git status': 'allow' } })
   await expect(git('git', ['status'], root)).resolves.toBe(root)
   await expect(git('git', ['reset', '--hard', 'status'], root)).rejects.toThrow('no explicit allow')
@@ -420,11 +439,68 @@ test('spawn permission adapter fails closed and isolates plugin contexts', async
   const secondRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-second-'))
   roots.push(secondRoot)
   await Promise.all([
-    expect(allow(process.execPath, [], root)).resolves.toBe(root),
+    expect(allow(process.execPath, ['-e', 'process.exit()'], root)).resolves.toBe(root),
     expect(
       authorizer({ bash: 'deny' }, secondRoot)(process.execPath, [], secondRoot)
     ).rejects.toThrow('no explicit allow'),
   ])
+})
+
+test('streaming redaction keeps split secrets out of PTY journals and exec streams', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-redaction-stream-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const session = record(root, 'pty_redaction_stream')
+  const state = supervisor as unknown as {
+    active: Map<
+      string,
+      {
+        record: SessionRecord
+        process: { write(data: string): void }
+        redactor: OutputRedactor
+        outputBuffer: string
+        outputBufferBytes: number
+        outputStartSequence: number
+        outputArrivalSequence: number
+      }
+    >
+    records: Map<string, SessionRecord>
+    handleOutput(active: unknown, data: string): void
+  }
+  state.records.set(session.id, session)
+  const active = {
+    record: session,
+    process: { write: () => {} },
+    redactor: new OutputRedactor({ API_TOKEN: 'split-secret-value' }),
+    outputBuffer: '',
+    outputBufferBytes: 0,
+    outputStartSequence: 0,
+    outputArrivalSequence: 0,
+  }
+  state.active.set(session.id, active)
+  state.handleOutput(active, active.redactor.write('before split-sec'))
+  state.handleOutput(active, active.redactor.write('ret-value after\n'))
+  state.handleOutput(active, active.redactor.finish())
+  await supervisor.flush()
+  const raw = await supervisor.rawOutput(session.id)
+  expect(raw?.raw).toBe('before [REDACTED] after\n')
+  expect(raw?.raw).not.toContain('split-secret-value')
+
+  const exec = await supervisor.exec({
+    command: process.execPath,
+    args: [
+      '-e',
+      "process.stdout.write('before split-sec'); setTimeout(() => process.stdout.write('ret-value after\\n'), 20)",
+    ],
+    env: { API_TOKEN: 'split-secret-value' },
+    parentSessionId: 'parent',
+    timeoutSeconds: 2,
+  })
+  expect(exec.stdout).toBe('before [REDACTED] after\n')
+  expect(exec.stdout).not.toContain('split-secret-value')
+  expect((await supervisor.execOutput(exec.session.id))?.stdout).not.toContain('split-secret-value')
 })
 
 test('daemon rejects oversized content-length and chunked RPC bodies before JSON materialization', async () => {
@@ -837,7 +913,7 @@ test('sendWait excludes output delivered synchronously by PTY write acceptance',
     process: {
       write: () => state.handleOutput(active, 'write-adjacent ready\n'),
     },
-    environment: {},
+    redactor: new OutputRedactor({}),
     outputBuffer: '',
     outputBufferBytes: 0,
     outputStartSequence: 0,

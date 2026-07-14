@@ -21,7 +21,7 @@ export function createShellExec(authorizeSpawn: SpawnAuthorizer) {
         .describe('Maximum captured bytes per stdout/stderr stream'),
     },
     async execute(args, ctx) {
-      const workdir = await authorizeSpawn(args.command, args.args ?? [], args.workdir)
+      const workdir = await authorizeSpawn(args.command, args.args ?? [], args.workdir, ctx.agent)
       const result = await manager.exec(
         {
           ...args,
