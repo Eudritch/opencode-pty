@@ -16,6 +16,7 @@ import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types
 import type { SpawnOptions } from '../src/plugin/pty/types.ts'
 import {
   daemonLaunchCommand,
+  daemonReadinessDeadline,
   DaemonClient,
   ownerContext,
   resolveDaemonLauncher,
@@ -2089,6 +2090,12 @@ test('daemon launcher resolves Bun instead of a non-Bun plugin host', () => {
   expect(command).toEqual([bun, 'daemon-entry.js', 'launch-options'])
   expect(command).not.toContain(pluginHost)
   expect(() => resolveDaemonLauncher(() => null)).toThrow('Bun executable')
+})
+
+test('daemon readiness budget starts after launch', () => {
+  const startupStartedAt = 0
+  const spawnedAt = startupStartedAt + 6_000
+  expect(daemonReadinessDeadline(spawnedAt)).toBe(11_000)
 })
 
 test('daemon storage protects private paths', async () => {

@@ -33,6 +33,10 @@ export function daemonLaunchCommand(
   return [resolveDaemonLauncher(which), entryPath, launchOptions]
 }
 
+export function daemonReadinessDeadline(startedAt: number): number {
+  return startedAt + START_TIMEOUT_MS
+}
+
 function retainStartupStderrTail(tail: string, chunk: string): string {
   return `${tail}${chunk}`.slice(-STARTUP_STDERR_TAIL_CHARS)
 }
@@ -268,14 +272,14 @@ export class DaemonClient {
       if (state === 'incompatible') throw this.incompatibleProtocol(this.descriptor)
     }
     this.descriptor = null
-    const deadline = Date.now() + START_TIMEOUT_MS
+    let deadline: number | undefined
     let ownsStartLock = false
     let started = false
     let startupStderr = ''
     let startupToken = ''
     let startupOptions = ''
     try {
-      while (Date.now() < deadline) {
+      while (deadline === undefined || Date.now() < deadline) {
         let descriptor: unknown = null
         try {
           descriptor = await this.storage.readDescriptor()
@@ -343,6 +347,7 @@ export class DaemonClient {
             startupStderr = tail
           }).catch(() => undefined)
           started = true
+          deadline = daemonReadinessDeadline(Date.now())
           continue
         }
         await Bun.sleep(25)
