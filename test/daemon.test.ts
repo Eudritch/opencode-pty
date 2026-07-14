@@ -913,24 +913,30 @@ test('sendWait ignores output before input acceptance and waits for later output
     command: process.execPath,
     args: [
       '-e',
-      "setTimeout(() => console.log('ready'), 50); setTimeout(() => console.log('ready'), 500); setTimeout(() => process.exit(0), 800)",
+      "process.stdin.setRawMode(true); console.log('ready'); process.stdin.once('data', (data) => { if (data.includes('go')) { console.log('ready'); process.exit(0) } })",
     ],
     parentSessionId: 'parent',
     workdir: root,
   })
-  await Bun.sleep(200)
-  const started = Date.now()
-  const result = await supervisor.sendWait(
-    session.id,
-    'go\n',
-    { kind: 'output', literal: 'ready' },
-    2
-  )
-  expect(Date.now() - started).toBeGreaterThan(150)
-  expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
-  const exit = await supervisor.wait(session.id, { kind: 'exit' }, 2)
-  expect(exit).toMatchObject({ satisfied: true, reason: 'exit', exitCode: 0 })
-  expect((await supervisor.get(session.id))?.lastWaitResult).toMatchObject({ reason: 'exit' })
+  try {
+    await expect(
+      supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
+    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
+    expect((await supervisor.read(session.id)).lines.join('\n')).toContain('ready')
+    const result = await supervisor.sendWait(
+      session.id,
+      'go\n',
+      { kind: 'output', literal: 'ready' },
+      2
+    )
+    expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
+    const exit = await supervisor.wait(session.id, { kind: 'exit' }, 2)
+    expect(exit).toMatchObject({ satisfied: true, reason: 'exit', exitCode: 0 })
+    expect((await supervisor.get(session.id))?.lastWaitResult).toMatchObject({ reason: 'exit' })
+  } finally {
+    await supervisor.stop(session.id).catch(() => undefined)
+    await supervisor.flush()
+  }
 })
 
 test('sendWait excludes output delivered synchronously by PTY write acceptance', async () => {

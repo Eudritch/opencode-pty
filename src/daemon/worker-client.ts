@@ -80,7 +80,7 @@ function workerCommand(): string[] {
   }
   const workerPackage =
     process.platform === 'linux' && process.arch === 'x64'
-      ? '@eudritch/opencode-pty-worker-linux-x64'
+      ? linuxWorkerPackage()
       : process.platform === 'win32' && process.arch === 'x64'
         ? '@eudritch/opencode-pty-worker-win32-x64'
         : process.platform === 'darwin' && process.arch === 'arm64'
@@ -99,6 +99,20 @@ function workerCommand(): string[] {
   throw new Error(
     `native_worker_unavailable: install the matching optional worker package for ${process.platform}-${process.arch}, or set PTY_NATIVE_WORKER_PATH.`
   )
+}
+
+function linuxWorkerPackage(): string {
+  const probe = Bun.spawnSync({ cmd: ['ldd', '--version'], stdout: 'pipe', stderr: 'pipe' })
+  const output = `${Buffer.from(probe.stdout)}${Buffer.from(probe.stderr)}`.toLowerCase()
+  if (output.includes('musl'))
+    throw new Error(
+      'native_worker_unavailable: linux-x64-gnu worker requires glibc; Alpine/musl is unsupported. Set PTY_NATIVE_WORKER_PATH to a compatible worker.'
+    )
+  if (!output.includes('glibc') && !output.includes('gnu libc'))
+    throw new Error(
+      'native_worker_unavailable: could not verify a glibc Linux runtime. Set PTY_NATIVE_WORKER_PATH to a compatible worker.'
+    )
+  return '@eudritch/opencode-pty-worker-linux-x64-gnu'
 }
 
 async function processIdentity(pid: number): Promise<string | null> {

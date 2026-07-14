@@ -7,12 +7,6 @@ on:
       - completed
     branches: [main]
   workflow_dispatch:
-    inputs:
-      sign_native_artifacts:
-        description: Attempt native artifact signing (not yet implemented)
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -56,7 +50,7 @@ jobs:
         shell: pwsh
         run: |-
           $platform = "${{ runner.os }}".ToLowerInvariant().Replace("windows", "win32")
-          if ($platform -eq "linux") { $platform = "linux-x64" }
+          if ($platform -eq "linux") { $platform = "linux-x64-gnu" }
           elseif ($platform -eq "win32") { $platform = "win32-x64" }
           elseif ($platform -eq "macos") { $platform = "darwin-arm64" }
           bun native:prepare $platform
@@ -159,13 +153,19 @@ jobs:
 
       - name: Write native artifact checksums and provenance
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
-        run: bun native:manifest native-artifacts
+        run: bun native:manifest native-artifacts "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
 
-      - name: Require configured native signing
-        if: github.event_name == 'workflow_dispatch' && inputs.sign_native_artifacts
+      - name: Install Cosign
+        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign and verify native artifact manifest
+        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
         env:
           NATIVE_ARTIFACT_SIGNING_KEY: ${{ secrets.NATIVE_ARTIFACT_SIGNING_KEY }}
-        run: bun native:sign
+          NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY: ${{ secrets.NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.NATIVE_ARTIFACT_SIGNING_PASSWORD }}
+        run: bun native:sign native-artifacts
 
       - name: Validate release artifact
         run: |
@@ -269,8 +269,7 @@ jobs:
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
         run: |
           set -euo pipefail
-          for artifact in native-artifacts/*.tgz; do npm publish "$artifact" --access public --provenance; done
-          npm publish --access public --provenance
+          bun native:publish native-artifacts "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
 
       - name: Create GitHub release
         if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
@@ -282,6 +281,6 @@ jobs:
           gh release create "v${{ steps.determine.outputs.current_version }}" \
             --title "v${{ steps.determine.outputs.current_version }}" \
             --notes-file "$NOTES_FILE" \
-            native-artifacts/*.tgz native-artifacts/native-artifacts.json
+            native-artifacts/*.tgz native-artifacts/native-artifacts.json native-artifacts/native-artifacts.json.sig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

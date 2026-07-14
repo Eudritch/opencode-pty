@@ -5,8 +5,11 @@ import { join } from 'node:path'
 const root = process.cwd()
 const packageDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-package-'))
 const stateDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-state-'))
-const platform = `${process.platform}-${process.arch}`
-const supportedPlatforms = new Set(['linux-x64', 'win32-x64', 'darwin-arm64'])
+const platform =
+  process.platform === 'linux' && process.arch === 'x64'
+    ? 'linux-x64-gnu'
+    : `${process.platform}-${process.arch}`
+const supportedPlatforms = new Set(['linux-x64-gnu', 'win32-x64', 'darwin-arm64'])
 let daemon: ReturnType<typeof Bun.spawn> | undefined
 let installed: string | undefined
 let executing: Promise<{ ok: boolean; result?: unknown; error?: unknown }> | undefined

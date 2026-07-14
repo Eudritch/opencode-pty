@@ -2,7 +2,7 @@ import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const platforms = {
-  'linux-x64': { os: 'linux', cpu: 'x64' },
+  'linux-x64-gnu': { os: 'linux', cpu: 'x64' },
   'win32-x64': { os: 'win32', cpu: 'x64' },
   'darwin-arm64': { os: 'darwin', cpu: 'arm64' },
 } as const

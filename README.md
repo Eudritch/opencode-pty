@@ -63,9 +63,9 @@ The daemon `diagnostics` RPC reports whether Linux native exec containment is en
 
 ## Native Worker Packages
 
-Native exec is currently packaged for `linux-x64`, `win32-x64`, and `darwin-arm64` as matching optional npm dependencies. `npm` installs only the package matching its `os` and `cpu`; the main `opencode-pty` tarball contains no worker binary. Enable it with `PTY_NATIVE_WORKER_ENABLED=1`; if the matching optional package was omitted or the platform is unsupported, native exec fails closed.
+Native exec is currently packaged for `linux-x64-gnu`, `win32-x64`, and `darwin-arm64` as matching optional npm dependencies. The Linux worker requires glibc; Alpine/musl is rejected before execution unless `PTY_NATIVE_WORKER_PATH` supplies a compatible worker. `npm` installs only the package matching its `os` and `cpu`; the main `opencode-pty` tarball contains no worker binary. Enable it with `PTY_NATIVE_WORKER_ENABLED=1`; if the matching optional package was omitted or the platform is unsupported, native exec fails closed.
 
-Native artifact tarballs have SHA-256 entries and GitHub build provenance in the release `native-artifacts.json`. Native artifact signing is intentionally not claimed: the release workflow refuses to publish when signing credentials/configuration are absent. macOS worker lifecycle verification and the POSIX signal/identity TOCTOU race remain pending.
+Native artifact tarballs have SHA-256 entries and GitHub build provenance in the release `native-artifacts.json`. Release publication requires a configured Cosign key pair: it signs and verifies that manifest before any npm package is published, and the release includes its `.sig`. Releases fail closed when signing credentials or Cosign configuration are absent. macOS worker lifecycle verification and the POSIX signal/identity TOCTOU race remain pending.
 
 ## Development
 
