@@ -11,6 +11,7 @@ import {
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
+import type { SpawnOptions } from '../src/plugin/pty/types.ts'
 import {
   daemonLaunchCommand,
   DaemonClient,
@@ -836,6 +837,41 @@ test('PTY idempotency canonicalizes environment order and scopes only by parent 
   await supervisor.stop(other.id)
   await Bun.sleep(25)
   await supervisor.flush()
+})
+
+test('PTY idempotency rejects a matching fingerprint with a different environment profile', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-environment-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const fingerprint = new Bun.CryptoHasher('sha256')
+    .update(
+      JSON.stringify(
+        Object.entries(process.env).sort(([left], [right]) => left.localeCompare(right))
+      )
+    )
+    .digest('hex')
+  const existing = record(root, 'pty_existing')
+  existing.idempotencyKey = 'same'
+  existing.environment = { kind: 'safe', keys: [], fingerprint, sensitive: false }
+  const state = supervisor as unknown as {
+    records: Map<string, SessionRecord>
+    idempotentSession: (options: SpawnOptions, args: string[]) => SessionRecord | undefined
+  }
+  state.records.set(existing.id, existing)
+
+  expect(() =>
+    state.idempotentSession(
+      {
+        command: 'test',
+        parentSessionId: 'parent',
+        workdir: root,
+        idempotencyKey: 'same',
+        inheritEnv: true,
+      },
+      []
+    )
+  ).toThrow('different command or specification')
 })
 
 test('daemon waits for output, exit, and deadline without plugin polling', async () => {

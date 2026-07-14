@@ -1167,14 +1167,15 @@ export class SessionSupervisor {
         record.idempotencyKey === options.idempotencyKey
     )
     if (!existing) return undefined
+    const environment = environmentProfile(
+      runtimeEnvironment(options.env, options.inheritEnv === true),
+      options.inheritEnv === true
+    )
     if (
       existing.command !== options.command ||
       JSON.stringify(existing.args) !== JSON.stringify(args) ||
-      existing.environment.fingerprint !==
-        environmentProfile(
-          runtimeEnvironment(options.env, options.inheritEnv === true),
-          options.inheritEnv === true
-        ).fingerprint ||
+      existing.environment.kind !== environment.kind ||
+      existing.environment.fingerprint !== environment.fingerprint ||
       existing.name !== options.name ||
       existing.timeoutSeconds !== options.timeoutSeconds
     ) {

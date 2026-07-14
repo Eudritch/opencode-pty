@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 #[cfg(all(test, unix))]
 use std::fs::remove_dir_all;
+#[cfg(all(test, windows))]
+use std::fs::remove_dir_all;
 use std::fs::{File, create_dir_all, remove_file, rename};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -463,6 +465,77 @@ fn quote_windows_arg(argument: &str) -> String {
 }
 
 #[cfg(windows)]
+fn windows_environment_value<'a>(env: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+#[cfg(windows)]
+fn resolve_windows_executable(
+    command: &str,
+    workdir: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if command.is_empty() || command.encode_utf16().any(|unit| unit == 0) {
+        return Err("Windows command cannot be empty or contain NUL".into());
+    }
+    let command_path = Path::new(command);
+    if command.contains(['\\', '/']) || command.contains(':') {
+        let path = if command_path.is_absolute() {
+            command_path.to_path_buf()
+        } else {
+            Path::new(workdir).join(command_path)
+        };
+        let path = std::fs::canonicalize(path)
+            .map_err(|_| format!("Windows executable not found: {command}"))?;
+        return path
+            .is_file()
+            .then(|| path.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("Windows executable not found: {command}"));
+    }
+    let extensions = if command_path.extension().is_some() {
+        vec![String::new()]
+    } else {
+        let extensions = windows_environment_value(env, "PATHEXT")
+            .unwrap_or(".COM;.EXE")
+            .split(';')
+            .filter(|extension| matches!(extension.to_ascii_uppercase().as_str(), ".COM" | ".EXE"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if extensions.is_empty() {
+            vec![".COM".into(), ".EXE".into()]
+        } else {
+            extensions
+        }
+    };
+    for entry in windows_environment_value(env, "PATH")
+        .unwrap_or_default()
+        .split(';')
+    {
+        let entry = entry.trim_matches('"');
+        let directory = Path::new(entry);
+        let base = if directory.as_os_str().is_empty() {
+            PathBuf::from(workdir)
+        } else if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            Path::new(workdir).join(directory)
+        };
+        for extension in &extensions {
+            let mut candidate = base.join(command_path);
+            candidate.as_mut_os_string().push(extension);
+            if let Ok(path) = std::fs::canonicalize(candidate)
+                && path.is_file()
+            {
+                return Ok(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Err(format!("Windows executable not found: {command}"))
+}
+
+#[cfg(windows)]
 fn windows_environment(env: &BTreeMap<String, String>) -> Result<Vec<u16>, String> {
     for (key, value) in env {
         // Windows ordinal ignore-case is not Rust Unicode uppercasing. Restrict names to the
@@ -616,7 +689,11 @@ fn windows_job() -> Result<WinHandle, String> {
 #[cfg(windows)]
 fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     let job = windows_job()?;
-    let application = wide(&bootstrap.command)?;
+    let application = wide(&resolve_windows_executable(
+        &bootstrap.command,
+        &bootstrap.workdir,
+        &bootstrap.env,
+    )?)?;
     let cwd = wide(&bootstrap.workdir)?;
     let environment = windows_environment(&bootstrap.env)?;
     let mut command_line = wide(
@@ -2375,6 +2452,43 @@ mod tests {
                 .last(),
             Some(&0)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolves_bare_commands_from_path_and_pathext() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-pty-worker-resolver-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        create_dir_all(&bin).expect("create fixture directory");
+        let node = bin.join("node.exe");
+        let cmd = bin.join("cmd.exe");
+        File::create(&node).expect("create node fixture");
+        File::create(&cmd).expect("create cmd fixture");
+        let env = BTreeMap::from([
+            ("Path".into(), bin.to_string_lossy().into_owned()),
+            ("PATHEXT".into(), ".CMD;.EXE".into()),
+        ]);
+        assert_eq!(
+            resolve_windows_executable("node", root.to_str().expect("Unicode temp path"), &env)
+                .expect("resolve bare node"),
+            std::fs::canonicalize(&node)
+                .expect("canonical node fixture")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            resolve_windows_executable("cmd.exe", root.to_str().expect("Unicode temp path"), &env)
+                .expect("resolve cmd.exe"),
+            std::fs::canonicalize(&cmd)
+                .expect("canonical cmd fixture")
+                .to_string_lossy()
+        );
+        remove_dir_all(root).expect("remove fixture directory");
     }
 
     #[test]
