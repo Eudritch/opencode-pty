@@ -1,9 +1,9 @@
-import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
+import { chmod, mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
-  OUTPUT_JOURNAL_VERSION,
   type DaemonDescriptor,
   type ExitReason,
+  OUTPUT_JOURNAL_VERSION,
   type OutputChunk,
   type SessionRecord,
 } from './types.ts'
@@ -67,6 +67,7 @@ export function daemonDataDirectory(): string {
 
 export class DaemonStorage {
   private readonly outputTails = new Map<string, OutputChunk>()
+  private readonly writes = new Map<string, Promise<void>>()
   private windowsUserSid: Promise<string> | undefined
   private windowsRootProtected = false
 
@@ -381,7 +382,7 @@ export class DaemonStorage {
               value.cleanup !== null &&
               typeof value.cleanup.requested === 'boolean' &&
               typeof value.cleanup.terminationConfirmed === 'boolean' &&
-              ['shutdown', 'kill', 'none'].includes(value.cleanup.method) &&
+              ['shutdown', 'rollback', 'kill', 'none'].includes(value.cleanup.method) &&
               (value.cleanup.directChildPid === undefined ||
                 validNonnegativeInteger(value.cleanup.directChildPid)) &&
               (value.cleanup.message === undefined || validText(value.cleanup.message))))) ||
@@ -645,6 +646,17 @@ export class DaemonStorage {
   }
 
   private async writeAtomic(path: string, contents: string): Promise<void> {
+    const previous = this.writes.get(path) ?? Promise.resolve()
+    const write = previous.catch(() => undefined).then(() => this.writeAtomicNow(path, contents))
+    this.writes.set(path, write)
+    try {
+      await write
+    } finally {
+      if (this.writes.get(path) === write) this.writes.delete(path)
+    }
+  }
+
+  private async writeAtomicNow(path: string, contents: string): Promise<void> {
     const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`
     const handle = await open(temporaryPath, 'w', 0o600)
     try {

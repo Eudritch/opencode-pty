@@ -1,22 +1,22 @@
-import { spawn, type IPty } from 'bun-pty'
 import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { type IPty, spawn } from 'bun-pty'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
+import type { DaemonStorage } from './storage.ts'
+import type { SpawnFailure } from './types.ts'
 import {
-  type ExecResult,
   type EnvironmentProfile,
-  OUTPUT_JOURNAL_VERSION,
+  type ExecResult,
   type ExitReason,
+  OUTPUT_JOURNAL_VERSION,
   type SessionRecord,
   type StopResult,
   type WaitCondition,
   type WaitResult,
   type WriteResult,
 } from './types.ts'
-import type { DaemonStorage } from './storage.ts'
 import type { WorkerClient, WorkerSnapshot } from './worker-client.ts'
 import { WorkerClient as NativeWorkerClient, WorkerStartError } from './worker-client.ts'
-import type { SpawnFailure } from './types.ts'
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1000000
 const MAX_OUTPUT_BYTES = 64 * 1024 * 64
@@ -746,7 +746,7 @@ export class SessionSupervisor {
     try {
       result = await started.client.wait(options.timeoutSeconds * 1000 + NATIVE_WAIT_MARGIN_MS)
     } catch (error) {
-      void this.monitorNative(record, started.client)
+      await this.rollbackNative(record, started.client, error)
       throw error
     }
     if (!this.nativeTerminal(result)) void this.monitorNative(record, started.client)
@@ -764,14 +764,43 @@ export class SessionSupervisor {
         await this.finalizeNative(record, worker, result)
         return
       } catch {
-        // Keep the descriptor reachable for recovery while a transient RPC failure clears.
-        await Bun.sleep(100)
+        if (this.nativeWorkers.get(record.id) !== worker) return
+        await this.rollbackNative(
+          record,
+          worker,
+          new Error('Native worker RPC became unavailable.')
+        )
+        return
       }
     }
   }
 
   private nativeTerminal(result: WorkerSnapshot): boolean {
     return result.terminationConfirmed && result.status !== 'running'
+  }
+
+  private async rollbackNative(
+    record: SessionRecord,
+    worker: WorkerClient,
+    error: unknown
+  ): Promise<void> {
+    const cleanup = await worker.rollback().catch((rollbackError) => ({
+      requested: false,
+      terminationConfirmed: false,
+      method: 'none' as const,
+      message: String(rollbackError),
+    }))
+    record.status = 'lost'
+    record.terminationRequested = cleanup.requested
+    record.terminationConfirmed = cleanup.terminationConfirmed
+    record.exitReason = {
+      kind: 'unknown',
+      message: `Native worker control failed: ${String(error)}; cleanup=${JSON.stringify(cleanup)}`,
+    }
+    record.updatedAt = new Date().toISOString()
+    await this.storage.writeSession(record)
+    await this.storage.removeWorkerDescriptor(record.id)
+    this.nativeWorkers.delete(record.id)
   }
 
   private async finalizeNative(

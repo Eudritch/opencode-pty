@@ -81,6 +81,7 @@ function workerCommand(): string[] {
 }
 
 async function processIdentity(pid: number): Promise<string | null> {
+  if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL === '1') return null
   if (process.platform !== 'win32') {
     try {
       const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
@@ -109,13 +110,41 @@ async function processIdentity(pid: number): Promise<string | null> {
   return output || null
 }
 
-async function exited(child: ReturnType<typeof Bun.spawn>, identity: string): Promise<boolean> {
-  await Promise.race([child.exited, Bun.sleep(2000)])
-  return (await processIdentity(child.pid)) !== identity
+async function exited(
+  child: ReturnType<typeof Bun.spawn>,
+  identity: string | null
+): Promise<boolean> {
+  const exited = await Promise.race([
+    child.exited.then(() => true),
+    Bun.sleep(2000).then(() => false),
+  ])
+  if (exited) return true // Bun owns this handle, so its exit promise is stronger than a PID probe.
+  if (!identity) return false
+  const current = await processIdentity(child.pid)
+  return current !== null && current !== identity
+}
+
+function frame(value: unknown): Buffer {
+  const payload = Buffer.from(JSON.stringify(value), 'utf8')
+  return Buffer.concat([Buffer.from(Uint32Array.of(payload.byteLength).buffer).swap32(), payload])
 }
 
 export class WorkerClient {
-  private constructor(private readonly descriptor: WorkerDescriptor) {}
+  private constructor(
+    private readonly descriptor: WorkerDescriptor,
+    private readonly owned?: {
+      child: ReturnType<typeof Bun.spawn>
+      reader: ReadableStreamDefaultReader<Uint8Array>
+      token: string
+    }
+  ) {}
+
+  private async control(operation: 'start' | 'rollback'): Promise<void> {
+    if (!this.owned) throw new Error('Worker control channel is not owned by this daemon.')
+    const input = this.owned.child.stdin
+    if (!input || typeof input === 'number') throw new Error('Worker control pipe is unavailable.')
+    await input.write(frame({ operation, token: this.owned.token }))
+  }
 
   static async start(bootstrap: Omit<WorkerBootstrap, 'workerControlToken' | 'workerId'>): Promise<{
     client: WorkerClient
@@ -142,7 +171,9 @@ export class WorkerClient {
       stderr: 'inherit',
     })
     const identity = await processIdentity(child.pid)
+    let client: WorkerClient | undefined
     const cleanup = async (): Promise<SpawnCleanup> => {
+      if (client) return client.rollback()
       try {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
         if (
@@ -152,30 +183,31 @@ export class WorkerClient {
           identity !== null &&
           descriptor.processIdentity === identity
         ) {
-          const client = new WorkerClient(descriptor)
-          const directChildPid = (await client.snapshot()).pid
-          await client.shutdown()
+          // The command is not eligible to spawn before the authenticated start frame.
+          const input = child.stdin
+          if (input && typeof input !== 'number') await input.end()
           return {
             requested: true,
             terminationConfirmed: await exited(child, identity),
-            method: 'shutdown',
-            directChildPid,
+            method: 'rollback',
           }
         }
       } catch {}
+      try {
+        const input = child.stdin
+        if (input && typeof input !== 'number') await input.end()
+      } catch {}
       if (!identity) {
         return {
-          requested: false,
-          terminationConfirmed: child.exitCode !== null,
-          method: 'none',
-          message: 'Worker identity could not be verified.',
+          requested: true,
+          terminationConfirmed: await exited(child, null),
+          method: 'rollback',
+          message:
+            'Worker identity could not be verified; bootstrap was closed before command start.',
         }
       }
-      const current = await processIdentity(child.pid)
-      if (current !== identity) {
-        return { requested: false, terminationConfirmed: true, method: 'none' }
-      }
       try {
+        // Fresh Bun handles are owned by this daemon; do not require /proc/mac identity to reap them.
         child.kill()
       } catch (error) {
         return {
@@ -194,10 +226,10 @@ export class WorkerClient {
     try {
       if (!identity)
         throw new Error('native_worker_unavailable: worker identity verification failed.')
-      await child.stdin.write(
-        Buffer.concat([Buffer.from(Uint32Array.of(payload.byteLength).buffer).swap32(), payload])
-      )
-      await child.stdin.end()
+      const input = child.stdin
+      if (!input || typeof input === 'number')
+        throw new Error('native_worker_unavailable: worker input unavailable.')
+      await input.write(frame(JSON.parse(payload.toString('utf8'))))
       const reader = child.stdout.getReader()
       const ready = await Promise.race([
         reader
@@ -207,8 +239,6 @@ export class WorkerClient {
           () => false
         ),
       ])
-      if (!ready) await reader.cancel().catch(() => undefined)
-      reader.releaseLock()
       if (ready) {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
         if (
@@ -219,16 +249,26 @@ export class WorkerClient {
         ) {
           throw new Error('native_worker_unavailable: worker descriptor verification failed.')
         }
-        return {
-          client: new WorkerClient(descriptor),
-          reference: {
-            pid: descriptor.pid,
-            startIdentity: descriptor.startIdentity,
-            processIdentity: descriptor.processIdentity,
-            endpoint: descriptor.endpoint,
-            protocolVersion: descriptor.protocolVersion,
-          },
+        client = new WorkerClient(descriptor, { child, reader, token: workerControlToken })
+        await client.control('start')
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+          try {
+            await client.snapshot()
+            return {
+              client,
+              reference: {
+                pid: descriptor.pid,
+                startIdentity: descriptor.startIdentity,
+                processIdentity: descriptor.processIdentity,
+                endpoint: descriptor.endpoint,
+                protocolVersion: descriptor.protocolVersion,
+              },
+            }
+          } catch {
+            await Bun.sleep(20)
+          }
         }
+        throw new Error('native_worker_unavailable: worker command did not start.')
       }
       let descriptor: WorkerDescriptor | null = null
       for (let attempt = 0; attempt < 40 && !descriptor; attempt += 1) {
@@ -300,6 +340,49 @@ export class WorkerClient {
       }
     }
     throw new Error('Native worker did not exit after shutdown.')
+  }
+
+  async rollback(): Promise<SpawnCleanup> {
+    if (!this.owned) {
+      return {
+        requested: false,
+        terminationConfirmed: false,
+        method: 'none',
+        message: 'Worker rollback channel is not owned by this daemon.',
+      }
+    }
+    try {
+      await this.control('rollback')
+      const input = this.owned.child.stdin
+      if (input && typeof input !== 'number') await input.end()
+    } catch {}
+    let output = ''
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      const next = await Promise.race([
+        this.owned.reader.read(),
+        Bun.sleep(deadline - Date.now()).then(
+          () => ({ done: true }) as ReadableStreamReadResult<Uint8Array>
+        ),
+      ])
+      if (next.done) break
+      output += new TextDecoder().decode(next.value)
+      if (output.includes(`"rollback":true,"token":"${this.owned.token}"`)) {
+        const pid = Number(/"pid":(\d+)/.exec(output)?.[1])
+        return {
+          requested: true,
+          terminationConfirmed: Number.isSafeInteger(pid) && pid > 0,
+          method: 'rollback',
+          ...(Number.isSafeInteger(pid) && pid > 0 ? { directChildPid: pid } : {}),
+        }
+      }
+    }
+    return {
+      requested: true,
+      terminationConfirmed: false,
+      method: 'rollback',
+      message: 'Worker exited without an authenticated direct-child rollback receipt.',
+    }
   }
 
   private async call<T>(

@@ -24,7 +24,7 @@ export type DaemonStatus =
 export interface SpawnCleanup {
   requested: boolean
   terminationConfirmed: boolean
-  method: 'shutdown' | 'kill' | 'none'
+  method: 'shutdown' | 'rollback' | 'kill' | 'none'
   directChildPid?: number
   message?: string
 }

@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
@@ -12,25 +12,11 @@ import {
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
-import { DaemonClient } from '../src/plugin/pty/daemon-client.ts'
-import { ownerContext } from '../src/plugin/pty/daemon-client.ts'
+import { DaemonClient, ownerContext } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
-
-async function processGone(pid: number) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try {
-      process.kill(pid, 0)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true
-      throw error
-    }
-    await Bun.sleep(25)
-  }
-  return false
-}
 
 const roots: string[] = []
 
@@ -1210,9 +1196,6 @@ test('native startup failures clean up the direct child and report the proven ou
       },
       context
     ).then((response) => response.json())
-    const childPid = (
-      readinessFailure as { error: { spawnFailure: { cleanup: { directChildPid: number } } } }
-    ).error.spawnFailure.cleanup.directChildPid
     expect(readinessFailure).toMatchObject({
       ok: false,
       error: {
@@ -1221,17 +1204,14 @@ test('native startup failures clean up the direct child and report the proven ou
           cleanup: {
             requested: true,
             terminationConfirmed: true,
-            directChildPid: expect.any(Number),
           },
         },
       },
     })
-    expect(childPid).toBeNumber()
-    expect(await processGone(childPid)).toBeTrue()
     const readinessRecord = (await storage.loadSessions()).find(
       (record) =>
         record.exitReason?.kind === 'spawn_error' &&
-        record.exitReason.cleanup?.directChildPid === childPid
+        record.exitReason.cleanup?.method === 'rollback'
     )
     expect(readinessRecord).toMatchObject({
       status: 'spawn_failed',
@@ -1239,9 +1219,113 @@ test('native startup failures clean up the direct child and report the proven ou
       terminationConfirmed: true,
       exitReason: {
         kind: 'spawn_error',
-        cleanup: { requested: true, terminationConfirmed: true, method: 'shutdown' },
+        cleanup: { requested: true, terminationConfirmed: true, method: 'rollback' },
       },
     })
+  } finally {
+    await server.stop()
+    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
+
+test('native worker identity and ready-output failures close the owned worker before command spawn', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-bootstrap-failure-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  const previousProbeFault = process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
+  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-bootstrap-failure', root)
+  const server = new DaemonServer(
+    storage,
+    new SessionSupervisor(storage),
+    'native-bootstrap-failure'
+  )
+  try {
+    const descriptor = await server.start()
+    process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL = '1'
+    const identityFailure = await rpc(
+      descriptor,
+      'exec',
+      { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], timeoutSeconds: 2 },
+      context
+    ).then((response) => response.json())
+    expect(identityFailure).toMatchObject({
+      error: { spawnFailure: { cleanup: { requested: true, terminationConfirmed: true } } },
+    })
+    delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
+    const readyFailure = await rpc(
+      descriptor,
+      'exec',
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'ready_stdout' },
+        timeoutSeconds: 2,
+      },
+      context
+    ).then((response) => response.json())
+    expect(readyFailure).toMatchObject({
+      error: { spawnFailure: { cleanup: { terminationConfirmed: true } } },
+    })
+  } finally {
+    await server.stop()
+    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    if (previousProbeFault === undefined)
+      delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
+    else process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL = previousProbeFault
+  }
+}, 10_000)
+
+test('native RPC loss after command start reaps the direct child before persisting unknown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-rpc-loss-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-rpc-loss', root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-rpc-loss')
+  try {
+    const descriptor = await server.start()
+    const result = await rpc(
+      descriptor,
+      'exec',
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'rpc_loss_after_start' },
+        timeoutSeconds: 2,
+      },
+      context
+    ).then((response) => response.json())
+    expect(result).toMatchObject({ ok: false })
+    const session = (await storage.loadSessions()).find((entry) => entry.mode === 'exec')
+    expect(session).toMatchObject({ status: 'lost', terminationConfirmed: false })
+    expect(session?.exitReason).toMatchObject({ kind: 'unknown' })
   } finally {
     await server.stop()
     if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED

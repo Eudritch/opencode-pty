@@ -46,6 +46,12 @@ struct Descriptor {
     protocol_version: u32,
 }
 
+#[derive(Deserialize)]
+struct Control {
+    operation: String,
+    token: String,
+}
+
 #[cfg(unix)]
 fn process_identity() -> Result<String, String> {
     let pid = std::process::id();
@@ -195,6 +201,15 @@ fn read_frame<R: Read>(input: &mut R) -> Result<Vec<u8>, String> {
         .read_exact(&mut data)
         .map_err(|error| error.to_string())?;
     Ok(data)
+}
+
+fn control(input: &mut impl Read, token: &str) -> Result<Control, String> {
+    let control: Control =
+        serde_json::from_slice(&read_frame(input)?).map_err(|error| error.to_string())?;
+    if control.token != token || (control.operation != "start" && control.operation != "rollback") {
+        return Err("invalid worker control frame".into());
+    }
+    Ok(control)
 }
 
 fn redact(mut data: String, secrets: &[String]) -> String {
@@ -840,8 +855,9 @@ fn serve(mut stream: TcpStream, worker: Arc<Worker>, token: String, shutdown: Ar
 }
 
 fn main() -> Result<(), String> {
-    let bootstrap: Bootstrap = serde_json::from_slice(&read_frame(&mut std::io::stdin())?)
-        .map_err(|error| error.to_string())?;
+    let mut stdin = std::io::stdin();
+    let bootstrap: Bootstrap =
+        serde_json::from_slice(&read_frame(&mut stdin)?).map_err(|error| error.to_string())?;
     if bootstrap.mode != "exec" {
         return Err("only exec mode is supported".into());
     }
@@ -875,6 +891,34 @@ fn main() -> Result<(), String> {
         &serde_json::to_string(&descriptor).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    if bootstrap.fault.as_deref() == Some("ready_stdout") {
+        let _ = remove_file(&descriptor_path);
+        return Err("injected worker ready stdout failure".into());
+    }
+    if bootstrap.fault.as_deref() == Some("missing_ready") {
+        thread::sleep(Duration::from_millis(100));
+    } else {
+        if let Ok(delay) = std::env::var("OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS")
+            .unwrap_or_default()
+            .parse::<u64>()
+        {
+            thread::sleep(Duration::from_millis(delay));
+        }
+        println!("{{\"ready\":true}}");
+        if let Err(error) = std::io::stdout().flush() {
+            let _ = remove_file(&descriptor_path);
+            return Err(error.to_string());
+        }
+    }
+    // The daemon controls command eligibility through this inherited pipe. Closing it before
+    // `start` means no direct child can be created after a failed worker identity probe.
+    match control(&mut stdin, &bootstrap.worker_control_token) {
+        Ok(control) if control.operation == "start" => {}
+        Ok(_) | Err(_) => {
+            let _ = remove_file(&descriptor_path);
+            return Ok(());
+        }
+    }
     let mut command = Command::new(&bootstrap.command);
     command
         .args(&bootstrap.args)
@@ -926,20 +970,28 @@ fn main() -> Result<(), String> {
     reader(worker.clone(), stderr, false);
     monitor(worker.clone());
     let shutdown = Arc::new(AtomicBool::new(false));
-    if bootstrap.fault.as_deref() == Some("missing_ready") {
-        thread::sleep(Duration::from_millis(100));
-        // Keep serving so the daemon can authenticate shutdown after its readiness timeout.
-    } else {
-        if let Ok(delay) = std::env::var("OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS")
-            .unwrap_or_default()
-            .parse::<u64>()
-        {
-            thread::sleep(Duration::from_millis(delay));
-        }
-        println!("{{\"ready\":true}}");
-        std::io::stdout()
-            .flush()
-            .map_err(|error| error.to_string())?;
+    let rollback = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        let rollback = rollback.clone();
+        let token = bootstrap.worker_control_token.clone();
+        thread::spawn(move || {
+            // EOF is parent death for this worker: reaping happens in the owner thread below.
+            match control(&mut std::io::stdin(), &token) {
+                Ok(control) if control.operation == "rollback" => {
+                    rollback.store(true, Ordering::Release)
+                }
+                _ => rollback.store(true, Ordering::Release),
+            }
+            shutdown.store(true, Ordering::Release);
+        });
+    }
+    if bootstrap.fault.as_deref() == Some("rpc_loss_after_start") {
+        let shutdown = shutdown.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            shutdown.store(true, Ordering::Release);
+        });
     }
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
@@ -954,6 +1006,22 @@ fn main() -> Result<(), String> {
             }
             Err(_) => break,
         }
+    }
+    if !worker
+        .state
+        .lock()
+        .expect("state lock")
+        .termination_confirmed
+    {
+        terminate_and_wait(&worker, "stopped");
+    }
+    if rollback.load(Ordering::Acquire) {
+        let pid = worker.child.lock().expect("child lock").id();
+        println!(
+            "{{\"rollback\":true,\"token\":\"{}\",\"pid\":{pid}}}",
+            bootstrap.worker_control_token
+        );
+        let _ = std::io::stdout().flush();
     }
     let _ = remove_file(descriptor_path);
     Ok(())
