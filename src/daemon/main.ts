@@ -13,7 +13,8 @@ function launchOptions(): DaemonLaunchOptions {
     if (
       (decoded.dataDirectory !== undefined && typeof decoded.dataDirectory !== 'string') ||
       (decoded.token !== undefined && typeof decoded.token !== 'string') ||
-      (decoded.startLockToken !== undefined && typeof decoded.startLockToken !== 'string')
+      (decoded.startLockHandoffToken !== undefined &&
+        typeof decoded.startLockHandoffToken !== 'string')
     ) {
       throw new Error('invalid options')
     }
@@ -30,7 +31,7 @@ const server = new DaemonServer(
   new SessionSupervisor(storage),
   options.token,
   undefined,
-  options.startLockToken
+  options.startLockHandoffToken
 )
 
 await server.start()

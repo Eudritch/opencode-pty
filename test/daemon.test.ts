@@ -530,37 +530,85 @@ test('start locks retain live owners and recover exactly one dead owner', async 
   roots.push(root)
   const storage = new DaemonStorage(root)
   const live = await storage.acquireStartLock()
-  expect(live).toEqual(expect.any(String))
+  expect(typeof live?.token).toBe('string')
+  expect(typeof live?.handoffToken).toBe('string')
   expect(await storage.acquireStartLock()).toBeNull()
   if (!live) throw new Error('Expected start lock.')
-  await storage.releaseStartLock(live)
+  await storage.releaseStartLock(live.token)
   await writeFile(
     join(root, 'daemon-start.lock'),
     JSON.stringify({ token: 'dead', pid: 2147483647, processIdentity: 'dead' })
   )
   const recovered = await Promise.all([storage.acquireStartLock(), storage.acquireStartLock()])
   expect(recovered.filter(Boolean)).toHaveLength(1)
-  const recoveredToken = recovered.find(Boolean)
-  if (!recoveredToken) throw new Error('Expected recovered start lock.')
-  await storage.releaseStartLock(recoveredToken)
+  const recoveredLock = recovered.find((lock) => lock !== null)
+  if (!recoveredLock) throw new Error('Expected recovered start lock.')
+  await storage.releaseStartLock(recoveredLock.token)
+})
+
+test('start lock handoff permits one distinct daemon identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-handoff-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  if (!(await processStartIdentity(process.pid))) return
+  const lock = await storage.acquireStartLock()
+  if (!lock) throw new Error('Expected start lock.')
+
+  const module = new URL('../src/daemon/storage.ts', import.meta.url).href
+  const claim = async (token: string) => {
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { DaemonStorage } from ${JSON.stringify(module)}; process.stdout.write(String(Boolean(await new DaemonStorage(process.argv[1]).claimStartLock(process.argv[2]))))`,
+        root,
+        token,
+      ],
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const output = await new Response(child.stdout).text()
+    expect(await child.exited).toBe(0)
+    return output
+  }
+  expect(await storage.claimStartLock(lock.handoffToken)).toBeNull()
+  expect(await claim('wrong-token')).toBe('false')
+  expect(await claim(lock.handoffToken)).toBe('true')
+  expect(await claim(lock.handoffToken)).toBe('false')
+  expect(await storage.claimStartLock(lock.handoffToken)).toBeNull()
+  await storage.releaseStartLock(lock.token)
+  const claimed = JSON.parse(await readFile(join(root, 'daemon-start.lock'), 'utf8')) as {
+    token: string
+    handoffToken: string | null
+    pid: number
+  }
+  expect(claimed).toMatchObject({ handoffToken: null })
+  expect(claimed.token).not.toBe(lock.token)
+  expect(claimed.pid).not.toBe(process.pid)
 })
 
 test('start lock recovery removes crash remnants but retains a valid live lock', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-remnants-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
-  for (const value of ['', '{', JSON.stringify({ token: 'old', pid: process.pid })]) {
+  for (const value of [
+    '',
+    '{',
+    JSON.stringify({ token: 'old', handoffToken: null, pid: process.pid, processIdentity: 'old' }),
+  ]) {
     await storage.initialize()
     await writeFile(join(root, 'daemon-start.lock'), value)
     const token = await storage.acquireStartLock()
-    expect(token).toEqual(expect.any(String))
+    expect(typeof token?.token).toBe('string')
+    expect(typeof token?.handoffToken).toBe('string')
     if (!token) throw new Error('Expected recovered start lock.')
-    await storage.releaseStartLock(token)
+    await storage.releaseStartLock(token.token)
   }
   const live = await storage.acquireStartLock()
-  expect(live).toEqual(expect.any(String))
+  expect(typeof live?.token).toBe('string')
+  expect(typeof live?.handoffToken).toBe('string')
   expect(await storage.acquireStartLock()).toBeNull()
-  if (live) await storage.releaseStartLock(live)
+  if (live) await storage.releaseStartLock(live.token)
 })
 
 test('start locks reject reused PIDs with a different process identity', async () => {
@@ -575,8 +623,9 @@ test('start locks reject reused PIDs with a different process identity', async (
     JSON.stringify({ token: 'old', pid: process.pid, processIdentity: `${identity}-old` })
   )
   const token = await storage.acquireStartLock()
-  expect(token).toEqual(expect.any(String))
-  if (token) await storage.releaseStartLock(token)
+  expect(typeof token?.token).toBe('string')
+  expect(typeof token?.handoffToken).toBe('string')
+  if (token) await storage.releaseStartLock(token.token)
 })
 
 test('descriptor ownership rejects a reused PID with a different process identity', async () => {

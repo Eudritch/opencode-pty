@@ -39,7 +39,7 @@ export class DaemonServer implements Disposable {
     private readonly supervisor: SessionSupervisor,
     private token: string = '',
     private readonly maxSessionsPerOwner: number = DEFAULT_MAX_SESSIONS_PER_OWNER,
-    private readonly startLockToken?: string
+    private readonly startLockHandoffToken?: string
   ) {}
 
   async start(): Promise<DaemonDescriptor> {
@@ -48,8 +48,10 @@ export class DaemonServer implements Disposable {
     this.processIdentity = (await processStartIdentity(process.pid)) ?? ''
     if (!this.processIdentity) throw new Error('Unable to verify daemon process identity.')
     this.token ||= crypto.randomUUID().replaceAll('-', '')
-    const startLockToken = this.startLockToken ?? (await this.storage.acquireStartLock())
-    if (!startLockToken || !(await this.storage.claimStartLock(startLockToken))) {
+    const startLockToken = this.startLockHandoffToken
+      ? await this.storage.claimStartLock(this.startLockHandoffToken)
+      : (await this.storage.acquireStartLock())?.token
+    if (!startLockToken) {
       throw new Error('PTY daemon start lock was lost.')
     }
     if (await this.storage.descriptorOwnerAlive()) {

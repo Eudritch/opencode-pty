@@ -275,7 +275,7 @@ export class DaemonClient {
     }
     this.descriptor = null
     let deadline: number | undefined
-    let startLockToken: string | null = null
+    let startLock: { token: string; handoffToken: string } | null = null
     let started = false
     let startupStderr = ''
     let startupToken = ''
@@ -301,12 +301,12 @@ export class DaemonClient {
             continue
           }
         }
-        if (!startLockToken) {
-          startLockToken = await this.storage.acquireStartLock()
-          if (startLockToken) continue
+        if (!startLock) {
+          startLock = await this.storage.acquireStartLock()
+          if (startLock) continue
           deadline ??= daemonReadinessDeadline(Date.now())
         }
-        if (startLockToken && !started) {
+        if (startLock && !started) {
           let lockedDescriptor: unknown = null
           try {
             lockedDescriptor = await this.storage.readDescriptor()
@@ -328,7 +328,7 @@ export class DaemonClient {
             JSON.stringify({
               dataDirectory: this.storage.rootDirectory,
               token,
-              startLockToken,
+              startLockHandoffToken: startLock.handoffToken,
             })
           ).toString('base64url')
           startupOptions = launchOptions
@@ -361,7 +361,7 @@ export class DaemonClient {
         await Bun.sleep(25)
       }
     } finally {
-      if (startLockToken) await this.storage.releaseStartLock(startLockToken)
+      if (startLock) await this.storage.releaseStartLock(startLock.token)
     }
     const diagnostic = safeStartupStderrTail(startupStderr, startupToken, startupOptions)
     throw new Error(
