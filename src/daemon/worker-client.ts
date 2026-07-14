@@ -7,6 +7,8 @@ function readyTimeout(value: string | undefined): number {
   return Number.isFinite(timeout) && timeout > 0 ? timeout : 5000
 }
 
+const MAX_READY_FRAME_BYTES = 1024 * 1024
+
 export interface WorkerDescriptor {
   pid: number
   startIdentity: string
@@ -81,6 +83,8 @@ function workerCommand(): string[] {
 }
 
 async function processIdentity(pid: number): Promise<string | null> {
+  if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW === '1')
+    throw new Error('injected worker identity probe failure')
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL === '1') return null
   if (process.platform !== 'win32') {
     try {
@@ -129,12 +133,58 @@ function frame(value: unknown): Buffer {
   return Buffer.concat([Buffer.from(Uint32Array.of(payload.byteLength).buffer).swap32(), payload])
 }
 
+type WorkerStdout = {
+  reader: ReadableStreamDefaultReader<Uint8Array>
+  buffered: Buffer
+}
+
+async function readReady(stdout: WorkerStdout, timeoutMs: number): Promise<boolean> {
+  let buffered = stdout.buffered
+  stdout.buffered = Buffer.alloc(0)
+  const deadline = Date.now() + timeoutMs
+  while (buffered.byteLength <= MAX_READY_FRAME_BYTES) {
+    const newline = buffered.indexOf(0x0a)
+    if (newline >= 0) {
+      stdout.buffered = buffered.subarray(newline + 1)
+      try {
+        const record: unknown = JSON.parse(buffered.subarray(0, newline).toString('utf8'))
+        return (
+          !!record &&
+          typeof record === 'object' &&
+          Object.keys(record).length === 1 &&
+          (record as { ready?: unknown }).ready === true
+        )
+      } catch {
+        return false
+      }
+    }
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return false
+    const next = await Promise.race([
+      stdout.reader.read(),
+      Bun.sleep(remaining).then(() => ({ done: true }) as ReadableStreamReadResult<Uint8Array>),
+    ])
+    if (next.done) return false
+    buffered = Buffer.concat([buffered, next.value])
+  }
+  return false
+}
+
+async function readStdout(stdout: WorkerStdout): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (stdout.buffered.byteLength) {
+    const value = stdout.buffered
+    stdout.buffered = Buffer.alloc(0)
+    return { done: false, value }
+  }
+  return (await stdout.reader.read()) as ReadableStreamReadResult<Uint8Array>
+}
+
 export class WorkerClient {
   private constructor(
     private readonly descriptor: WorkerDescriptor,
     private readonly owned?: {
       child: ReturnType<typeof Bun.spawn>
-      reader: ReadableStreamDefaultReader<Uint8Array>
+      stdout: WorkerStdout
       token: string
     }
   ) {}
@@ -170,7 +220,7 @@ export class WorkerClient {
       stdout: 'pipe',
       stderr: 'inherit',
     })
-    const identity = await processIdentity(child.pid)
+    let identity: string | null = null
     let client: WorkerClient | undefined
     const cleanup = async (): Promise<SpawnCleanup> => {
       if (client) return client.rollback()
@@ -231,21 +281,18 @@ export class WorkerClient {
       }
     }
     try {
+      identity = await processIdentity(child.pid)
       if (!identity)
         throw new Error('native_worker_unavailable: worker identity verification failed.')
       const input = child.stdin
       if (!input || typeof input === 'number')
         throw new Error('native_worker_unavailable: worker input unavailable.')
       await input.write(frame(JSON.parse(payload.toString('utf8'))))
-      const reader = child.stdout.getReader()
-      const ready = await Promise.race([
-        reader
-          .read()
-          .then(({ value }) => new TextDecoder().decode(value).includes('{"ready":true}')),
-        Bun.sleep(readyTimeout(bootstrap.env.OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS)).then(
-          () => false
-        ),
-      ])
+      const stdout = { reader: child.stdout.getReader(), buffered: Buffer.alloc(0) }
+      const ready = await readReady(
+        stdout,
+        readyTimeout(bootstrap.env.OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS)
+      )
       if (ready) {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
         if (
@@ -256,7 +303,7 @@ export class WorkerClient {
         ) {
           throw new Error('native_worker_unavailable: worker descriptor verification failed.')
         }
-        client = new WorkerClient(descriptor, { child, reader, token: workerControlToken })
+        client = new WorkerClient(descriptor, { child, stdout, token: workerControlToken })
         await client.control('start')
         for (let attempt = 0; attempt < 50; attempt += 1) {
           try {
@@ -367,7 +414,7 @@ export class WorkerClient {
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {
       const next = await Promise.race([
-        this.owned.reader.read(),
+        readStdout(this.owned.stdout),
         Bun.sleep(deadline - Date.now()).then(
           () => ({ done: true }) as ReadableStreamReadResult<Uint8Array>
         ),

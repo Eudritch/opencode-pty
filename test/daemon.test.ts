@@ -1257,6 +1257,7 @@ test('native worker identity and ready-output failures close the owned worker be
   const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
   const previousProbeFault = process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
+  const previousProbeThrow = process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW
   process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
@@ -1279,6 +1280,26 @@ test('native worker identity and ready-output failures close the owned worker be
       error: { spawnFailure: { cleanup: { requested: true, terminationConfirmed: true } } },
     })
     delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
+    const directChildMarker = join(root, 'identity-probe-direct-child')
+    process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW = '1'
+    const throwingProbeFailure = await rpc(
+      descriptor,
+      'exec',
+      {
+        command: process.execPath,
+        args: [
+          '-e',
+          `require('node:fs').writeFileSync(${JSON.stringify(directChildMarker)}, 'started')`,
+        ],
+        timeoutSeconds: 2,
+      },
+      context
+    ).then((response) => response.json())
+    expect(throwingProbeFailure).toMatchObject({
+      error: { spawnFailure: { cleanup: { requested: true, terminationConfirmed: true } } },
+    })
+    await expect(stat(directChildMarker)).rejects.toThrow()
+    delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW
     const readyFailure = await rpc(
       descriptor,
       'exec',
@@ -1302,6 +1323,50 @@ test('native worker identity and ready-output failures close the owned worker be
     if (previousProbeFault === undefined)
       delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
     else process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL = previousProbeFault
+    if (previousProbeThrow === undefined)
+      delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW
+    else process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW = previousProbeThrow
+  }
+}, 10_000)
+
+test('native worker accepts a split readiness frame', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-split-ready-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-split-ready', root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-split-ready')
+  try {
+    const descriptor = await server.start()
+    expect(
+      await rpc(
+        descriptor,
+        'exec',
+        {
+          command: process.execPath,
+          args: ['-e', 'process.exit(0)'],
+          env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'split_ready' },
+          timeoutSeconds: 2,
+        },
+        context
+      ).then((response) => response.json())
+    ).toMatchObject({ ok: true, result: { session: { status: 'exited' }, exitCode: 0 } })
+  } finally {
+    await server.stop()
+    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
+    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
 }, 10_000)
 

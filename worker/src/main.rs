@@ -904,7 +904,16 @@ fn main() -> Result<(), String> {
         {
             thread::sleep(Duration::from_millis(delay));
         }
-        println!("{{\"ready\":true}}");
+        if bootstrap.fault.as_deref() == Some("split_ready") {
+            print!("{{\"rea");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| error.to_string())?;
+            thread::sleep(Duration::from_millis(10));
+            println!("dy\":true}}");
+        } else {
+            println!("{{\"ready\":true}}");
+        }
         if let Err(error) = std::io::stdout().flush() {
             let _ = remove_file(&descriptor_path);
             return Err(error.to_string());
