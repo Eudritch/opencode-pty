@@ -66,7 +66,7 @@ export class DaemonServer implements Disposable {
   }
 
   async stop(): Promise<void> {
-    this.server?.stop(true)
+    this.server?.stop()
     await this.supervisor.shutdown?.(false)
     await this.supervisor.flush()
     await this.storage.removeDescriptor()

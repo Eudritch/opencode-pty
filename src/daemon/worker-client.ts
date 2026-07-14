@@ -147,8 +147,8 @@ export class WorkerClient {
     return this.call('stop')
   }
 
-  async shutdown(): Promise<void> {
-    await this.call('shutdown')
+  async shutdown(): Promise<WorkerSnapshot> {
+    return this.call('shutdown', {}, 10_000)
   }
 
   private async call<T>(
@@ -206,4 +206,8 @@ export interface WorkerSnapshot {
   terminationRequested: boolean
   terminationConfirmed: boolean
   storageFailure?: string
+  stdoutEof: boolean
+  stderrEof: boolean
+  outputComplete: boolean
+  outputIncomplete: boolean
 }

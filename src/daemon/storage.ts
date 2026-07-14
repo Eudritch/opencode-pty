@@ -313,6 +313,10 @@ export class DaemonStorage {
     await rm(this.sessionDirectory(id), { recursive: true, force: true })
   }
 
+  async removeWorkerDescriptor(id: string): Promise<void> {
+    await rm(join(this.sessionDirectory(id), 'worker.json'), { force: true })
+  }
+
   async loadSessions(): Promise<SessionRecord[]> {
     try {
       const entries = await readdir(join(this.root, SESSIONS_DIRECTORY), { withFileTypes: true })
@@ -371,7 +375,7 @@ export class DaemonStorage {
           (value.message === undefined || validText(value.message))) ||
         value.kind === 'stopped' ||
         (value.kind === 'spawn_error' && validText(value.message)) ||
-        value.kind === 'unknown'
+        (value.kind === 'unknown' && (value.message === undefined || validText(value.message)))
       )
     }
     const validEnvironment = (environment: unknown): boolean => {
@@ -477,6 +481,7 @@ export class DaemonStorage {
       !validEnvironment(value.environment) ||
       !validExecOutput(value.execOutput) ||
       !validWorker(value.worker) ||
+      !validOptionalText(value.storageFailure) ||
       !validWait(value.lastWaitResult)
     ) {
       return false

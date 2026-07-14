@@ -9,7 +9,7 @@ export type ExitReason =
   | { kind: 'stopped' }
   | { kind: 'spawn_error'; message: string }
   | { kind: 'output_limit'; message?: string }
-  | { kind: 'unknown' }
+  | { kind: 'unknown'; message?: string }
 
 export type DaemonStatus =
   | 'starting'
@@ -120,6 +120,7 @@ export interface SessionRecord {
   outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
   execOutput?: ExecOutput
   worker?: WorkerReference
+  storageFailure?: string
   lastWaitResult?: WaitResult
 }
 

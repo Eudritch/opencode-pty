@@ -727,13 +727,24 @@ export class SessionSupervisor {
     this.nativeWorkers.set(id, started.client)
     await this.storage.writeSession(record)
     const result = await started.client.wait(options.timeoutSeconds * 1000 + 1500)
-    return this.finishNative(record, result)
+    try {
+      return await this.finishNative(record, result)
+    } finally {
+      if (result.terminationConfirmed && result.status !== 'running') {
+        await started.client.shutdown().catch(() => undefined)
+        this.nativeWorkers.delete(id)
+      }
+    }
   }
 
   private async monitorNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
     try {
       const result = await worker.wait((record.timeoutSeconds ?? 1) * 1000 + 1500)
       await this.finishNative(record, result)
+      if (result.terminationConfirmed && result.status !== 'running') {
+        await worker.shutdown().catch(() => undefined)
+        this.nativeWorkers.delete(record.id)
+      }
     } catch {
       // Recovery will retry a reachable descriptor on the next daemon start.
     }
@@ -768,7 +779,12 @@ export class SessionSupervisor {
     record.exitSignal = result.exitSignal ?? undefined
     record.terminationRequested = result.terminationRequested
     record.terminationConfirmed = result.terminationConfirmed
-    if (result.storageFailure) record.exitReason = { kind: 'unknown' }
+    record.storageFailure = result.storageFailure ?? undefined
+    if (result.storageFailure)
+      record.exitReason = {
+        kind: 'unknown',
+        message: `Native worker storage failure: ${result.storageFailure}`,
+      }
     else if (result.exitReason === 'timeout') record.exitReason = { kind: 'timeout' }
     else if (result.exitReason === 'output_limit') record.exitReason = { kind: 'output_limit' }
     else if (result.exitReason === 'stopped') record.exitReason = { kind: 'stopped' }
@@ -783,12 +799,11 @@ export class SessionSupervisor {
     record.exitedAt = result.exitedAt
     record.updatedAt = new Date().toISOString()
     await this.storage.writeSession(record)
-    if (result.storageFailure) {
+    if (result.storageFailure && result.terminationConfirmed) {
       const error = new Error(`Native worker output storage failed: ${result.storageFailure}`)
       Object.assign(error, { code: 'ESTORAGE' })
       throw error
     }
-    // Keep terminal workers reachable for snapshots until cleanup/final shutdown.
     return {
       session: { id: record.id, status: record.status, mode: 'exec', pid: record.pid },
       stdout: result.stdout,
@@ -941,10 +956,19 @@ export class SessionSupervisor {
     await this.flush()
     const record = this.records.get(id)
     if (!record || !this.isTerminal(record)) return false
-    await this.storage.deleteSession(id)
     const worker = this.nativeWorkers.get(id)
+    if (worker) {
+      try {
+        const result = await worker.shutdown()
+        if (!result.terminationConfirmed || result.status === 'running') return false
+      } catch {
+        // A completed worker may have already removed its listener; its persisted terminal record is authoritative.
+        if (!record.terminationConfirmed) return false
+      }
+    }
     this.nativeWorkers.delete(id)
-    void worker?.shutdown().catch(() => undefined)
+    await this.storage.removeWorkerDescriptor(id)
+    await this.storage.deleteSession(id)
     this.records.delete(id)
     return true
   }
@@ -962,9 +986,12 @@ export class SessionSupervisor {
             record.ownerProjectDirectory === projectDirectory &&
             record.ownerCapabilityHash === capabilityHash &&
             record.lifecycle === 'conversation' &&
-            (this.active.has(record.id) || this.nativeWorkers.has(record.id))
+            (this.active.has(record.id) || this.nativeWorkers.has(record.id) || record.worker)
         )
-        .map((record) => this.stop(record.id))
+        .map(async (record) => {
+          await this.stop(record.id)
+          if (record.worker) await this.cleanup(record.id)
+        })
     )
   }
 
@@ -974,10 +1001,14 @@ export class SessionSupervisor {
   }
 
   async shutdown(final = false): Promise<void> {
-    if (final)
+    if (final) {
+      await Promise.all(
+        [...this.records.values()].map((record) => this.stop(record.id).catch(() => undefined))
+      )
       await Promise.all(
         [...this.nativeWorkers.values()].map((worker) => worker.shutdown().catch(() => undefined))
       )
+    }
   }
 
   private async timeout(id: string): Promise<void> {

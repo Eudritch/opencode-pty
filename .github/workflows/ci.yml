@@ -169,7 +169,7 @@ jobs:
         run: devenv shell -- bun build:prod
 
       - name: Quality checks (bun test)
-        run: devenv shell -- bun unittest
+        run: devenv shell -- cargo build --locked --workspace && devenv shell -- bun unittest
       - name: Quality checks (typecheck)
         run: devenv shell -- bun typecheck
       - name: Quality checks (lint)

@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +62,10 @@ struct State {
     termination_requested: bool,
     termination_confirmed: bool,
     storage_failure: Option<String>,
+    stdout_eof: bool,
+    stderr_eof: bool,
+    reader_drain_deadline: Option<SystemTime>,
+    output_incomplete: bool,
 }
 
 struct Worker {
@@ -240,6 +245,7 @@ fn record_exit(worker: &Arc<Worker>, exit: ExitStatus) {
     }
     state.exited_at = Some(now());
     state.termination_confirmed = true;
+    state.reader_drain_deadline = Some(SystemTime::now() + READER_DRAIN_TIMEOUT);
 }
 
 fn observe_exit(worker: &Arc<Worker>) {
@@ -273,7 +279,12 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
         if state.storage_failure.is_some() {
             return;
         }
-        let available = worker.max_output_bytes.saturating_sub(state.next_sequence);
+        // Each stream owns its advertised cap; next_sequence remains the aggregate journal cursor.
+        let available = if stdout {
+            worker.max_output_bytes.saturating_sub(state.stdout_bytes)
+        } else {
+            worker.max_output_bytes.saturating_sub(state.stderr_bytes)
+        };
         let mut end = available.min(data.len());
         while end < data.len() && end > 0 && (data.as_bytes()[end] & 0xc0) == 0x80 {
             end -= 1;
@@ -315,6 +326,27 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
     }
 }
 
+fn mark_reader_eof(worker: &Arc<Worker>, stdout: bool) {
+    let mut state = worker.state.lock().expect("state lock");
+    if stdout {
+        state.stdout_eof = true;
+    } else {
+        state.stderr_eof = true;
+    }
+}
+
+fn update_reader_drain(worker: &Arc<Worker>) {
+    let mut state = worker.state.lock().expect("state lock");
+    if state.termination_confirmed
+        && (!state.stdout_eof || !state.stderr_eof)
+        && state
+            .reader_drain_deadline
+            .is_some_and(|deadline| SystemTime::now() >= deadline)
+    {
+        state.output_incomplete = true;
+    }
+}
+
 fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: bool) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
@@ -327,6 +359,7 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
                         stdout,
                         redact_stream(String::new(), &mut tail, &worker.secrets, true),
                     );
+                    mark_reader_eof(&worker, stdout);
                     return;
                 }
                 Ok(size) => append_output(
@@ -348,11 +381,12 @@ fn monitor(worker: Arc<Worker>) {
     thread::spawn(move || {
         loop {
             observe_exit(&worker);
-            let terminal = worker
-                .state
-                .lock()
-                .expect("state lock")
-                .termination_confirmed;
+            update_reader_drain(&worker);
+            let terminal = {
+                let state = worker.state.lock().expect("state lock");
+                state.output_incomplete
+                    || (state.termination_confirmed && state.stdout_eof && state.stderr_eof)
+            };
             if terminal {
                 return;
             }
@@ -366,11 +400,14 @@ fn monitor(worker: Arc<Worker>) {
 
 fn snapshot(worker: &Arc<Worker>) -> Value {
     observe_exit(worker);
+    update_reader_drain(worker);
     let pid = worker.child.lock().expect("child lock").id();
     let state = worker.state.lock().expect("state lock");
-    let status = if state.storage_failure.is_some() {
+    let output_complete = state.stdout_eof && state.stderr_eof;
+    let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
+    let status = if terminal && (state.storage_failure.is_some() || state.output_incomplete) {
         "lost"
-    } else if state.termination_confirmed {
+    } else if terminal {
         "exited"
     } else {
         "running"
@@ -384,8 +421,19 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "exitSignal": state.exit_signal, "exitReason": state.exit_reason,
         "startedAt": state.started_at, "exitedAt": state.exited_at, "timedOut": state.timed_out,
         "terminationRequested": state.termination_requested, "terminationConfirmed": state.termination_confirmed,
-        "storageFailure": state.storage_failure,
+        "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
+        "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
     })
+}
+
+fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
+    loop {
+        let result = snapshot(worker);
+        if result["status"] != "running" {
+            return result;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerError> {
@@ -459,9 +507,19 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
         }
         "stop" => {
             terminate_and_wait(worker, "stopped");
-            Ok((snapshot(worker), false))
+            Ok((wait_for_final_snapshot(worker), false))
         }
-        "shutdown" => Ok((json!({"stopped": true}), true)),
+        "shutdown" => {
+            if !worker
+                .state
+                .lock()
+                .expect("state lock")
+                .termination_confirmed
+            {
+                terminate_and_wait(worker, "stopped");
+            }
+            Ok((wait_for_final_snapshot(worker), true))
+        }
         _ => Err(WorkerError {
             code: "validation",
             message: "unsupported operation".into(),
