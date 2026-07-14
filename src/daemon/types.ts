@@ -1,4 +1,4 @@
-export const DAEMON_PROTOCOL_VERSION = 3
+export const DAEMON_PROTOCOL_VERSION = 4
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
@@ -254,7 +254,7 @@ export interface DaemonDiagnostics {
   platform: {
     nativeContainment: boolean
     processTreeTermination: boolean
-    ptyContainment: false
+    ptyContainment: boolean
     containmentVerification: 'linux_proc' | 'unavailable'
   }
 }

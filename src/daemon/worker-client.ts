@@ -38,7 +38,9 @@ export interface WorkerBootstrap {
   workerId: string
   timeoutSeconds: number
   maxOutputBytes: number
-  mode: 'exec'
+  mode: 'exec' | 'pty'
+  cols?: number
+  rows?: number
   fault?: string
 }
 
@@ -62,7 +64,7 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
     typeof descriptor.endpoint === 'string' &&
     typeof descriptor.token === 'string' &&
     descriptor.token.length >= 16 &&
-    descriptor.protocolVersion === 1
+    descriptor.protocolVersion === 2
   )
 }
 
@@ -400,6 +402,7 @@ export class WorkerClient {
         descriptor.endpoint !== reference.endpoint
       )
         return null
+      if ((await processIdentity(descriptor.pid)) !== descriptor.processIdentity) return null
       const client = new WorkerClient(descriptor)
       await client.call('health')
       return client
@@ -418,6 +421,10 @@ export class WorkerClient {
 
   async write(data: string): Promise<{ acceptedBytes: number }> {
     return this.call('write', { data })
+  }
+
+  async resize(cols: number, rows: number): Promise<{ cols: number; rows: number }> {
+    return this.call('resize', { cols, rows })
   }
 
   async stop(): Promise<WorkerSnapshot> {
@@ -511,6 +518,7 @@ export class WorkerClient {
 export interface WorkerSnapshot {
   status: 'running' | 'exited' | 'lost'
   pid: number
+  mode: 'exec' | 'pty'
   stdout: string
   stderr: string
   stdoutBytes: number

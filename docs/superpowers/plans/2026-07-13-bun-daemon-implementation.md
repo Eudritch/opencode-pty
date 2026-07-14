@@ -14,7 +14,7 @@ At startup, mark persisted live sessions as `lost`; preserve their output. Test 
 
 ## 3. Implement Session Supervisor
 
-Add `src/daemon/supervisor.ts` to own `bun-pty` instances, timers, in-memory active handles, durable session state, and output sequence counters. It implements spawn, write, read, search, list, get, stop, and parent-session cleanup.
+Add `src/daemon/supervisor.ts` to own native worker references, durable session state, and output sequence cursors. It implements spawn, write, resize, read, search, list, get, stop, and parent-session cleanup.
 
 Writes return accepted UTF-8 byte and character counts or throw structured failures. Stops distinguish requested termination from confirmed PTY exit and do not clean a running record. Exit callbacks persist exact code, signal, timeout, or unknown reasons.
 

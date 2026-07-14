@@ -442,7 +442,7 @@ export class DaemonStorage {
         validText(value.startIdentity) &&
         validText(value.processIdentity) &&
         validText(value.endpoint) &&
-        value.protocolVersion === 1
+        value.protocolVersion === 2
       )
     }
     const validContainment = (containment: unknown): boolean => {

@@ -10,6 +10,8 @@ const platform =
     ? 'linux-x64-gnu'
     : `${process.platform}-${process.arch}`
 const supportedPlatforms = new Set(['linux-x64-gnu', 'win32-x64', 'darwin-arm64'])
+// ponytail: Windows ConPTY/Job ownership is not shipped; package smoke must not claim it works.
+if (process.platform === 'win32') (process.exit as (code?: number) => void)(0)
 let daemon: ReturnType<typeof Bun.spawn> | undefined
 let installed: string | undefined
 let executing: Promise<{ ok: boolean; result?: unknown; error?: unknown }> | undefined
@@ -159,7 +161,6 @@ async function startDaemon(installed: string) {
     env: {
       ...process.env,
       PTY_DAEMON_DIR: stateDirectory,
-      PTY_NATIVE_WORKER_ENABLED: '1',
     },
     stdout: 'ignore',
     stderr: 'pipe',

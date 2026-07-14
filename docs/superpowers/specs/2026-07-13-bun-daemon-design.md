@@ -20,7 +20,7 @@ The release provides deterministic control semantics where possible: idempotent 
 OpenCode plugin
   -> authenticated loopback RPC
 Per-user Bun daemon
-  -> bun-pty sessions
+  -> per-session native workers
   -> session metadata and output journal on disk
 ```
 
@@ -83,7 +83,7 @@ Every state change is persisted with a timestamp and optional structured exit re
 
 `stop` changes a running session to `stopping`, requests the PTY backend termination, and returns `requested: true`. It returns `terminationConfirmed: true` only after the PTY exit callback arrives. If the callback has not arrived before the request deadline, the session remains `stopping` and the response says `terminationConfirmed: false`.
 
-`write` returns accepted byte and character counts only after `bun-pty` accepts the write. Exceptions and closed sessions produce failures. It never converts an exception into success.
+`write` returns accepted byte and character counts only after the native worker accepts the write. Exceptions and closed sessions produce failures. It never converts an exception into success.
 
 Timeouts are persisted as `timed_out` before termination is requested. The daemon uses monotonic deadlines internally where Bun supplies them; persisted timestamps are wall-clock diagnostics only.
 
@@ -124,4 +124,4 @@ Existing PTY integration tests remain the backend smoke tests. Web HTTP/WebSocke
 
 - A secure human web client can be added later as a daemon client with a one-time capability token, origin validation, and operation-specific capabilities.
 - Resize, terminal-screen emulation, session aliases, worker isolation, native CPU/memory limits, Job Objects/cgroups, and verified process-tree termination remain deferred. Bun-level session, input, runtime, and output limits are not native containment.
-- Native containment and a signed platform daemon replace `bun-pty` only when their platform matrix and verification requirements can be tested.
+- Windows Job containment remains deferred until its platform verification requirements can be tested.

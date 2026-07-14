@@ -94,6 +94,15 @@ export class DaemonClient {
     return this.call('write', { id, data }, START_TIMEOUT_MS, owner)
   }
 
+  async resize(
+    id: string,
+    cols: number,
+    rows: number,
+    owner: OwnerContext
+  ): Promise<{ cols: number; rows: number }> {
+    return this.call('resize', { id, cols, rows }, START_TIMEOUT_MS, owner)
+  }
+
   async read(
     id: string,
     offset?: number,
@@ -254,6 +263,7 @@ export class DaemonClient {
             stdin: 'ignore',
             stdout: 'ignore',
             stderr: 'ignore',
+            env: process.env as Record<string, string>,
           })
           started = true
         }

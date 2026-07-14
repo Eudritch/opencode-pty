@@ -1,6 +1,5 @@
 import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { type IPty, spawn } from 'bun-pty'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
 import type { DaemonStorage } from './storage.ts'
 import type { SpawnFailure } from './types.ts'
@@ -20,7 +19,6 @@ import { WorkerClient as NativeWorkerClient, WorkerStartError } from './worker-c
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1000000
 const MAX_OUTPUT_BYTES = 64 * 1024 * 64
-const OUTPUT_CHUNK_BYTES = 64 * 1024
 const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
@@ -40,18 +38,6 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
   'ComSpec',
 ])
 const SENSITIVE_ENVIRONMENT_KEY = /(token|secret|password|credential|api[_-]?key|auth|cookie)/i
-
-interface ActiveSession {
-  record: SessionRecord
-  process: IPty
-  redactor: OutputRedactor
-  timeout?: ReturnType<typeof setTimeout>
-  outputBuffer: string
-  outputBufferBytes: number
-  outputStartSequence: number
-  outputArrivalSequence: number
-  outputTimer?: ReturnType<typeof setTimeout>
-}
 
 interface ExecOptions extends SpawnOptions {
   maxOutputBytes?: number
@@ -114,34 +100,6 @@ function searchLines(
   })
 }
 
-function outputChunks(data: string, startSequence: number) {
-  const chunks: Array<{
-    startSequence: number
-    endSequence: number
-    timestamp: string
-    data: string
-  }> = []
-  const chunkBytes = OUTPUT_CHUNK_BYTES
-  let text = ''
-  let bytes = 0
-  let sequence = startSequence
-  const timestamp = new Date().toISOString()
-  for (const character of data) {
-    const characterBytes = Buffer.byteLength(character)
-    if (text && bytes + characterBytes > chunkBytes) {
-      chunks.push({ startSequence: sequence, endSequence: sequence + bytes, timestamp, data: text })
-      sequence += bytes
-      text = ''
-      bytes = 0
-    }
-    text += character
-    bytes += characterBytes
-  }
-  if (text)
-    chunks.push({ startSequence: sequence, endSequence: sequence + bytes, timestamp, data: text })
-  return chunks
-}
-
 function safeRegex(pattern: string): RegExp {
   if (pattern.length > 512 || /[()*+?{|}]/.test(pattern) || /\\[1-9]/.test(pattern)) {
     throw new Error('Regex wait pattern is outside the limited-safe subset.')
@@ -157,10 +115,14 @@ function activeStatus(record: SessionRecord): boolean {
   return record.status === 'starting' || record.status === 'running' || record.status === 'stopping'
 }
 
-function containmentDrained(record: Pick<SessionRecord, 'containment'>): boolean {
+function containmentDrained(
+  record: Pick<SessionRecord, 'containment' | 'terminationConfirmed'>
+): boolean {
   return (
     !record.containment ||
     record.containment.status === 'posix_best_effort_empty' ||
+    // macOS only proves direct-child exit; it never claims descendant drain.
+    (process.platform === 'darwin' && record.terminationConfirmed) ||
     record.containment.status === 'not_applicable'
   )
 }
@@ -252,7 +214,6 @@ function startsWith(characters: string[], index: number, prefix: string[]): bool
 }
 
 export class SessionSupervisor {
-  private readonly active = new Map<string, ActiveSession>()
   private readonly records = new Map<string, SessionRecord>()
   private readonly waits = new Map<string, PendingWait[]>()
   private readonly nativeWorkers = new Map<string, WorkerClient>()
@@ -286,7 +247,7 @@ export class SessionSupervisor {
         record.status === 'running' ||
         record.status === 'stopping'
       ) {
-        if (record.mode === 'exec' && record.worker) {
+        if (record.worker) {
           let worker: WorkerClient | null = null
           for (let attempt = 0; attempt < 30 && !worker; attempt += 1) {
             worker = await NativeWorkerClient.reconnect(
@@ -330,7 +291,6 @@ export class SessionSupervisor {
     const id = `pty_${crypto.randomUUID()}`
     const now = new Date().toISOString()
     const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
-    const redactor = new OutputRedactor(environment)
     const record: SessionRecord = {
       id,
       title:
@@ -368,14 +328,20 @@ export class SessionSupervisor {
     }
     this.records.set(id, record)
     await this.storage.writeSession(record)
-    let ptyProcess: IPty
+    let started: Awaited<ReturnType<typeof NativeWorkerClient.start>>
     try {
-      ptyProcess = spawn(record.command, record.args, {
-        name: 'xterm-256color',
+      started = await NativeWorkerClient.start({
+        command: record.command,
+        args: record.args,
+        workdir: record.workdir,
+        env: environment,
+        redactionSecrets: this.redactionSecrets(environment),
+        sessionDirectory: join(this.storage.rootDirectory, 'sessions', id),
+        timeoutSeconds: options.timeoutSeconds ?? 24 * 60 * 60,
+        maxOutputBytes: this.maxOutputBytes,
+        mode: 'pty',
         cols: 120,
         rows: 40,
-        cwd: record.workdir,
-        env: environment,
       })
     } catch (error) {
       record.status = 'spawn_failed'
@@ -390,38 +356,26 @@ export class SessionSupervisor {
         `Failed to spawn PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
       )
     }
-    record.pid = ptyProcess.pid
+    const initial = await started.client.snapshot()
+    record.pid = initial.pid
+    record.worker = started.reference
+    record.containment = initial.containment
+    record.termination = initial.termination
     record.status = 'running'
     record.updatedAt = new Date().toISOString()
-    const active: ActiveSession = {
-      record,
-      process: ptyProcess,
-      redactor,
-      outputBuffer: '',
-      outputBufferBytes: 0,
-      outputStartSequence: record.nextSequence,
-      outputArrivalSequence: record.nextSequence,
-    }
-    this.active.set(id, active)
-    ptyProcess.onData((data: string) => this.handleOutput(active, redactor.write(data)))
-    ptyProcess.onExit(
-      ({ exitCode, signal }: { exitCode: number | null; signal?: number | string }) =>
-        this.handleExit(active, exitCode, signal)
-    )
-    if (record.timeoutSeconds) {
-      active.timeout = setTimeout(() => void this.timeout(id), record.timeoutSeconds * 1000)
-    }
+    this.nativeWorkers.set(id, started.client)
     await this.storage.writeSession(record)
+    void this.monitorNative(record, started.client)
     return this.toInfo(record)
   }
 
   async write(id: string, data: string): Promise<WriteResult> {
     await this.flush()
-    const active = this.active.get(id)
-    if (!active || active.record.status !== 'running')
-      throw new Error(`PTY session '${id}' is closed.`)
+    const worker = this.nativeWorkers.get(id)
+    const record = this.recordFor(id)
+    if (!worker || record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
     try {
-      active.process.write(data)
+      await worker.write(data)
       return { acceptedBytes: Buffer.byteLength(data), acceptedCharacters: [...data].length }
     } catch (error) {
       throw new ProcessError(
@@ -441,12 +395,23 @@ export class SessionSupervisor {
     await this.write(id, data)
     // onData may run synchronously from write; that output predates accepted input.
     const afterSequence =
-      this.active.get(id)?.outputArrivalSequence ?? this.recordFor(id).nextSequence
+      (await this.nativeWorkers.get(id)?.snapshot())?.nextSequence ??
+      this.recordFor(id).nextSequence
     return this.wait(
       id,
       { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
       timeoutSeconds
     )
+  }
+
+  async resize(id: string, cols: number, rows: number): Promise<{ cols: number; rows: number }> {
+    await this.flush()
+    const record = this.recordFor(id)
+    if (record.mode !== 'pty') throw new Error(`Session '${id}' is not a PTY.`)
+    if (record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
+    const worker = this.nativeWorkers.get(id)
+    if (!worker) throw new Error(`PTY session '${id}' is closed.`)
+    return worker.resize(cols, rows)
   }
 
   async wait(id: string, condition: WaitCondition, timeoutSeconds: number): Promise<WaitResult> {
@@ -769,16 +734,16 @@ export class SessionSupervisor {
       throw error
     }
     if (!this.nativeTerminal(result)) void this.monitorNative(record, started.client)
-    return this.finalizeNative(record, started.client, result)
+    return (await this.finalizeNative(record, started.client, result)) as ExecResult
   }
 
   private async monitorNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
     while (this.nativeWorkers.get(record.id) === worker) {
       try {
-        let result = await worker.wait((record.timeoutSeconds ?? 1) * 1000 + NATIVE_WAIT_MARGIN_MS)
+        let result = await worker.wait(1000)
         while (!this.nativeTerminal(result)) {
           await this.finishNative(record, result)
-          result = await worker.wait(NATIVE_WAIT_MARGIN_MS)
+          result = await worker.wait(1000)
         }
         await this.finalizeNative(record, worker, result)
         return
@@ -798,7 +763,10 @@ export class SessionSupervisor {
     return (
       result.terminationConfirmed &&
       result.status !== 'running' &&
-      containmentDrained({ containment: result.containment })
+      containmentDrained({
+        containment: result.containment,
+        terminationConfirmed: result.terminationConfirmed,
+      })
     )
   }
 
@@ -830,7 +798,7 @@ export class SessionSupervisor {
     record: SessionRecord,
     worker: WorkerClient,
     result: WorkerSnapshot
-  ): Promise<ExecResult> {
+  ): Promise<ExecResult | PTYSessionInfo> {
     try {
       return await this.finishNative(record, result)
     } finally {
@@ -844,23 +812,27 @@ export class SessionSupervisor {
     }
   }
 
-  private async finishNative(record: SessionRecord, result: WorkerSnapshot): Promise<ExecResult> {
+  private async finishNative(
+    record: SessionRecord,
+    result: WorkerSnapshot
+  ): Promise<ExecResult | PTYSessionInfo> {
     record.pid = result.pid
     record.nextSequence = result.nextSequence
     record.firstRetainedSequence = result.firstRetainedSequence
     record.outputBytes = result.stdoutBytes + result.stderrBytes
     record.outputTruncated = result.outputTruncated
     record.timedOut = result.timedOut
-    record.execOutput = {
-      stdout: result.stdout,
-      stderr: result.stderr,
-      stdoutBytes: result.stdoutBytes,
-      stderrBytes: result.stderrBytes,
-      stdoutTruncated: result.stdoutTruncated,
-      stderrTruncated: result.stderrTruncated,
-      containment: result.containment,
-      termination: result.termination,
-    }
+    if (record.mode === 'exec')
+      record.execOutput = {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        stdoutBytes: result.stdoutBytes,
+        stderrBytes: result.stderrBytes,
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated,
+        containment: result.containment,
+        termination: result.termination,
+      }
     record.status =
       result.status === 'lost'
         ? 'lost'
@@ -900,7 +872,13 @@ export class SessionSupervisor {
     else record.exitReason = { kind: 'unknown' }
     record.exitedAt = result.exitedAt
     record.updatedAt = new Date().toISOString()
+    const output = await this.storage.readOutput(record.id)
+    record.outputBytes = Buffer.byteLength(output)
+    record.lineCount = lineCount(output)
+    record.outputHasPartialLine = Boolean(output) && !output.endsWith('\n')
     await this.storage.writeSession(record)
+    this.resolveOutputWaits(record)
+    if (!activeStatus(record)) this.resolveExitWaits(record)
     if (
       (result.storageFailure || result.readerFailure || result.outputIncomplete) &&
       result.terminationConfirmed
@@ -913,6 +891,7 @@ export class SessionSupervisor {
       Object.assign(error, { code: 'ESTORAGE' })
       throw error
     }
+    if (record.mode === 'pty') return this.toInfo(record)
     return {
       session: { id: record.id, status: record.status, mode: 'exec', pid: record.pid },
       stdout: result.stdout,
@@ -985,7 +964,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finalizeNative(record, native, await native.snapshot())
+      await this.finishNative(record, await native.snapshot())
     }
     return record ? this.toInfo(record) : null
   }
@@ -1039,7 +1018,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finalizeNative(record, native, await native.snapshot())
+      await this.finishNative(record, await native.snapshot())
     }
     return record?.execOutput
       ? { ...record.execOutput, containment: record.containment, termination: record.termination }
@@ -1063,45 +1042,13 @@ export class SessionSupervisor {
         termination: record.termination,
       }
     }
-    const active = this.active.get(id)
-    if (!active) {
-      const record = this.records.get(id)
-      if (!record) throw new Error(`PTY session '${id}' not found.`)
-      return {
-        requested: false,
-        terminationConfirmed: record.terminationConfirmed,
-        containment: record.containment,
-        termination: record.termination,
-      }
-    }
-    if (active.record.terminationRequested) {
-      return {
-        requested: true,
-        terminationConfirmed: active.record.terminationConfirmed,
-        containment: active.record.containment,
-        termination: active.record.termination,
-      }
-    }
-    active.record.terminationRequested = true
-    if (!active.record.timedOut) active.record.status = 'stopping'
-    active.record.updatedAt = new Date().toISOString()
-    await this.storage.writeSession(active.record)
-    try {
-      active.process.kill()
-    } catch (error) {
-      active.record.terminationRequested = false
-      if (!active.record.timedOut) active.record.status = 'running'
-      active.record.updatedAt = new Date().toISOString()
-      await this.storage.writeSession(active.record)
-      throw new ProcessError(
-        `Failed to stop PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
+    const record = this.records.get(id)
+    if (!record) throw new Error(`PTY session '${id}' not found.`)
     return {
-      requested: true,
-      terminationConfirmed: !this.active.has(id),
-      containment: active.record.containment,
-      termination: active.record.termination,
+      requested: false,
+      terminationConfirmed: record.terminationConfirmed,
+      containment: record.containment,
+      termination: record.termination,
     }
   }
 
@@ -1116,7 +1063,10 @@ export class SessionSupervisor {
         if (
           !result.terminationConfirmed ||
           result.status === 'running' ||
-          !containmentDrained({ containment: result.containment })
+          !containmentDrained({
+            containment: result.containment,
+            terminationConfirmed: result.terminationConfirmed,
+          })
         )
           return false
       } catch {
@@ -1144,7 +1094,7 @@ export class SessionSupervisor {
             record.ownerProjectDirectory === projectDirectory &&
             record.ownerCapabilityHash === capabilityHash &&
             record.lifecycle === 'conversation' &&
-            (this.active.has(record.id) || this.nativeWorkers.has(record.id) || record.worker)
+            (this.nativeWorkers.has(record.id) || record.worker)
         )
         .map(async (record) => {
           await this.stop(record.id)
@@ -1154,7 +1104,6 @@ export class SessionSupervisor {
   }
 
   async flush(): Promise<void> {
-    for (const active of this.active.values()) this.persistOutput(active)
     await this.persistQueue
   }
 
@@ -1169,119 +1118,10 @@ export class SessionSupervisor {
     }
   }
 
-  private async timeout(id: string): Promise<void> {
-    const active = this.active.get(id)
-    if (!active || active.record.status !== 'running') return
-    active.record.timedOut = true
-    active.record.status = 'timed_out'
-    active.record.exitReason = { kind: 'timeout' }
-    active.record.terminationRequested = true
-    active.record.terminationConfirmed = false
-    active.record.updatedAt = new Date().toISOString()
-    await this.storage.writeSession(active.record)
-    try {
-      active.process.kill()
-    } catch (error) {
-      active.record.terminationRequested = false
-      active.record.exitReason = {
-        kind: 'timeout',
-        message: `Failed to stop PTY: ${error instanceof Error ? error.message : String(error)}`,
-      }
-      active.record.updatedAt = new Date().toISOString()
-      await this.storage.writeSession(active.record)
-      return
-    }
-  }
-
-  private handleOutput(active: ActiveSession, data: string): void {
-    if (!data) return
-    if (!active.outputBuffer) active.outputStartSequence = active.outputArrivalSequence
-    active.outputArrivalSequence += Buffer.byteLength(data)
-    active.outputBuffer += data
-    active.outputBufferBytes += Buffer.byteLength(data)
-    if (active.outputBufferBytes >= OUTPUT_CHUNK_BYTES) this.persistOutput(active)
-    else if (!active.outputTimer)
-      active.outputTimer = setTimeout(() => this.persistOutput(active), 10)
-  }
-
-  private persistOutput(active: ActiveSession): void {
-    if (!active.outputBuffer) return
-    if (active.outputTimer) clearTimeout(active.outputTimer)
-    active.outputTimer = undefined
-    const buffered = active.outputBuffer
-    const startSequence = active.outputStartSequence
-    active.outputBuffer = ''
-    active.outputBufferBytes = 0
-    this.enqueuePersist(async () => {
-      const next = { ...active.record }
-      const byteLength = Buffer.byteLength(buffered)
-      const chunks = outputChunks(buffered, startSequence)
-      next.nextSequence = startSequence + byteLength
-      next.outputBytes += byteLength
-      const newlines = buffered.split('\n').length - 1
-      if (next.outputHasPartialLine) {
-        next.lineCount += newlines - (buffered.endsWith('\n') ? 1 : 0)
-      } else {
-        next.lineCount += newlines + (buffered && !buffered.endsWith('\n') ? 1 : 0)
-      }
-      next.outputHasPartialLine = !buffered.endsWith('\n')
-      next.updatedAt = new Date().toISOString()
-      await this.storage.appendOutput(next.id, chunks)
-      await this.trimOutput(next)
-      await this.storage.writeSession(next)
-      active.record.nextSequence = next.nextSequence
-      active.record.firstRetainedSequence = next.firstRetainedSequence
-      active.record.outputBytes = next.outputBytes
-      active.record.outputTruncated = next.outputTruncated
-      active.record.lineCount = next.lineCount
-      active.record.outputHasPartialLine = next.outputHasPartialLine
-      active.record.lastOutputAt = next.updatedAt
-    })
-    void this.persistQueue.then(() => this.resolveOutputWaits(active.record))
-  }
-
-  private handleExit(
-    active: ActiveSession,
-    exitCode: number | null,
-    signal?: number | string
-  ): void {
-    if (active.timeout) clearTimeout(active.timeout)
-    this.handleOutput(active, active.redactor.finish())
-    this.persistOutput(active)
-    this.active.delete(active.record.id)
-    if (active.record.timedOut) {
-      active.record.status = 'timed_out'
-      active.record.exitReason = { kind: 'timeout' }
-    } else {
-      active.record.status = 'exited'
-      active.record.exitReason = this.exitReason(exitCode, signal)
-    }
-    active.record.exitCode = exitCode ?? undefined
-    active.record.exitSignal = signal || undefined
-    active.record.terminationConfirmed = true
-    active.record.updatedAt = new Date().toISOString()
-    active.record.exitedAt = active.record.updatedAt
-    this.enqueuePersist(() => this.storage.writeSession(active.record))
-    this.resolveExitWaits(active.record)
-  }
-
   private async outputFor(id: string): Promise<string> {
     this.recordFor(id)
     await this.persistQueue
     return this.storage.readOutput(id)
-  }
-
-  private async trimOutput(record: SessionRecord): Promise<void> {
-    if (record.outputBytes <= this.maxOutputBytes) return
-    const retained = await this.storage.retainedOutput(record.id, this.maxOutputBytes)
-    record.outputBytes = retained.outputBytes
-    record.firstRetainedSequence = retained.firstRetainedSequence
-    record.outputTruncated ||= retained.outputTruncated
-    await this.storage.writeSession(record)
-    await this.storage.trimOutput(record.id, this.maxOutputBytes)
-    const output = await this.storage.readOutput(record.id)
-    record.lineCount = lineCount(output)
-    record.outputHasPartialLine = Boolean(output) && !output.endsWith('\n')
   }
 
   private enqueuePersist(task: () => Promise<void>): void {
@@ -1496,6 +1336,12 @@ export class SessionSupervisor {
     if (exitCode !== null) return { kind: 'code', code: exitCode }
     if (signal) return { kind: 'signal', signal: String(signal) }
     return { kind: 'unknown' }
+  }
+
+  private redactionSecrets(environment: Record<string, string>): string[] {
+    return Object.entries(environment)
+      .filter(([key, value]) => SENSITIVE_ENVIRONMENT_KEY.test(key) && value.length >= 4)
+      .map(([, value]) => value)
   }
 
   private recordFor(id: string): SessionRecord {

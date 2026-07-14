@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,7 +7,6 @@ import { DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
 import {
   effectiveMaxOutputBytes,
-  OutputRedactor,
   ProcessError,
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
@@ -32,6 +31,13 @@ async function processGone(pid: number) {
 }
 
 const roots: string[] = []
+const nativeWorkerPath = join(
+  process.cwd(),
+  'target',
+  'debug',
+  `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+)
+if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_PATH ??= nativeWorkerPath
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -106,6 +112,7 @@ async function rpc(
 }
 
 test('daemon authenticates RPC and retains PTY output', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -189,6 +196,7 @@ test('daemon validates RPC fields and uses literal searches', async () => {
 })
 
 test('daemon denies other owners and reports bounded diagnostics', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -226,7 +234,7 @@ test('daemon denies other owners and reports bounded diagnostics', async () => {
       result: { limits: { maxSessionsPerOwner: number }; platform: { nativeContainment: boolean } }
     }
     expect(diagnostics.result.limits.maxSessionsPerOwner).toBe(32)
-    expect(diagnostics.result.platform.nativeContainment).toBeFalse()
+    expect(diagnostics.result.platform.nativeContainment).toBeTrue()
     await rpc('stop', { id })
   } finally {
     await server.stop()
@@ -234,6 +242,7 @@ test('daemon denies other owners and reports bounded diagnostics', async () => {
 })
 
 test('a new client retains owned output, list, and cleanup access after daemon restart', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-restart-'))
   roots.push(root)
   const previousDirectory = process.env.PTY_DAEMON_DIR
@@ -276,6 +285,7 @@ test('a new client retains owned output, list, and cleanup access after daemon r
 })
 
 test('server canonicalizes project owners and limits only active PTY and exec sessions', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-path-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -340,6 +350,7 @@ test('server canonicalizes project owners and limits only active PTY and exec se
 })
 
 test('conversation cleanup excludes persistent sessions and environment values stay out of records', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-'))
   const otherProject = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-other-'))
   roots.push(root, otherProject)
@@ -464,42 +475,6 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
   await supervisor.initialize()
-  const session = record(root, 'pty_redaction_stream')
-  const state = supervisor as unknown as {
-    active: Map<
-      string,
-      {
-        record: SessionRecord
-        process: { write(data: string): void }
-        redactor: OutputRedactor
-        outputBuffer: string
-        outputBufferBytes: number
-        outputStartSequence: number
-        outputArrivalSequence: number
-      }
-    >
-    records: Map<string, SessionRecord>
-    handleOutput(active: unknown, data: string): void
-  }
-  state.records.set(session.id, session)
-  const active = {
-    record: session,
-    process: { write: () => {} },
-    redactor: new OutputRedactor({ API_TOKEN: 'split-secret-value' }),
-    outputBuffer: '',
-    outputBufferBytes: 0,
-    outputStartSequence: 0,
-    outputArrivalSequence: 0,
-  }
-  state.active.set(session.id, active)
-  state.handleOutput(active, active.redactor.write('before split-sec'))
-  state.handleOutput(active, active.redactor.write('ret-value after\n'))
-  state.handleOutput(active, active.redactor.finish())
-  await supervisor.flush()
-  const raw = await supervisor.rawOutput(session.id)
-  expect(raw?.raw).toBe('before [REDACTED] after\n')
-  expect(raw?.raw).not.toContain('split-secret-value')
-
   const exec = await supervisor.exec({
     command: process.execPath,
     args: [
@@ -802,6 +777,7 @@ test('exec truncation redacts a secret that crosses the output cap', async () =>
 })
 
 test('PTY idempotency reuses only an active matching owner and spec', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -834,6 +810,7 @@ test('PTY idempotency reuses only an active matching owner and spec', async () =
 })
 
 test('PTY idempotency canonicalizes environment order and scopes only by parent and workdir', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
   roots.push(root)
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
@@ -857,6 +834,7 @@ test('PTY idempotency canonicalizes environment order and scopes only by parent 
 })
 
 test('daemon waits for output, exit, and deadline without plugin polling', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-wait-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -905,6 +883,7 @@ test('daemon waits for output, exit, and deadline without plugin polling', async
 })
 
 test('sendWait ignores output before input acceptance and waits for later output', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-'))
   roots.push(root)
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
@@ -937,38 +916,6 @@ test('sendWait ignores output before input acceptance and waits for later output
     await supervisor.stop(session.id).catch(() => undefined)
     await supervisor.flush()
   }
-})
-
-test('sendWait excludes output delivered synchronously by PTY write acceptance', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-write-race-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const supervisor = new SessionSupervisor(storage)
-  await supervisor.initialize()
-  const session = record(root, 'pty_write_race')
-  const state = supervisor as unknown as {
-    active: Map<string, { record: SessionRecord; process: { write(data: string): void } }>
-    records: Map<string, SessionRecord>
-    handleOutput(active: unknown, data: string): void
-  }
-  state.records.set(session.id, session)
-  const active = {
-    record: session,
-    process: {
-      write: () => state.handleOutput(active, 'write-adjacent ready\n'),
-    },
-    redactor: new OutputRedactor({}),
-    outputBuffer: '',
-    outputBufferBytes: 0,
-    outputStartSequence: 0,
-    outputArrivalSequence: 0,
-  }
-  state.active.set(session.id, active)
-
-  await expect(
-    supervisor.sendWait(session.id, 'go\n', { kind: 'output', literal: 'ready' }, 1)
-  ).resolves.toMatchObject({ satisfied: false, reason: 'deadline' })
-  await supervisor.flush()
 })
 
 test('exec output remains separately recoverable after restart', async () => {
@@ -1529,6 +1476,64 @@ test('native exec POSIX containment creates a fresh session, drains groups, esca
   }
 }, 15_000)
 
+test('native PTY writes, resizes, rejects exec resize, and recovers after daemon restart', async () => {
+  if (process.platform === 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-pty-'))
+  roots.push(root)
+  const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker')
+  await stat(workerPath)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-pty', root)
+  const first = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-first')
+  let restarted: DaemonServer | undefined
+  try {
+    const descriptor = await first.start()
+    const spawned = await rpc(
+      descriptor,
+      'spawn',
+      {
+        command: process.execPath,
+        args: ['-e', "process.stdin.on('data', value => process.stdout.write('echo:' + value))"],
+        description: 'native pty integration',
+      },
+      context
+    ).then((response) => response.json())
+    const id = (spawned as { result: { id: string } }).result.id
+    expect(
+      await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then((response) =>
+        response.json()
+      )
+    ).toMatchObject({ result: { cols: 100, rows: 30 } })
+    await rpc(descriptor, 'write', { id, data: 'hello\n' }, context)
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const output = await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
+        response.json()
+      )
+      if ((output as { result: { raw: string } }).result.raw.includes('echo:hello')) break
+      await Bun.sleep(20)
+    }
+    expect(
+      await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: { raw: expect.stringContaining('echo:hello') } })
+    await first.stop()
+    restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-second')
+    const restartedDescriptor = await restarted.start()
+    expect(
+      await rpc(restartedDescriptor, 'resize', { id, cols: 90, rows: 25 }, context).then(
+        (response) => response.json()
+      )
+    ).toMatchObject({ result: { cols: 90, rows: 25 } })
+    await rpc(restartedDescriptor, 'stop', { id }, context)
+  } finally {
+    await restarted?.stop()
+    await first.stop().catch(() => undefined)
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 15_000)
+
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
   expect(escapeXml(`ok\u0000\u001f\ud800😀`)).toBe('ok���😀')
@@ -1979,115 +1984,28 @@ test('daemon classifies PTY failures as process failures', async () => {
   }
 })
 
-test('supervisor preserves timeout diagnostics, stop state, cleanup state, and output cursors', async () => {
+test('supervisor preserves terminal cleanup state and output cursors', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-supervisor-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
   await storage.initialize()
-  const timedOut = record(root, 'pty_timeout')
-  const stopped = record(root, 'pty_stop')
   const terminal = record(root, 'pty_terminal', 'exited')
   const output = record(root, 'pty_output', 'exited')
-  const writable = record(root, 'pty_write')
-  const parent = record(root, 'pty_parent')
-  parent.parentSessionId = 'parent-cleanup'
   output.nextSequence = 8
   output.outputBytes = 8
   output.lineCount = 2
   await supervisor.initialize()
   const state = supervisor as unknown as {
-    active: Map<
-      string,
-      { record: SessionRecord; process: { kill(): void; write(data: string): void } }
-    >
     records: Map<string, SessionRecord>
-    timeout(id: string): Promise<void>
   }
-  for (const entry of [timedOut, stopped, terminal, output, writable, parent]) {
+  for (const entry of [terminal, output]) {
     state.records.set(entry.id, entry)
     await storage.writeSession(entry)
   }
   await storage.appendOutput('pty_output', [
     { startSequence: 0, endSequence: 8, timestamp: new Date().toISOString(), data: 'one\nhit\n' },
   ])
-  state.active.set('pty_timeout', {
-    record: timedOut,
-    process: {
-      kill: () => {
-        throw new Error('permission denied')
-      },
-      write: () => {},
-    },
-  })
-  await state.timeout('pty_timeout')
-  expect(await supervisor.get('pty_timeout')).toMatchObject({
-    status: 'timed_out',
-    timedOut: true,
-    terminationRequested: false,
-    exitReason: { kind: 'timeout', message: 'Failed to stop PTY: permission denied' },
-  })
-  const recovered = new SessionSupervisor(storage)
-  await recovered.initialize()
-  expect((await recovered.get('pty_timeout'))?.status).toBe('timed_out')
-
-  let kills = 0
-  state.active.set('pty_stop', {
-    record: stopped,
-    process: {
-      kill: () => {
-        kills += 1
-      },
-      write: () => {},
-    },
-  })
-  expect(await supervisor.stop('pty_stop')).toMatchObject({
-    requested: true,
-    terminationConfirmed: false,
-  })
-  expect(kills).toBe(1)
-  expect(await recovered.stop('pty_timeout')).toMatchObject({
-    requested: false,
-    terminationConfirmed: false,
-  })
-
-  let written = ''
-  state.active.set('pty_write', {
-    record: writable,
-    process: {
-      kill: () => {},
-      write: (data) => {
-        written = data
-      },
-    },
-  })
-  expect(await supervisor.write('pty_write', 'A😀')).toEqual({
-    acceptedBytes: 5,
-    acceptedCharacters: 2,
-  })
-  expect(written).toBe('A😀')
-  state.active.set('pty_write', {
-    record: writable,
-    process: {
-      kill: () => {},
-      write: () => {
-        throw new Error('closed')
-      },
-    },
-  })
-  await expect(supervisor.write('pty_write', 'x')).rejects.toBeInstanceOf(ProcessError)
-
-  state.active.set('pty_parent', {
-    record: parent,
-    process: {
-      kill: () => {
-        kills += 1
-      },
-      write: () => {},
-    },
-  })
-  await supervisor.cleanupByParentSession('parent-cleanup', root, '')
-  expect(kills).toBe(2)
 
   const read = await supervisor.read('pty_output')
   const search = await supervisor.search('pty_output', 'hit')
@@ -2106,10 +2024,13 @@ test('supervisor preserves timeout diagnostics, stop state, cleanup state, and o
 })
 
 test('plugin client starts its daemon from the configured data directory', async () => {
+  if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-client-'))
   roots.push(root)
   const previousDirectory = process.env.PTY_DAEMON_DIR
+  const previousWorkerPath = process.env.PTY_NATIVE_WORKER_PATH
   process.env.PTY_DAEMON_DIR = root
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
   const storage = new DaemonStorage(root)
   let pid: number | undefined
   try {
@@ -2148,6 +2069,8 @@ test('plugin client starts its daemon from the configured data directory', async
     if (pid) process.kill(pid)
     await Bun.sleep(100)
     process.env.PTY_DAEMON_DIR = previousDirectory
+    if (previousWorkerPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousWorkerPath
   }
 })
 

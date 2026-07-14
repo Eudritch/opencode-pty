@@ -9,6 +9,7 @@ import { ptyList } from './plugin/pty/tools/list.ts'
 import { ptyKill } from './plugin/pty/tools/kill.ts'
 import { createShellExec } from './plugin/pty/tools/exec.ts'
 import { ptySendWait, ptyWait } from './plugin/pty/tools/wait.ts'
+import { ptyResize } from './plugin/pty/tools/resize.ts'
 
 export const PTYPlugin = async ({ client, directory }: PluginContext): Promise<PluginResult> => {
   const authorizeSpawn = createSpawnAuthorizer(client, directory)
@@ -23,6 +24,7 @@ export const PTYPlugin = async ({ client, directory }: PluginContext): Promise<P
       shell_exec: createShellExec(authorizeSpawn),
       pty_wait: ptyWait,
       pty_send_wait: ptySendWait,
+      pty_resize: ptyResize,
     },
     event: async ({ event }) => {
       if (event.type === 'session.deleted') {

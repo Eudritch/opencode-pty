@@ -8,6 +8,8 @@ use std::fs::remove_dir_all;
 use std::fs::{File, create_dir_all, remove_file, rename};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
@@ -39,6 +41,10 @@ struct Bootstrap {
     timeout_seconds: u64,
     max_output_bytes: usize,
     mode: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    cols: Option<u16>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    rows: Option<u16>,
     fault: Option<String>,
 }
 
@@ -195,12 +201,15 @@ struct Containment {
 
 struct Worker {
     child: Mutex<Child>,
+    #[cfg(unix)]
+    terminal: Option<Mutex<File>>,
     state: Mutex<State>,
     secrets: Vec<String>,
     output_directory: PathBuf,
     max_output_bytes: usize,
     deadline: SystemTime,
     containment: Containment,
+    mode: String,
 }
 
 struct WorkerError {
@@ -751,7 +760,12 @@ fn signal_contained(containment: &Containment, signal: i32) -> (bool, Containmen
 }
 
 fn containment_drained(report: &ContainmentReport) -> bool {
-    report.status == "posix_best_effort_empty" || report.status == "not_applicable"
+    report.status == "posix_best_effort_empty"
+        || report.status == "not_applicable"
+        // macOS has no process identity scan. A reaped direct child is terminal, but descendant
+        // containment remains deliberately unavailable.
+        || (cfg!(all(unix, not(target_os = "linux")))
+            && report.status == "posix_containment_unknown")
 }
 
 fn refresh_termination_confirmed(worker: &Arc<Worker>) -> ContainmentReport {
@@ -944,6 +958,83 @@ fn contain_child(command: &mut Command) {
 }
 
 #[cfg(unix)]
+fn pty_child(command: &mut Command, cols: u16, rows: u16) -> Result<(Child, File), String> {
+    let mut master = -1;
+    let mut slave = -1;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &size,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // openpty returned owned descriptors; every Command stream gets its own duplicate.
+    let master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let slave_fd = slave.as_raw_fd();
+    let stdin = slave.try_clone().map_err(|error| error.to_string())?;
+    let stdout = slave.try_clone().map_err(|error| error.to_string())?;
+    let stderr = slave.try_clone().map_err(|error| error.to_string())?;
+    command
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    Ok((child, master))
+}
+
+#[cfg(unix)]
+fn resize_terminal(worker: &Arc<Worker>, cols: u16, rows: u16) -> Result<(), WorkerError> {
+    let terminal = worker.terminal.as_ref().ok_or(WorkerError {
+        code: "process",
+        message: "session is not a PTY".into(),
+    })?;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::ioctl(
+            terminal.lock().expect("terminal lock").as_raw_fd(),
+            libc::TIOCSWINSZ,
+            &size,
+        )
+    } == -1
+    {
+        return Err(WorkerError {
+            code: "process",
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn verify_containment(pid: u32) -> Result<Containment, String> {
     let pgid = unsafe { libc::getpgid(pid as i32) };
     let sid = unsafe { libc::getsid(pid as i32) };
@@ -1094,8 +1185,12 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
                         stdout,
                         redact_stream(String::new(), &mut tail, &worker.secrets, true),
                     );
-                    let mut state = worker.state.lock().expect("state lock");
-                    mark_reader_failure(&mut state, stdout, error.to_string());
+                    if worker.mode == "pty" && error.raw_os_error() == Some(libc::EIO) {
+                        mark_reader_eof(&worker, stdout);
+                    } else {
+                        let mut state = worker.state.lock().expect("state lock");
+                        mark_reader_failure(&mut state, stdout, error.to_string());
+                    }
                     return;
                 }
                 Ok(size) => append_output(
@@ -1150,8 +1245,11 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         .join("; ");
     let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
     let containment_unavailable = containment.status == "posix_containment_unknown";
+    let macos_direct_exit = cfg!(all(unix, not(target_os = "linux"))) && state.root_exited;
     let status = if (terminal || (state.root_exited && containment_unavailable))
-        && (state.storage_failure.is_some() || state.output_incomplete || containment_unavailable)
+        && (state.storage_failure.is_some()
+            || state.output_incomplete
+            || (containment_unavailable && !macos_direct_exit))
     {
         "lost"
     } else if terminal {
@@ -1160,7 +1258,7 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "running"
     };
     json!({
-        "status": status, "pid": pid, "stdout": state.stdout, "stderr": state.stderr,
+        "status": status, "pid": pid, "mode": worker.mode, "stdout": state.stdout, "stderr": state.stderr,
         "stdoutBytes": state.stdout_bytes, "stderrBytes": state.stderr_bytes,
         "stdoutTruncated": state.stdout_truncated, "stderrTruncated": state.stderr_truncated,
         "nextSequence": state.next_sequence, "firstRetainedSequence": state.first_retained_sequence,
@@ -1240,6 +1338,8 @@ mod tests {
         create_dir_all(&output_directory).expect("create output directory");
         let worker = Arc::new(Worker {
             child: Mutex::new(child),
+            #[cfg(unix)]
+            terminal: None,
             state: Mutex::new(State {
                 started_at: now(),
                 ..State::default()
@@ -1256,6 +1356,7 @@ mod tests {
                 known_members: Mutex::new(BTreeMap::new()),
                 escaped_members: Mutex::new(BTreeMap::new()),
             },
+            mode: "exec".into(),
         });
         reader(worker.clone(), FailingReader, true);
         for _ in 0..1_000 {
@@ -1472,7 +1573,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             message: "missing operation".into(),
         })?;
     match operation {
-        "health" => Ok((json!({"protocolVersion": 1}), false)),
+        "health" => Ok((json!({"protocolVersion": 2}), false)),
         "snapshot" => Ok((snapshot(worker), false)),
         "write" => {
             let data = request
@@ -1500,6 +1601,21 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                     message: "worker output storage failed".into(),
                 });
             }
+            #[cfg(unix)]
+            if let Some(terminal) = &worker.terminal {
+                let mut terminal = terminal.lock().expect("terminal lock");
+                terminal
+                    .write_all(data.as_bytes())
+                    .map_err(|error| WorkerError {
+                        code: "process",
+                        message: error.to_string(),
+                    })?;
+                terminal.flush().map_err(|error| WorkerError {
+                    code: "process",
+                    message: error.to_string(),
+                })?;
+                return Ok((json!({"acceptedBytes": data.len()}), false));
+            }
             let mut child = worker.child.lock().expect("child lock");
             let input = child.stdin.as_mut().ok_or(WorkerError {
                 code: "process",
@@ -1516,6 +1632,43 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                 message: error.to_string(),
             })?;
             Ok((json!({"acceptedBytes": data.len()}), false))
+        }
+        "resize" => {
+            if worker.mode != "pty" {
+                return Err(WorkerError {
+                    code: "process",
+                    message: "session is not a PTY".into(),
+                });
+            }
+            let cols = request
+                .get("cols")
+                .and_then(Value::as_u64)
+                .filter(|value| (1..=1000).contains(value))
+                .ok_or(WorkerError {
+                    code: "validation",
+                    message: "cols must be an integer from 1 to 1000".into(),
+                })? as u16;
+            let rows = request
+                .get("rows")
+                .and_then(Value::as_u64)
+                .filter(|value| (1..=1000).contains(value))
+                .ok_or(WorkerError {
+                    code: "validation",
+                    message: "rows must be an integer from 1 to 1000".into(),
+                })? as u16;
+            #[cfg(unix)]
+            {
+                resize_terminal(worker, cols, rows)?;
+                Ok((json!({"cols": cols, "rows": rows}), false))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (cols, rows);
+                Err(WorkerError {
+                    code: "process",
+                    message: "native PTY resize is unavailable on this platform".into(),
+                })
+            }
         }
         "wait" => {
             let timeout_ms = request
@@ -1637,8 +1790,8 @@ fn main() -> Result<(), String> {
     let mut stdin = std::io::stdin();
     let bootstrap: Bootstrap =
         serde_json::from_slice(&read_frame(&mut stdin)?).map_err(|error| error.to_string())?;
-    if bootstrap.mode != "exec" {
-        return Err("only exec mode is supported".into());
+    if bootstrap.mode != "exec" && bootstrap.mode != "pty" {
+        return Err("mode must be exec or pty".into());
     }
     if bootstrap.worker_control_token.len() < 16 {
         return Err("invalid worker token".into());
@@ -1663,7 +1816,7 @@ fn main() -> Result<(), String> {
             listener.local_addr().map_err(|error| error.to_string())?
         ),
         token: bootstrap.worker_control_token.clone(),
-        protocol_version: 1,
+        protocol_version: 2,
     };
     write_atomic(
         &descriptor_path,
@@ -1712,18 +1865,33 @@ fn main() -> Result<(), String> {
         .args(&bootstrap.args)
         .current_dir(&bootstrap.workdir)
         .env_clear()
-        .envs(&bootstrap.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .envs(&bootstrap.env);
     #[cfg(unix)]
-    contain_child(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = remove_file(&descriptor_path);
-            return Err(error.to_string());
+    let (mut child, terminal) = if bootstrap.mode == "pty" {
+        pty_child(
+            &mut command,
+            bootstrap.cols.unwrap_or(120).clamp(1, 1000),
+            bootstrap.rows.unwrap_or(40).clamp(1, 1000),
+        )
+        .map(|(child, terminal)| (child, Some(terminal)))?
+    } else {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        contain_child(&mut command);
+        (command.spawn().map_err(|error| error.to_string())?, None)
+    };
+    #[cfg(not(unix))]
+    let mut child = {
+        if bootstrap.mode == "pty" {
+            return Err("native PTY is unavailable on this platform".into());
         }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().map_err(|error| error.to_string())?
     };
     let containment = match verify_containment(child.id()) {
         Ok(containment) => containment,
@@ -1733,30 +1901,37 @@ fn main() -> Result<(), String> {
             return Err(error);
         }
     };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            #[cfg(unix)]
-            terminate_contained_child_and_wait(&mut child, &containment);
-            #[cfg(not(unix))]
-            terminate_child_and_wait(&mut child);
-            let _ = remove_file(&descriptor_path);
-            return Err("missing stdout".into());
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            #[cfg(unix)]
-            terminate_contained_child_and_wait(&mut child, &containment);
-            #[cfg(not(unix))]
-            terminate_child_and_wait(&mut child);
-            let _ = remove_file(&descriptor_path);
-            return Err("missing stderr".into());
-        }
+    let (stdout, stderr) = if bootstrap.mode == "pty" {
+        (None, None)
+    } else {
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                #[cfg(unix)]
+                terminate_contained_child_and_wait(&mut child, &containment);
+                #[cfg(not(unix))]
+                terminate_child_and_wait(&mut child);
+                let _ = remove_file(&descriptor_path);
+                return Err("missing stdout".into());
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                #[cfg(unix)]
+                terminate_contained_child_and_wait(&mut child, &containment);
+                #[cfg(not(unix))]
+                terminate_child_and_wait(&mut child);
+                let _ = remove_file(&descriptor_path);
+                return Err("missing stderr".into());
+            }
+        };
+        (Some(stdout), Some(stderr))
     };
     let worker = Arc::new(Worker {
         child: Mutex::new(child),
+        #[cfg(unix)]
+        terminal: terminal.map(Mutex::new),
         state: Mutex::new(State {
             started_at: now(),
             ..State::default()
@@ -1770,9 +1945,26 @@ fn main() -> Result<(), String> {
         max_output_bytes: bootstrap.max_output_bytes.min(MAX_OUTPUT_BYTES),
         deadline: SystemTime::now() + Duration::from_secs(bootstrap.timeout_seconds),
         containment,
+        mode: bootstrap.mode.clone(),
     });
-    reader(worker.clone(), stdout, true);
-    reader(worker.clone(), stderr, false);
+    if bootstrap.mode == "pty" {
+        #[cfg(unix)]
+        {
+            let terminal = worker
+                .terminal
+                .as_ref()
+                .expect("PTY terminal")
+                .lock()
+                .expect("terminal lock")
+                .try_clone()
+                .map_err(|error| error.to_string())?;
+            reader(worker.clone(), terminal, true);
+            mark_reader_eof(&worker, false); // A PTY intentionally has one merged output stream.
+        }
+    } else {
+        reader(worker.clone(), stdout.expect("exec stdout"), true);
+        reader(worker.clone(), stderr.expect("exec stderr"), false);
+    }
     monitor(worker.clone());
     let shutdown = Arc::new(AtomicBool::new(false));
     let rollback = Arc::new(AtomicBool::new(false));
@@ -1781,12 +1973,12 @@ fn main() -> Result<(), String> {
         let rollback = rollback.clone();
         let token = bootstrap.worker_control_token.clone();
         thread::spawn(move || {
-            // EOF is parent death for this worker: reaping happens in the owner thread below.
+            // The daemon may restart and close its inherited stdin. EOF is not worker ownership.
             match control(&mut std::io::stdin(), &token) {
                 Ok(control) if control.operation == "rollback" => {
                     rollback.store(true, Ordering::Release)
                 }
-                _ => rollback.store(true, Ordering::Release),
+                _ => return,
             }
             shutdown.store(true, Ordering::Release);
         });

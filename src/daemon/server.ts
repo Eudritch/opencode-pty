@@ -193,6 +193,17 @@ export class DaemonServer implements Disposable {
         this.useInput(owner, data)
         return this.supervisor.write(id, data)
       }
+      case 'resize': {
+        const payload = this.objectPayload(request.payload)
+        this.onlyFields(payload, ['id', 'cols', 'rows'])
+        const id = this.requiredString(payload, 'id')
+        this.authorize(id, owner)
+        return this.supervisor.resize(
+          id,
+          this.requiredBoundedInteger(payload, 'cols', 1000),
+          this.requiredBoundedInteger(payload, 'rows', 1000)
+        )
+      }
       case 'wait': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'condition', 'timeoutSeconds'])
@@ -352,9 +363,7 @@ export class DaemonServer implements Disposable {
       throw new Error('Exec runtime limit exceeded.')
     }
     return this.withSessionSlot(owner, () =>
-      (process.env.PTY_NATIVE_WORKER_ENABLED === '1'
-        ? this.supervisor.nativeExec.bind(this.supervisor)
-        : this.supervisor.exec.bind(this.supervisor))({
+      this.supervisor.nativeExec({
         ...options,
         parentSessionId: owner.parentSessionId,
         ownerProjectDirectory: owner.projectDirectory,
@@ -452,11 +461,9 @@ export class DaemonServer implements Disposable {
       },
       environment: { inheritEnabled: true, defaultProfile: 'safe' },
       platform: {
-        nativeContainment:
-          process.platform === 'linux' && process.env.PTY_NATIVE_WORKER_ENABLED === '1',
-        processTreeTermination:
-          process.platform === 'linux' && process.env.PTY_NATIVE_WORKER_ENABLED === '1',
-        ptyContainment: false,
+        nativeContainment: process.platform === 'linux',
+        processTreeTermination: process.platform === 'linux',
+        ptyContainment: process.platform === 'linux',
         containmentVerification: process.platform === 'linux' ? 'linux_proc' : 'unavailable',
       },
     }
@@ -498,6 +505,17 @@ export class DaemonServer implements Disposable {
     const value = this.optionalNonnegativeInteger(payload, key)
     if (!value) throw new ValidationError(`RPC field '${key}' must be positive.`)
     return value
+  }
+
+  private requiredBoundedInteger(
+    payload: Record<string, unknown>,
+    key: string,
+    maximum: number
+  ): number {
+    const value = payload[key]
+    if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > maximum)
+      throw new ValidationError(`RPC field '${key}' must be an integer from 1 to ${maximum}.`)
+    return value as number
   }
 
   private optionalSequence(payload: Record<string, unknown>, key: string): number | undefined {
