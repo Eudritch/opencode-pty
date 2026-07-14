@@ -156,9 +156,8 @@ try {
   )
 } finally {
   daemon?.kill('SIGKILL')
-  await Promise.race([daemon?.exited.catch(() => undefined), Bun.sleep(5000)])
-  await removeTemporary(packageDirectory)
-  await removeTemporary(stateDirectory)
+  void removeTemporary(packageDirectory)
+  void removeTemporary(stateDirectory)
 }
 
 process.exit(0)
