@@ -199,6 +199,7 @@ export interface DaemonDescriptor {
 export interface DaemonLaunchOptions {
   readonly dataDirectory?: string
   readonly token?: string
+  readonly startLockToken?: string
 }
 
 export interface RpcRequest {

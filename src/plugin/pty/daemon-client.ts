@@ -273,7 +273,7 @@ export class DaemonClient {
     }
     this.descriptor = null
     let deadline: number | undefined
-    let ownsStartLock = false
+    let startLockToken: string | null = null
     let started = false
     let startupStderr = ''
     let startupToken = ''
@@ -293,12 +293,18 @@ export class DaemonClient {
             return descriptor
           }
           if (state === 'incompatible') throw this.incompatibleProtocol(descriptor)
+          if (await this.storage.descriptorOwnerAlive()) {
+            deadline ??= daemonReadinessDeadline(Date.now())
+            await Bun.sleep(25)
+            continue
+          }
         }
-        if (!ownsStartLock && (await this.storage.acquireStartLock())) {
-          ownsStartLock = true
-          continue
+        if (!startLockToken) {
+          startLockToken = await this.storage.acquireStartLock()
+          if (startLockToken) continue
+          deadline ??= daemonReadinessDeadline(Date.now())
         }
-        if (ownsStartLock && !started) {
+        if (startLockToken && !started) {
           let lockedDescriptor: unknown = null
           try {
             lockedDescriptor = await this.storage.readDescriptor()
@@ -313,7 +319,6 @@ export class DaemonClient {
             }
             if (state === 'incompatible') throw this.incompatibleProtocol(lockedDescriptor)
           }
-          await this.storage.removeDescriptor()
           const extension = import.meta.url.endsWith('.ts') ? 'ts' : 'js'
           const token = crypto.randomUUID()
           startupToken = token
@@ -321,6 +326,7 @@ export class DaemonClient {
             JSON.stringify({
               dataDirectory: this.storage.rootDirectory,
               token,
+              startLockToken,
             })
           ).toString('base64url')
           startupOptions = launchOptions
@@ -353,7 +359,7 @@ export class DaemonClient {
         await Bun.sleep(25)
       }
     } finally {
-      if (ownsStartLock) await this.storage.releaseStartLock()
+      if (startLockToken) await this.storage.releaseStartLock(startLockToken)
     }
     const diagnostic = safeStartupStderrTail(startupStderr, startupToken, startupOptions)
     throw new Error(

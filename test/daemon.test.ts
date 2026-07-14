@@ -8,6 +8,7 @@ import { DaemonStorage } from '../src/daemon/storage.ts'
 import { WorkerClient as NativeWorkerClient } from '../src/daemon/worker-client.ts'
 import {
   effectiveMaxOutputBytes,
+  OutputRedactor,
   ProcessError,
   runtimeEnvironment,
   SessionSupervisor,
@@ -513,6 +514,51 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
   expect(exec.stdout).toBe('before [REDACTED] after\n')
   expect(exec.stdout).not.toContain('split-secret-value')
   expect((await supervisor.execOutput(exec.session.id))?.stdout).not.toContain('split-secret-value')
+})
+
+test('private and signing key environment values are redacted across chunks', () => {
+  for (const key of ['SSH_PRIVATE_KEY', 'PRIVATE_KEY', 'TLS_PRIVATE_KEY', 'SIGNING_KEY']) {
+    const redactor = new OutputRedactor({ [key]: 'private-key-value' })
+    expect(
+      `${redactor.write('before private-')}${redactor.write('key-value after')}${redactor.finish()}`
+    ).toBe('before [REDACTED] after')
+  }
+})
+
+test('start locks retain live owners and recover exactly one dead owner', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const live = await storage.acquireStartLock()
+  expect(live).toEqual(expect.any(String))
+  expect(await storage.acquireStartLock()).toBeNull()
+  if (!live) throw new Error('Expected start lock.')
+  await storage.releaseStartLock(live)
+  await writeFile(
+    join(root, 'daemon-start.lock'),
+    JSON.stringify({ token: 'dead', pid: 2147483647 })
+  )
+  const recovered = await Promise.all([storage.acquireStartLock(), storage.acquireStartLock()])
+  expect(recovered.filter(Boolean)).toHaveLength(1)
+  const recoveredToken = recovered.find(Boolean)
+  if (!recoveredToken) throw new Error('Expected recovered start lock.')
+  await storage.releaseStartLock(recoveredToken)
+})
+
+test('daemon stop leaves a replacement descriptor intact', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-descriptor-owner-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'first-token')
+  await server.start()
+  await storage.writeDescriptor({
+    pid: process.pid,
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: DAEMON_PROTOCOL_VERSION,
+    token: 'replacement-token',
+  })
+  await server.stop()
+  expect((await storage.readDescriptor())?.token).toBe('replacement-token')
 })
 
 test('daemon rejects oversized content-length and chunked RPC bodies before JSON materialization', async () => {

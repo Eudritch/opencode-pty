@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
+import { chmod, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
   type DaemonDescriptor,
@@ -15,12 +15,17 @@ const METADATA_FILE = 'session.json'
 const LEGACY_OUTPUT_FILE = 'output.log'
 const OUTPUT_DIRECTORY = 'output'
 const START_LOCK_FILE = 'daemon-start.lock'
-const STALE_START_LOCK_MS = 10000
+const START_LOCK_RECOVERY_FILE = 'daemon-start-recovery.lock'
 const QUARANTINE_DIRECTORY = 'quarantine'
 const OUTPUT_SEGMENT_BYTES = 64 * 1024
 
 class InvalidSessionError extends Error {}
 class InvalidJournalError extends InvalidSessionError {}
+
+interface StartLock {
+  token: string
+  pid: number
+}
 
 const SESSION_STATUSES = new Set([
   'starting',
@@ -89,6 +94,10 @@ export class DaemonStorage {
     return join(this.root, START_LOCK_FILE)
   }
 
+  private get startLockRecoveryPath(): string {
+    return join(this.root, START_LOCK_RECOVERY_FILE)
+  }
+
   private sessionDirectory(id: string): string {
     return join(this.root, SESSIONS_DIRECTORY, id)
   }
@@ -128,7 +137,7 @@ export class DaemonStorage {
       return JSON.parse(await readFile(this.descriptorPath, 'utf8')) as DaemonDescriptor
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-      throw error
+      return null
     }
   }
 
@@ -136,8 +145,20 @@ export class DaemonStorage {
     await this.writeAtomic(this.descriptorPath, JSON.stringify(descriptor))
   }
 
-  async removeDescriptor(): Promise<void> {
-    await rm(this.descriptorPath, { force: true })
+  async removeDescriptor(token: string): Promise<void> {
+    const startLockToken = await this.acquireStartLock()
+    if (!startLockToken) return
+    try {
+      const descriptor = await this.readDescriptor()
+      if (descriptor?.token === token) await rm(this.descriptorPath, { force: true })
+    } finally {
+      await this.releaseStartLock(startLockToken)
+    }
+  }
+
+  async descriptorOwnerAlive(): Promise<boolean> {
+    const descriptor = await this.readDescriptor()
+    return descriptor ? this.processAlive(descriptor.pid) : false
   }
 
   async ownershipSecret(): Promise<string> {
@@ -167,30 +188,110 @@ export class DaemonStorage {
     }
   }
 
-  async acquireStartLock(): Promise<boolean> {
+  async acquireStartLock(): Promise<string | null> {
     await this.initialize()
+    const token = crypto.randomUUID()
     try {
       const handle = await open(this.startLockPath, 'wx', 0o600)
-      await handle.close()
+      try {
+        await handle.writeFile(
+          JSON.stringify({ token, pid: process.pid } satisfies StartLock),
+          'utf8'
+        )
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
       await this.privateFile(this.startLockPath)
-      return true
+      await this.syncDirectory(this.root)
+      return token
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      let lock: Awaited<ReturnType<typeof stat>>
+      const lock = await this.readStartLock()
+      if (!lock || this.processAlive(lock.pid)) return null
+      if (!(await this.acquireStartLockRecovery())) return null
       try {
-        lock = await stat(this.startLockPath)
-      } catch (statError) {
-        if ((statError as NodeJS.ErrnoException).code === 'ENOENT') return this.acquireStartLock()
-        throw statError
+        const current = await this.readStartLock()
+        if (!current || this.processAlive(current.pid)) return null
+        await rm(this.startLockPath, { force: true })
+        await this.syncDirectory(this.root)
+        return this.acquireStartLock()
+      } finally {
+        await rm(this.startLockRecoveryPath, { force: true })
       }
-      if (Date.now() - lock.mtimeMs < STALE_START_LOCK_MS) return false
-      await rm(this.startLockPath, { force: true })
-      return this.acquireStartLock()
     }
   }
 
-  async releaseStartLock(): Promise<void> {
-    await rm(this.startLockPath, { force: true })
+  async claimStartLock(token: string): Promise<boolean> {
+    const lock = await this.readStartLock()
+    if (!lock || lock.token !== token) return false
+    await this.writeStartLock({ token, pid: process.pid })
+    return true
+  }
+
+  async releaseStartLock(token: string): Promise<void> {
+    const lock = await this.readStartLock()
+    if (lock?.token === token && lock.pid === process.pid) {
+      await rm(this.startLockPath, { force: true })
+      await this.syncDirectory(this.root)
+    }
+  }
+
+  private async readStartLock(): Promise<StartLock | null> {
+    try {
+      const value = JSON.parse(await readFile(this.startLockPath, 'utf8')) as Partial<StartLock>
+      const { token, pid } = value
+      return typeof token === 'string' &&
+        token &&
+        typeof pid === 'number' &&
+        Number.isSafeInteger(pid) &&
+        pid > 0
+        ? (value as StartLock)
+        : null
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
+  private async writeStartLock(lock: StartLock): Promise<void> {
+    await this.writeAtomic(this.startLockPath, JSON.stringify(lock))
+  }
+
+  private async acquireStartLockRecovery(): Promise<boolean> {
+    try {
+      const handle = await open(this.startLockRecoveryPath, 'wx', 0o600)
+      try {
+        await handle.writeFile(String(process.pid), 'utf8')
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      await this.privateFile(this.startLockRecoveryPath)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        let pid: number | null = null
+        try {
+          pid = Number.parseInt(await readFile(this.startLockRecoveryPath, 'utf8'), 10)
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code !== 'ENOENT') throw readError
+        }
+        if (pid && this.processAlive(pid)) return false
+        await rm(this.startLockRecoveryPath, { force: true })
+        return this.acquireStartLockRecovery()
+      }
+      throw error
+    }
+  }
+
+  private processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+    }
   }
 
   async writeSession(record: SessionRecord): Promise<void> {

@@ -12,7 +12,8 @@ function launchOptions(): DaemonLaunchOptions {
     ) as DaemonLaunchOptions
     if (
       (decoded.dataDirectory !== undefined && typeof decoded.dataDirectory !== 'string') ||
-      (decoded.token !== undefined && typeof decoded.token !== 'string')
+      (decoded.token !== undefined && typeof decoded.token !== 'string') ||
+      (decoded.startLockToken !== undefined && typeof decoded.startLockToken !== 'string')
     ) {
       throw new Error('invalid options')
     }
@@ -24,7 +25,13 @@ function launchOptions(): DaemonLaunchOptions {
 
 const options = launchOptions()
 const storage = new DaemonStorage(options.dataDirectory)
-const server = new DaemonServer(storage, new SessionSupervisor(storage), options.token)
+const server = new DaemonServer(
+  storage,
+  new SessionSupervisor(storage),
+  options.token,
+  undefined,
+  options.startLockToken
+)
 
 await server.start()
 

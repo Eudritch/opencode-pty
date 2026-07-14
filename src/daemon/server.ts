@@ -37,13 +37,22 @@ export class DaemonServer implements Disposable {
     private readonly storage: DaemonStorage,
     private readonly supervisor: SessionSupervisor,
     private token: string = '',
-    private readonly maxSessionsPerOwner: number = DEFAULT_MAX_SESSIONS_PER_OWNER
+    private readonly maxSessionsPerOwner: number = DEFAULT_MAX_SESSIONS_PER_OWNER,
+    private readonly startLockToken?: string
   ) {}
 
   async start(): Promise<DaemonDescriptor> {
     await this.supervisor.initialize()
     this.ownershipSecret = await this.storage.ownershipSecret()
     this.token ||= crypto.randomUUID().replaceAll('-', '')
+    const startLockToken = this.startLockToken ?? (await this.storage.acquireStartLock())
+    if (!startLockToken || !(await this.storage.claimStartLock(startLockToken))) {
+      throw new Error('PTY daemon start lock was lost.')
+    }
+    if (await this.storage.descriptorOwnerAlive()) {
+      await this.storage.releaseStartLock(startLockToken)
+      throw new Error('PTY daemon is already running.')
+    }
     this.server = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
@@ -57,9 +66,11 @@ export class DaemonServer implements Disposable {
     }
     try {
       await this.storage.writeDescriptor(descriptor)
+      await this.storage.releaseStartLock(startLockToken)
     } catch (error) {
       this.server.stop(true)
       this.server = null
+      await this.storage.releaseStartLock(startLockToken)
       throw error
     }
     return descriptor
@@ -69,7 +80,7 @@ export class DaemonServer implements Disposable {
     this.server?.stop()
     await this.supervisor.shutdown?.(false)
     await this.supervisor.flush()
-    await this.storage.removeDescriptor()
+    await this.storage.removeDescriptor(this.token)
   }
 
   [Symbol.dispose](): void {

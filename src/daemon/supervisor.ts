@@ -37,7 +37,8 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
   'LANG',
   'ComSpec',
 ])
-const SENSITIVE_ENVIRONMENT_KEY = /(token|secret|password|credential|api[_-]?key|auth|cookie)/i
+const SENSITIVE_ENVIRONMENT_KEY =
+  /(token|secret|password|credential|api[_-]?key|auth|cookie|(?:^|[_-])(?:ssh|tls)?[_-]?private[_-]?key(?:$|[_-])|(?:^|[_-])signing[_-]?key(?:$|[_-]))/i
 
 interface ExecOptions extends SpawnOptions {
   maxOutputBytes?: number
