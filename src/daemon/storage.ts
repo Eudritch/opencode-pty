@@ -429,6 +429,7 @@ export class DaemonStorage {
         validNonnegativeInteger(value.pid) &&
         value.pid > 0 &&
         validText(value.startIdentity) &&
+        validText(value.processIdentity) &&
         validText(value.endpoint) &&
         value.protocolVersion === 1
       )

@@ -6,6 +6,7 @@ const READY_TIMEOUT_MS = 5000
 export interface WorkerDescriptor {
   pid: number
   startIdentity: string
+  processIdentity: string
   endpoint: string
   token: string
   protocolVersion: number
@@ -14,6 +15,7 @@ export interface WorkerDescriptor {
 export interface WorkerReference {
   pid: number
   startIdentity: string
+  processIdentity: string
   endpoint: string
   protocolVersion: number
 }
@@ -39,6 +41,7 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
     Number.isSafeInteger(descriptor.pid) &&
     (descriptor.pid ?? 0) > 0 &&
     typeof descriptor.startIdentity === 'string' &&
+    typeof descriptor.processIdentity === 'string' &&
     typeof descriptor.endpoint === 'string' &&
     typeof descriptor.token === 'string' &&
     descriptor.token.length >= 16 &&
@@ -105,6 +108,7 @@ export class WorkerClient {
       reference: {
         pid: descriptor.pid,
         startIdentity: descriptor.startIdentity,
+        processIdentity: descriptor.processIdentity,
         endpoint: descriptor.endpoint,
         protocolVersion: descriptor.protocolVersion,
       },
@@ -120,6 +124,7 @@ export class WorkerClient {
       if (
         descriptor.pid !== reference.pid ||
         descriptor.startIdentity !== reference.startIdentity ||
+        descriptor.processIdentity !== reference.processIdentity ||
         descriptor.endpoint !== reference.endpoint
       )
         return null

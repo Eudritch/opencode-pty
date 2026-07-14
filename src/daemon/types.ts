@@ -77,6 +77,7 @@ export interface ExecOutput {
 export interface WorkerReference {
   pid: number
   startIdentity: string
+  processIdentity: string
   endpoint: string
   protocolVersion: number
 }

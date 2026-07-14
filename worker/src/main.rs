@@ -39,9 +39,62 @@ struct Bootstrap {
 struct Descriptor {
     pid: u32,
     start_identity: String,
+    process_identity: String,
     endpoint: String,
     token: String,
     protocol_version: u32,
+}
+
+#[cfg(unix)]
+fn process_identity() -> Result<String, String> {
+    let pid = std::process::id();
+    let stat = std::fs::read_to_string("/proc/self/stat").map_err(|error| error.to_string())?;
+    let fields = stat
+        .rsplit_once(')')
+        .ok_or("invalid /proc/self/stat")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let start_time = fields.get(19).ok_or("missing /proc/self/stat start time")?;
+    Ok(format!("posix:{pid}:{start_time}"))
+}
+
+#[cfg(windows)]
+fn process_identity() -> Result<String, String> {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessTimes(
+            process: *mut std::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let mut creation = FileTime { low: 0, high: 0 };
+    let mut exit = FileTime { low: 0, high: 0 };
+    let mut kernel = FileTime { low: 0, high: 0 };
+    let mut user = FileTime { low: 0, high: 0 };
+    // GetProcessTimes binds the identity to the current process handle, never a PID lookup.
+    let result = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let ticks = u64::from(creation.low) | (u64::from(creation.high) << 32);
+    Ok(format!("windows:{}:{ticks}", std::process::id()))
 }
 
 #[derive(Default)]
@@ -814,6 +867,7 @@ fn main() -> Result<(), String> {
     let descriptor = Descriptor {
         pid: std::process::id(),
         start_identity: bootstrap.worker_id,
+        process_identity: process_identity()?,
         endpoint: format!(
             "http://{}",
             listener.local_addr().map_err(|error| error.to_string())?
