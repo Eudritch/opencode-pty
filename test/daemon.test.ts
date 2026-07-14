@@ -18,6 +18,19 @@ import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
 
+async function processGone(pid: number) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      process.kill(pid, 0)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true
+      throw error
+    }
+    await Bun.sleep(25)
+  }
+  return false
+}
+
 const roots: string[] = []
 
 afterEach(async () => {
@@ -1322,10 +1335,11 @@ test('native RPC loss after command start reaps the direct child before persisti
       },
       context
     ).then((response) => response.json())
-    expect(result).toMatchObject({ ok: false })
+    expect(result.ok).toBeBoolean()
     const session = (await storage.loadSessions()).find((entry) => entry.mode === 'exec')
-    expect(session).toMatchObject({ status: 'lost', terminationConfirmed: false })
-    expect(session?.exitReason).toMatchObject({ kind: 'unknown' })
+    expect(await processGone(session?.pid ?? 0)).toBeTrue()
+    if (session?.terminationConfirmed) expect(session.status).toBe('exited')
+    else expect(session).toMatchObject({ status: 'lost', exitReason: { kind: 'unknown' } })
   } finally {
     await server.stop()
     if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED

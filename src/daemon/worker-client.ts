@@ -198,9 +198,16 @@ export class WorkerClient {
         if (input && typeof input !== 'number') await input.end()
       } catch {}
       if (!identity) {
+        let terminationConfirmed = await exited(child, null)
+        if (!terminationConfirmed) {
+          try {
+            child.kill()
+          } catch {}
+          terminationConfirmed = await exited(child, null)
+        }
         return {
           requested: true,
-          terminationConfirmed: await exited(child, null),
+          terminationConfirmed,
           method: 'rollback',
           message:
             'Worker identity could not be verified; bootstrap was closed before command start.',
