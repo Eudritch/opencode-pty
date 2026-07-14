@@ -14,6 +14,66 @@ import { fileURLToPath } from 'node:url'
 import { realpathSync } from 'node:fs'
 
 const START_TIMEOUT_MS = 5000
+const STARTUP_STDERR_TAIL_CHARS = 4096
+const UNSAFE_STARTUP_STDERR =
+  /\b(?:token|secret|password|passwd|api[_-]?key|authorization|bearer)\b|(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=/i
+
+export function resolveDaemonLauncher(which: (command: string) => string | null): string {
+  const launcher = which('bun')
+  if (!launcher)
+    throw new Error('PTY daemon requires the Bun executable, but Bun was not found on PATH.')
+  return launcher
+}
+
+export function daemonLaunchCommand(
+  which: (command: string) => string | null,
+  entryPath: string,
+  launchOptions: string
+): string[] {
+  return [resolveDaemonLauncher(which), entryPath, launchOptions]
+}
+
+function retainStartupStderrTail(tail: string, chunk: string): string {
+  return `${tail}${chunk}`.slice(-STARTUP_STDERR_TAIL_CHARS)
+}
+
+async function captureStartupStderr(
+  stream: ReadableStream<Uint8Array>,
+  onTail: (tail: string) => void
+): Promise<void> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let tail = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      tail = retainStartupStderrTail(tail, decoder.decode(value, { stream: true }))
+      onTail(tail)
+    }
+    onTail(retainStartupStderrTail(tail, decoder.decode()))
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function safeStartupStderrTail(
+  stderr: string,
+  launchToken: string,
+  launchOptions: string
+): string | null {
+  const tail = stderr.trim()
+  if (
+    !tail ||
+    UNSAFE_STARTUP_STDERR.test(tail) ||
+    tail.includes(launchToken) ||
+    tail.includes(launchOptions) ||
+    Object.values(process.env).some((value) => value && value.length > 3 && tail.includes(value))
+  ) {
+    return null
+  }
+  return tail
+}
 
 function isSafeDescriptor(value: unknown): value is DaemonDescriptor {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -211,6 +271,9 @@ export class DaemonClient {
     const deadline = Date.now() + START_TIMEOUT_MS
     let ownsStartLock = false
     let started = false
+    let startupStderr = ''
+    let startupToken = ''
+    let startupOptions = ''
     try {
       while (Date.now() < deadline) {
         let descriptor: unknown = null
@@ -248,31 +311,49 @@ export class DaemonClient {
           }
           await this.storage.removeDescriptor()
           const extension = import.meta.url.endsWith('.ts') ? 'ts' : 'js'
+          const token = crypto.randomUUID()
+          startupToken = token
           const launchOptions = Buffer.from(
             JSON.stringify({
               dataDirectory: this.storage.rootDirectory,
-              token: crypto.randomUUID(),
+              token,
             })
           ).toString('base64url')
-          Bun.spawn({
-            cmd: [
-              process.execPath,
-              fileURLToPath(new URL(`../../daemon/main.${extension}`, import.meta.url)),
-              launchOptions,
-            ],
-            stdin: 'ignore',
-            stdout: 'ignore',
-            stderr: 'ignore',
-            env: process.env as Record<string, string>,
-          })
+          startupOptions = launchOptions
+          let child: ReturnType<typeof Bun.spawn>
+          try {
+            child = Bun.spawn({
+              cmd: daemonLaunchCommand(
+                Bun.which,
+                fileURLToPath(new URL(`../../daemon/main.${extension}`, import.meta.url)),
+                launchOptions
+              ),
+              stdin: 'ignore',
+              stdout: 'ignore',
+              stderr: 'pipe',
+              env: process.env as Record<string, string>,
+            })
+          } catch {
+            throw new Error('PTY daemon could not be launched.')
+          }
+          if (!(child.stderr instanceof ReadableStream)) {
+            throw new Error('PTY daemon stderr could not be captured.')
+          }
+          void captureStartupStderr(child.stderr, (tail) => {
+            startupStderr = tail
+          }).catch(() => undefined)
           started = true
+          continue
         }
         await Bun.sleep(25)
       }
     } finally {
       if (ownsStartLock) await this.storage.releaseStartLock()
     }
-    throw new Error('PTY daemon did not start within 5 seconds.')
+    const diagnostic = safeStartupStderrTail(startupStderr, startupToken, startupOptions)
+    throw new Error(
+      `PTY daemon did not start within 5 seconds.${diagnostic ? ` Startup stderr: ${diagnostic}` : ''}`
+    )
   }
 
   private async probe(

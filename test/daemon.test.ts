@@ -11,7 +11,12 @@ import {
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
 import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
-import { DaemonClient, ownerContext } from '../src/plugin/pty/daemon-client.ts'
+import {
+  daemonLaunchCommand,
+  DaemonClient,
+  ownerContext,
+  resolveDaemonLauncher,
+} from '../src/plugin/pty/daemon-client.ts'
 import { formatLine, formatSessionInfo } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
@@ -1857,6 +1862,19 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
     server.stop(true)
     process.env.PTY_DAEMON_DIR = previousDirectory
   }
+})
+
+test('daemon launcher resolves Bun instead of a non-Bun plugin host', () => {
+  const pluginHost = 'C:\\Program Files\\OpenCode\\opencode.exe'
+  const bun = 'C:\\Program Files\\Bun\\bun.exe'
+  const command = daemonLaunchCommand(
+    (name) => (name === 'bun' ? bun : null),
+    'daemon-entry.js',
+    'launch-options'
+  )
+  expect(command).toEqual([bun, 'daemon-entry.js', 'launch-options'])
+  expect(command).not.toContain(pluginHost)
+  expect(() => resolveDaemonLauncher(() => null)).toThrow('Bun executable')
 })
 
 test('daemon storage protects private paths', async () => {
