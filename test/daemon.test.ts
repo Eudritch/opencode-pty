@@ -1168,9 +1168,11 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
       },
       context
     ).then((response) => response.json())
-    expect(capped).toMatchObject({
-      result: { stdout: 'x'.repeat(64), stderr: '', outputLimited: true },
-    })
+    expect(capped).toMatchObject({ result: { outputLimited: true } })
+    expect(
+      (capped as { result: { stdout: string; stderr: string } }).result.stdout +
+        (capped as { result: { stdout: string; stderr: string } }).result.stderr
+    ).toMatch(/^[xy]{64}$/)
 
     const failing = rpc(
       descriptor,
@@ -1296,6 +1298,21 @@ test('native startup failures clean up the direct child and report the proven ou
       exitReason: { cleanup: { directChildStarted: false } },
     })
 
+    if (process.platform === 'win32') {
+      const assignmentFailure = await rpc(
+        descriptor,
+        'exec',
+        {
+          command: process.execPath,
+          args: ['-e', 'setInterval(() => {}, 1000)'],
+          env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'job_assign' },
+          timeoutSeconds: 2,
+        },
+        context
+      ).then((response) => response.json())
+      expect(assignmentFailure).toMatchObject({ ok: false, error: { code: 'process' } })
+    }
+
     const readinessFailure = await rpc(
       descriptor,
       'exec',
@@ -1336,7 +1353,11 @@ test('native startup failures clean up the direct child and report the proven ou
         cleanup: { requested: true, terminationConfirmed: true, method: 'rollback' },
       },
     })
-    if (process.platform === 'linux' || process.platform === 'darwin') {
+    if (
+      process.platform === 'linux' ||
+      process.platform === 'darwin' ||
+      process.platform === 'win32'
+    ) {
       const containmentFailure = await rpc(
         descriptor,
         'exec',
@@ -1348,7 +1369,7 @@ test('native startup failures clean up the direct child and report the proven ou
         },
         context
       ).then((response) => response.json())
-      if (process.platform === 'linux')
+      if (process.platform === 'linux' || process.platform === 'win32')
         expect(containmentFailure).toMatchObject({
           error: {
             spawnFailure: {
@@ -1370,7 +1391,7 @@ test('native startup failures clean up the direct child and report the proven ou
           record.exitReason.message.includes('injected containment verification failure')
       )
       expect(containmentRecord).toMatchObject(
-        process.platform === 'linux'
+        process.platform === 'linux' || process.platform === 'win32'
           ? {
               status: 'spawn_failed',
               terminationRequested: true,
@@ -1479,7 +1500,7 @@ test('native worker identity and ready-output failures close the owned worker be
   }
 }, 10_000)
 
-test('native worker accepts a split readiness frame', async () => {
+test('native worker accepts a split readiness frame and immediate post-resume exit', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-split-ready-'))
   roots.push(root)
   const workerPath = join(
@@ -1515,6 +1536,65 @@ test('native worker accepts a split readiness frame', async () => {
     await server.stop()
     if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
     else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
+
+test('Windows native stop drains Job descendants', async () => {
+  if (process.platform !== 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-windows-job-'))
+  roots.push(root)
+  const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker.exe')
+  await stat(workerPath)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'native-windows-job', root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-windows-job')
+  const descendantMarker = join(root, 'job-descendant-started')
+  try {
+    const descriptor = await server.start()
+    const executing = rpc(
+      descriptor,
+      'exec',
+      {
+        command: process.execPath,
+        args: [
+          '-e',
+          `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(descendantMarker)}, 'started'); setInterval(() => {}, 1000)`)}], { stdio: 'ignore' }); setInterval(() => {}, 1000)`,
+        ],
+        timeoutSeconds: 5,
+      },
+      context
+    )
+    let id = ''
+    for (let attempt = 0; attempt < 50 && !id; attempt += 1) {
+      id = (await storage.loadSessions()).find((session) => session.mode === 'exec')?.id ?? ''
+      if (!id) await Bun.sleep(20)
+    }
+    expect(id).not.toBe('')
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (
+        await stat(descendantMarker).then(
+          () => true,
+          () => false
+        )
+      )
+        break
+      await Bun.sleep(20)
+    }
+    await stat(descendantMarker)
+    expect(
+      await rpc(descriptor, 'stop', { id }, context).then((response) => response.json())
+    ).toMatchObject({
+      result: { terminationConfirmed: true, containment: { status: 'windows_job_empty' } },
+    })
+    await expect(executing.then((response) => response.json())).resolves.toMatchObject({
+      result: { terminationConfirmed: true },
+    })
+  } finally {
+    await server.stop()
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
@@ -1721,17 +1801,17 @@ test('native PTY writes, resizes, rejects exec resize, and recovers after daemon
         response.json()
       )
     ).toMatchObject({ result: { cols: 100, rows: 30 } })
-    await rpc(descriptor, 'write', { id, data: 'hello\n' }, context)
+    await rpc(descriptor, 'write', { id, data: 'conpty-check\n' }, context)
     for (let attempt = 0; attempt < 50; attempt += 1) {
-      const output = await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
+      const output = (await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
         response.json()
-      )
-      if ((output as { result: { raw: string } }).result.raw.includes('echo:hello')) break
+      )) as { result?: { raw?: string } }
+      if (output.result?.raw?.includes('echo:conpty-check')) break
       await Bun.sleep(20)
     }
     expect(
       await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: { raw: expect.stringContaining('echo:hello') } })
+    ).toMatchObject({ result: { raw: expect.stringContaining('echo:conpty-check') } })
     await first.stop()
     restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-second')
     const restartedDescriptor = await restarted.start()
@@ -1740,7 +1820,9 @@ test('native PTY writes, resizes, rejects exec resize, and recovers after daemon
         (response) => response.json()
       )
     ).toMatchObject({ result: { cols: 90, rows: 25 } })
-    await rpc(restartedDescriptor, 'stop', { id }, context)
+    expect(
+      await rpc(restartedDescriptor, 'stop', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: {} })
   } finally {
     await restarted?.stop()
     await first.stop().catch(() => undefined)

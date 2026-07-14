@@ -21,14 +21,14 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::{
-    mem::size_of,
+    mem::{size_of, size_of_val},
     ptr::{null, null_mut},
 };
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-        WAIT_OBJECT_0,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::{ReadFile, WriteFile},
@@ -36,15 +36,16 @@ use windows_sys::Win32::{
         Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole},
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Pipes::CreatePipe,
         Threading::{
             CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
             PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
             TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
         },
@@ -54,6 +55,8 @@ use windows_sys::Win32::{
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const TERMINATION_HARD_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 #[cfg(unix)]
@@ -374,6 +377,7 @@ struct WindowsChild {
     stdout: Option<WinHandle>,
     stderr: Option<WinHandle>,
     pty: Option<WindowsPty>,
+    exit: Option<WindowsExit>,
 }
 
 #[cfg(windows)]
@@ -382,18 +386,28 @@ impl WindowsChild {
         self.pid
     }
     fn try_wait(&mut self) -> std::io::Result<Option<WindowsExit>> {
+        if let Some(exit) = self.exit {
+            return Ok(Some(exit));
+        }
         let mut code = 0;
         if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok((code != 259).then_some(WindowsExit(code as i32)))
+        let exit = (code != 259).then_some(WindowsExit(code as i32));
+        self.exit = exit;
+        Ok(exit)
     }
-    fn wait(&mut self) -> std::io::Result<WindowsExit> {
-        if unsafe { WaitForSingleObject(self.process.raw(), u32::MAX) } != WAIT_OBJECT_0 {
-            return Err(std::io::Error::last_os_error());
+    fn wait_for(&mut self, timeout: Duration) -> std::io::Result<Option<WindowsExit>> {
+        match unsafe {
+            WaitForSingleObject(
+                self.process.raw(),
+                timeout.as_millis().min(u32::MAX as u128) as u32,
+            )
+        } {
+            WAIT_OBJECT_0 => self.try_wait(),
+            WAIT_TIMEOUT => Ok(None),
+            _ => Err(std::io::Error::last_os_error()),
         }
-        self.try_wait()?
-            .ok_or_else(|| std::io::Error::other("process wait completed without exit code"))
     }
     fn terminate_job(&self) -> std::io::Result<()> {
         if unsafe { TerminateJobObject(self.job.raw(), 1) } == 0 {
@@ -405,6 +419,7 @@ impl WindowsChild {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy)]
 struct WindowsExit(i32);
 
 #[cfg(windows)]
@@ -449,20 +464,69 @@ fn quote_windows_arg(argument: &str) -> String {
 
 #[cfg(windows)]
 fn windows_environment(env: &BTreeMap<String, String>) -> Result<Vec<u16>, String> {
-    let mut block = Vec::new();
     for (key, value) in env {
+        // Windows ordinal ignore-case is not Rust Unicode uppercasing. Restrict names to the
+        // compatible ASCII subset; values remain fully Unicode.
         if key.is_empty()
+            || !key.is_ascii()
             || key.contains('=')
             || key.encode_utf16().any(|unit| unit == 0)
             || value.encode_utf16().any(|unit| unit == 0)
         {
-            return Err("invalid Unicode Windows environment entry".into());
+            return Err("invalid Windows environment entry".into());
         }
+    }
+    let mut entries = env.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| {
+        left.to_ascii_uppercase()
+            .cmp(&right.to_ascii_uppercase())
+            .then_with(|| left.cmp(right))
+    });
+    let mut block = Vec::new();
+    let mut previous: Option<&str> = None;
+    for (key, value) in entries {
+        if previous.is_some_and(|earlier| earlier.eq_ignore_ascii_case(key)) {
+            return Err(format!("duplicate Windows environment key: {key}"));
+        }
+        previous = Some(key);
         block.extend(format!("{key}={value}").encode_utf16());
         block.push(0);
     }
     block.push(0);
     Ok(block)
+}
+
+#[cfg(windows)]
+struct WindowsAttributeList {
+    _bytes: Vec<u8>,
+    list: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+#[cfg(windows)]
+impl WindowsAttributeList {
+    fn new(count: u32) -> Result<Self, String> {
+        let mut size = 0;
+        unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size) };
+        if size == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut bytes = vec![0; size];
+        let list = bytes.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) } == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(Self {
+            _bytes: bytes,
+            list,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsAttributeList {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.list) };
+    }
 }
 
 #[cfg(windows)]
@@ -492,23 +556,42 @@ fn pipe(inherit_read: bool) -> Result<(WinHandle, WinHandle), String> {
 
 #[cfg(windows)]
 fn windows_job_empty(job: HANDLE) -> Result<bool, String> {
-    let mut bytes =
-        vec![0_u8; size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() + 128 * size_of::<usize>()];
+    let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
     let mut returned = 0;
     let result = unsafe {
         QueryInformationJobObject(
             job,
-            JobObjectBasicProcessIdList,
-            bytes.as_mut_ptr().cast(),
-            bytes.len() as u32,
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
             &mut returned,
         )
     };
     if result == 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let list = unsafe { &*bytes.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-    Ok(list.NumberOfAssignedProcesses == 0)
+    Ok(accounting.ActiveProcesses == 0)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_job_drain(
+    child: &mut WindowsChild,
+    deadline: SystemTime,
+) -> Result<bool, String> {
+    loop {
+        let root_exited = child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        let empty = windows_job_empty(child.job.raw())?;
+        if root_exited && empty {
+            return Ok(true);
+        }
+        if SystemTime::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(windows)]
@@ -543,7 +626,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             .collect::<Vec<_>>()
             .join(" "),
     )?;
-    let (stdin, stdout, stderr, child_stdin, child_stdout, child_stderr, pty, attributes) =
+    let (stdin, stdout, stderr, child_stdin, child_stdout, child_stderr, pty) =
         if bootstrap.mode == "pty" {
             let (console_input, parent_input) = pipe(true)?;
             let (parent_output, console_output) = pipe(false)?;
@@ -577,7 +660,6 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
                     input: parent_input,
                     output: Some(parent_output),
                 }),
-                true,
             )
         } else {
             let (child_input, parent_input) = pipe(true)?;
@@ -591,39 +673,61 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
                 Some(child_output),
                 Some(child_error),
                 None,
-                false,
             )
         };
-    let mut list_bytes = Vec::new();
-    let mut list = null_mut();
+    let mut inheritable_handles = [
+        child_stdin.as_ref().map(WinHandle::raw),
+        child_stdout.as_ref().map(WinHandle::raw),
+        child_stderr.as_ref().map(WinHandle::raw),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let attribute_count = u32::from(pty.is_some()) + u32::from(!inheritable_handles.is_empty());
+    let attribute_list = if attribute_count == 0 {
+        None
+    } else {
+        Some(WindowsAttributeList::new(attribute_count)?)
+    };
+    let list = attribute_list
+        .as_ref()
+        .map(|attributes| attributes.list)
+        .unwrap_or(null_mut());
     let mut pseudo_console = pty.as_ref().map(|pty| pty.console).unwrap_or(0);
-    if attributes {
-        let mut size = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
-        }
-        list_bytes.resize(size, 0);
-        list = list_bytes.as_mut_ptr().cast();
-        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0
-            || unsafe {
-                UpdateProcThreadAttribute(
-                    list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                    (&mut pseudo_console as *mut HPCON).cast(),
-                    size_of::<HPCON>(),
-                    null_mut(),
-                    null(),
-                )
-            } == 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+    if pty.is_some()
+        && unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                (&mut pseudo_console as *mut HPCON).cast(),
+                size_of::<HPCON>(),
+                null_mut(),
+                null(),
+            )
+        } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if !inheritable_handles.is_empty()
+        && unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                inheritable_handles.as_mut_ptr().cast(),
+                size_of_val(inheritable_handles.as_slice()),
+                null_mut(),
+                null(),
+            )
+        } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
     }
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.lpAttributeList = list;
-    if !attributes {
+    if pty.is_none() {
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         startup.StartupInfo.hStdInput = child_stdin.as_ref().expect("exec stdin").raw();
         startup.StartupInfo.hStdOutput = child_stdout.as_ref().expect("exec stdout").raw();
@@ -632,7 +736,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = CREATE_SUSPENDED
         | CREATE_UNICODE_ENVIRONMENT
-        | if attributes {
+        | if attribute_list.is_some() {
             EXTENDED_STARTUPINFO_PRESENT
         } else {
             0
@@ -643,7 +747,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             command_line.as_mut_ptr(),
             null(),
             null(),
-            if attributes { 0 } else { 1 },
+            if inheritable_handles.is_empty() { 0 } else { 1 },
             flags,
             environment.as_ptr().cast(),
             cwd.as_ptr(),
@@ -651,11 +755,6 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             &mut process,
         )
     };
-    if !list.is_null() {
-        unsafe {
-            DeleteProcThreadAttributeList(list);
-        }
-    }
     drop(child_stdin);
     drop(child_stdout);
     drop(child_stderr);
@@ -669,13 +768,23 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     {
         // The child is still suspended and not in the Job. Kill and reap this owned handle.
         let _ = unsafe { TerminateProcess(process_handle.raw(), 1) };
-        let _ = unsafe { WaitForSingleObject(process_handle.raw(), u32::MAX) };
+        let _ = unsafe { WaitForSingleObject(process_handle.raw(), 1_000) };
         return Err("failed to assign suspended child to Job Object".into());
     }
     if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
-        let _ = unsafe { TerminateJobObject(job.raw(), 1) };
-        let _ = unsafe { WaitForSingleObject(process_handle.raw(), u32::MAX) };
-        return Err(std::io::Error::last_os_error().to_string());
+        let resume_error = std::io::Error::last_os_error().to_string();
+        let mut child = WindowsChild {
+            process: process_handle,
+            pid: process.dwProcessId,
+            job,
+            stdin,
+            stdout,
+            stderr,
+            pty,
+            exit: None,
+        };
+        let cleanup = cleanup_unverified_windows_spawn(&mut child);
+        return Err(format!("{resume_error}; {}", cleanup.message));
     }
     Ok(WindowsChild {
         process: process_handle,
@@ -685,7 +794,32 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         stdout,
         stderr,
         pty,
+        exit: None,
     })
+}
+
+#[cfg(windows)]
+struct WindowsSpawnCleanup {
+    confirmed: bool,
+    message: String,
+}
+
+#[cfg(windows)]
+fn cleanup_unverified_windows_spawn(child: &mut WindowsChild) -> WindowsSpawnCleanup {
+    let termination = child.terminate_job();
+    let drained = wait_for_windows_job_drain(child, SystemTime::now() + TERMINATION_HARD_TIMEOUT);
+    WindowsSpawnCleanup {
+        confirmed: termination.is_ok() && drained == Ok(true),
+        message: if termination.is_ok() && drained == Ok(true) {
+            "unverified Windows spawn Job was terminated".into()
+        } else {
+            format!(
+                "unverified Windows spawn cleanup is unknown: terminate={:?}; job={:?}",
+                termination.as_ref().err(),
+                drained
+            )
+        },
+    }
 }
 
 #[cfg(unix)]
@@ -1401,11 +1535,21 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
     #[cfg(windows)]
     {
         let mut child = worker.child.lock().expect("child lock");
-        let sent = child.terminate_job().is_ok();
-        let _ = child.wait();
+        let termination = child.terminate_job();
+        let drained =
+            wait_for_windows_job_drain(&mut child, SystemTime::now() + TERMINATION_HARD_TIMEOUT);
         drop(child);
         observe_exit(worker);
-        let report = refresh_termination_confirmed(worker);
+        let mut report = refresh_termination_confirmed(worker);
+        let sent = termination.is_ok();
+        match drained {
+            Ok(true) => {}
+            Ok(false) => report.status = "windows_job_processes_remaining".into(),
+            Err(_) => report.status = "windows_job_unknown".into(),
+        }
+        let mut state = worker.state.lock().expect("state lock");
+        state.termination_confirmed = state.root_exited && report.status == "windows_job_empty";
+        drop(state);
         let root_exited = worker.state.lock().expect("state lock").root_exited;
         worker.state.lock().expect("state lock").termination = Some(TerminationResult {
             requested: true,
@@ -1495,6 +1639,18 @@ fn observe_exit(worker: &Arc<Worker>) {
 
 fn terminate_and_wait(worker: &Arc<Worker>, reason: &str) {
     mark_termination(worker, reason);
+    #[cfg(windows)]
+    {
+        let exit = worker
+            .child
+            .lock()
+            .expect("child lock")
+            .wait_for(TERMINATION_HARD_TIMEOUT);
+        if let Ok(Some(exit)) = exit {
+            record_exit(worker, exit);
+        }
+    }
+    #[cfg(not(windows))]
     if !worker.state.lock().expect("state lock").root_exited {
         let exit = worker.child.lock().expect("child lock").wait();
         if let Ok(exit) = exit {
@@ -1718,9 +1874,13 @@ fn verify_containment(pid: u32) -> Result<Containment, String> {
 }
 
 #[cfg(windows)]
-fn verify_containment(child: &WindowsChild) -> Result<Containment, String> {
+fn verify_containment(child: &mut WindowsChild) -> Result<Containment, String> {
     if windows_job_empty(child.job.raw())? {
-        return Err("assigned child is missing from its Job Object".into());
+        // A fast child can legitimately leave its assigned Job before this first query.
+        child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .ok_or("assigned child is missing from its Job Object")?;
     }
     Ok(Containment {
         root_pid: child.id(),
@@ -2101,7 +2261,8 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         .collect::<Vec<_>>()
         .join("; ");
     let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
-    let containment_unavailable = containment.status == "posix_containment_unknown";
+    let containment_unavailable = containment.status == "posix_containment_unknown"
+        || containment.status == "windows_job_unknown";
     let macos_direct_exit = cfg!(all(unix, not(target_os = "linux"))) && state.root_exited;
     let status = if (terminal || (state.root_exited && containment_unavailable))
         && (state.storage_failure.is_some()
@@ -2187,6 +2348,32 @@ mod tests {
         assert_eq!(
             redact_stream(String::new(), &mut tail, &["tail-secret".into()], true),
             "[REDACTED]"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_environment_rejects_non_ascii_or_duplicate_keys_and_preserves_unicode_values() {
+        let duplicate =
+            BTreeMap::from([("PATH".into(), "one".into()), ("Path".into(), "two".into())]);
+        assert!(windows_environment(&duplicate).is_err());
+        assert!(
+            windows_environment(&BTreeMap::from([("\u{96ea}".into(), "value".into())])).is_err()
+        );
+        let environment = windows_environment(&BTreeMap::from([
+            ("Zebra".into(), "value".into()),
+            ("alpha".into(), "snowman \u{2603}".into()),
+        ]))
+        .expect("build Unicode environment");
+        let entries =
+            String::from_utf16(&environment[..environment.len() - 1]).expect("decode environment");
+        assert_eq!(entries, "alpha=snowman \u{2603}\0Zebra=value\0");
+        assert_eq!(quote_windows_arg("\u{96ea} space"), "\"\u{96ea} space\"");
+        assert_eq!(
+            wide("C:\\tmp\\\u{96ea}")
+                .expect("encode Unicode cwd")
+                .last(),
+            Some(&0)
         );
     }
 
@@ -2448,6 +2635,13 @@ mod tests {
     }
 }
 
+#[cfg(windows)]
+fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
+    // terminate_contained already performed the bounded Job drain poll.
+    snapshot(worker)
+}
+
+#[cfg(not(windows))]
 fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
     loop {
         let result = snapshot(worker);
@@ -2458,7 +2652,6 @@ fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
     }
 }
 
-#[allow(clippy::needless_return)]
 fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerError> {
     let operation = request
         .get("operation")
@@ -2619,7 +2812,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                             message: format!("ResizePseudoConsole failed: 0x{result:08x}"),
                         });
                     }
-                    return Ok((json!({"cols": cols, "rows": rows}), false));
+                    Ok((json!({"cols": cols, "rows": rows}), false))
                 }
                 #[cfg(not(windows))]
                 Err(WorkerError {
@@ -2893,7 +3086,7 @@ fn main() -> Result<(), String> {
     } else {
         #[cfg(windows)]
         {
-            verify_containment(&child)
+            verify_containment(&mut child)
         }
         #[cfg(not(windows))]
         {
@@ -2908,8 +3101,16 @@ fn main() -> Result<(), String> {
             let cleanup = cleanup_unverified_spawn(&mut child);
             #[cfg(windows)]
             {
-                let _ = child.terminate_job();
-                let _ = child.wait();
+                let cleanup = cleanup_unverified_windows_spawn(&mut child);
+                write_spawn_failure(
+                    &session_directory,
+                    &bootstrap,
+                    &descriptor,
+                    true,
+                    Some(child_pid),
+                    cleanup.confirmed,
+                    &format!("{error}; {}", cleanup.message),
+                )?;
             }
             #[cfg(unix)]
             write_spawn_failure(
@@ -2920,16 +3121,6 @@ fn main() -> Result<(), String> {
                 Some(cleanup.direct_child_pid),
                 cleanup.confirmed,
                 &cleanup.message,
-            )?;
-            #[cfg(windows)]
-            write_spawn_failure(
-                &session_directory,
-                &bootstrap,
-                &descriptor,
-                true,
-                Some(child_pid),
-                true,
-                &error,
             )?;
             let _ = remove_file(&descriptor_path);
             #[cfg(unix)]

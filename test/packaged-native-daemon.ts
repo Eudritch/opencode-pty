@@ -313,7 +313,7 @@ try {
       'spawn',
       {
         command: process.execPath,
-        args: ['-e', "process.stdin.on('data', data => process.stdout.write(data))"],
+        args: ['-e', "process.stdin.on('data', data => process.stdout.write('echo:' + data))"],
       },
       owner
     )
@@ -325,6 +325,14 @@ try {
     const resized = await rpc(started.descriptor, 'resize', { id, cols: 100, rows: 30 }, owner)
     if (!resized.ok)
       throw new Error(`Windows packaged ConPTY did not resize: ${JSON.stringify(resized)}`)
+    let output = ''
+    for (let attempt = 0; attempt < 100 && !output.includes('echo:conpty-check'); attempt += 1) {
+      const read = await rpc(started.descriptor, 'rawOutput', { id }, owner)
+      output = (read.result as { raw?: string } | undefined)?.raw ?? ''
+      if (!output.includes('echo:conpty-check')) await Bun.sleep(25)
+    }
+    if (!output.includes('echo:conpty-check'))
+      throw new Error(`Windows packaged ConPTY did not echo input: ${JSON.stringify(output)}`)
     await rpc(started.descriptor, 'stop', { id }, owner)
   }
   executeAbort = new AbortController()
