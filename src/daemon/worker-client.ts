@@ -101,7 +101,17 @@ function workerCommand(): string[] {
           `${workerPackage}/bin/opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
         ),
       ]
-    } catch {}
+    } catch {
+      try {
+        // ponytail: source-loaded plugins resolve from OpenCode, so use the project dependency tree.
+        const require = createRequire(join(process.cwd(), 'package.json'))
+        return [
+          require.resolve(
+            `${workerPackage}/bin/opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+          ),
+        ]
+      } catch {}
+    }
   }
   throw new Error(
     `native_worker_unavailable: install the matching optional worker package for ${process.platform}-${process.arch}, or set PTY_NATIVE_WORKER_PATH.`
