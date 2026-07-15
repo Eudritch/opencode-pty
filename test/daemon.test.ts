@@ -2755,6 +2755,82 @@ test('native get and list snapshots cannot overwrite monitor finalization', asyn
   expect(await supervisor.cleanup(session.id)).toBeTrue()
 })
 
+test('cleanup waits for a native terminal write before deleting its session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-cleanup-race-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_native_cleanup_race')
+  await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitedAt: new Date().toISOString(),
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  let terminalWriteStarted!: () => void
+  let releaseTerminalWrite!: () => void
+  const started = new Promise<void>((resolve) => {
+    terminalWriteStarted = resolve
+  })
+  const release = new Promise<void>((resolve) => {
+    releaseTerminalWrite = resolve
+  })
+  const writeSession = storage.writeSession.bind(storage)
+  const deleteSession = storage.deleteSession.bind(storage)
+  let deletionStarted!: () => void
+  const deletion = new Promise<void>((resolve) => {
+    deletionStarted = resolve
+  })
+  storage.writeSession = async (entry) => {
+    if (entry.id === session.id && entry.status === 'exited') {
+      terminalWriteStarted()
+      await release
+    }
+    await writeSession(entry)
+  }
+  storage.deleteSession = async (id) => {
+    deletionStarted()
+    await deleteSession(id)
+  }
+  const worker = {
+    finalSnapshot: async () => terminal,
+    shutdown: async () => terminal,
+  }
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(
+    session.id,
+    worker
+  )
+
+  const finalization = (
+    supervisor as unknown as {
+      finalizeNative: (
+        record: SessionRecord,
+        worker: unknown,
+        result: WorkerSnapshot
+      ) => Promise<unknown>
+    }
+  ).finalizeNative(session, worker, terminal)
+  await started
+  const cleanup = supervisor.cleanup(session.id)
+  expect(
+    await Promise.race([deletion.then(() => true), Bun.sleep(25).then(() => false)])
+  ).toBeFalse()
+  releaseTerminalWrite()
+
+  expect(await cleanup).toBeTrue()
+  await finalization
+  expect(existsSync(join(root, 'sessions', session.id))).toBeFalse()
+  expect(await storage.loadSessions()).toEqual([])
+})
+
 test('native finalization persists a lost storage failure', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-finalize-failure-'))
   roots.push(root)

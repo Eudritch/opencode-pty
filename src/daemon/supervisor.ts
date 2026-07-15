@@ -870,7 +870,8 @@ export class SessionSupervisor {
     }
     record.updatedAt = new Date().toISOString()
     await this.enqueueNativePersist(record.id, async () => {
-      if (version !== this.nativeVersion(record.id)) return
+      if (this.records.get(record.id) !== record || version !== this.nativeVersion(record.id))
+        return
       await this.storage.writeSession(record)
       this.bumpNativeVersion(record.id)
     })
@@ -934,7 +935,8 @@ export class SessionSupervisor {
     terminal = false
   ): Promise<ExecResult | PTYSessionInfo> {
     return this.enqueueNativePersist(record.id, async () => {
-      if (version !== this.nativeVersion(record.id)) return this.toInfo(record)
+      if (this.records.get(record.id) !== record || version !== this.nativeVersion(record.id))
+        return this.toInfo(record)
       try {
         return await this.finishNativeVersion(record, result)
       } finally {
@@ -1223,12 +1225,9 @@ export class SessionSupervisor {
     await this.flush()
     const record = this.records.get(id)
     if (!record) return false
+    await this.nativeFinalizations.get(id)
     if (record.status === 'lost') {
-      this.nativeWorkers.delete(id)
-      await this.storage.removeWorkerDescriptor(id)
-      await this.storage.deleteSession(id)
-      this.records.delete(id)
-      return true
+      return this.deleteNativeSession(record)
     }
     if (!this.isTerminal(record)) return false
     const worker = this.nativeWorkers.get(id)
@@ -1251,11 +1250,7 @@ export class SessionSupervisor {
         if (!terminalDirectChild(record)) return false
       }
     }
-    this.nativeWorkers.delete(id)
-    await this.storage.removeWorkerDescriptor(id)
-    await this.storage.deleteSession(id)
-    this.records.delete(id)
-    return true
+    return this.deleteNativeSession(record)
   }
 
   async cleanupByParentSession(
@@ -1360,6 +1355,18 @@ export class SessionSupervisor {
       if (this.nativePersists.get(id) === settled) this.nativePersists.delete(id)
     })
     return result
+  }
+
+  private deleteNativeSession(record: SessionRecord): Promise<boolean> {
+    return this.enqueueNativePersist(record.id, async () => {
+      if (this.records.get(record.id) !== record) return false
+      this.bumpNativeVersion(record.id)
+      this.nativeWorkers.delete(record.id)
+      await this.storage.removeWorkerDescriptor(record.id)
+      await this.storage.deleteSession(record.id)
+      this.records.delete(record.id)
+      return true
+    })
   }
 
   private idempotentSession(options: SpawnOptions, args: string[]): SessionRecord | undefined {
