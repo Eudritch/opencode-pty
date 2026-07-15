@@ -597,6 +597,7 @@ export interface WorkerSnapshot {
   mode: 'exec' | 'pty'
   stdout: string
   stderr: string
+  journalOutput: string
   stdoutBytes: number
   stderrBytes: number
   stdoutTruncated: boolean

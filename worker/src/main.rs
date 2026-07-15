@@ -238,7 +238,7 @@ struct State {
     output_truncated: bool,
     retained_bytes: usize,
     chunks: Vec<JournalChunk>,
-    exit_code: Option<i32>,
+    exit_code: Option<u32>,
     exit_signal: Option<String>,
     exit_reason: Option<String>,
     started_at: String,
@@ -460,7 +460,7 @@ impl WindowsChild {
         if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let exit = (code != 259).then_some(WindowsExit(code as i32));
+        let exit = (code != 259).then_some(WindowsExit(code));
         self.exit = exit;
         Ok(exit)
     }
@@ -487,11 +487,11 @@ impl WindowsChild {
 
 #[cfg(windows)]
 #[derive(Clone, Copy)]
-struct WindowsExit(i32);
+struct WindowsExit(u32);
 
 #[cfg(windows)]
 impl WindowsExit {
-    fn code(&self) -> Option<i32> {
+    fn code(&self) -> Option<u32> {
         Some(self.0)
     }
 }
@@ -1678,7 +1678,7 @@ fn record_exit(worker: &Arc<Worker>, exit: ExitStatus) {
     if state.root_exited {
         return;
     }
-    state.exit_code = exit.code();
+    state.exit_code = exit.code().and_then(|code| u32::try_from(code).ok());
     state.exit_signal = exit_signal(&exit);
     if state.exit_reason.is_none() {
         state.exit_reason = if let Some(signal) = &state.exit_signal {
@@ -2366,6 +2366,7 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
     };
     json!({
         "status": status, "pid": pid, "mode": worker.mode, "stdout": state.stdout, "stderr": state.stderr,
+        "journalOutput": state.chunks.iter().map(|chunk| chunk.data.as_str()).collect::<String>(),
         "stdoutBytes": state.stdout_bytes, "stderrBytes": state.stderr_bytes,
         "stdoutTruncated": state.stdout_truncated, "stderrTruncated": state.stderr_truncated,
         "nextSequence": state.next_sequence, "firstRetainedSequence": state.first_retained_sequence,
@@ -2439,6 +2440,12 @@ mod tests {
             redact_stream(String::new(), &mut tail, &["tail-secret".into()], true),
             "[REDACTED]"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exit_status_preserves_high_ntstatus() {
+        assert_eq!(WindowsExit(0xc000_0005u32).code(), Some(0xc000_0005u32));
     }
 
     #[cfg(windows)]

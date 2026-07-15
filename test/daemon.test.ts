@@ -130,6 +130,45 @@ async function owner(storage: DaemonStorage, parentSessionId: string, projectDir
   }
 }
 
+function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
+  return {
+    status: 'running',
+    pid: 1,
+    mode: 'pty',
+    stdout: '',
+    stderr: '',
+    journalOutput: '',
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    nextSequence: 0,
+    firstRetainedSequence: 0,
+    outputTruncated: false,
+    startedAt: new Date().toISOString(),
+    timedOut: false,
+    terminationRequested: false,
+    terminationConfirmed: false,
+    directChildExited: false,
+    stdoutEof: false,
+    stderrEof: false,
+    outputComplete: false,
+    outputIncomplete: false,
+    containment: {
+      platform: 'not_applicable',
+      status: 'not_applicable',
+      rootPid: 1,
+      rootStartIdentity: 'start',
+      rootIdentityVerified: true,
+      observedGroupPids: [],
+      observedSessionPids: [],
+      observedEscapedDescendantPids: [],
+      verifiedAt: new Date().toISOString(),
+    },
+    ...overrides,
+  }
+}
+
 async function rpc(
   descriptor: { endpoint: string; token: string },
   operation: string,
@@ -2580,6 +2619,115 @@ test('lost sessions can only be discarded by explicit cleanup', async () => {
   expect(await storage.loadSessions()).toHaveLength(0)
 })
 
+test('native finalization resnapshots after journal output arrives', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-finalize-race-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_native_finalization_race')
+  await storage.writeSession(session)
+  const settled = workerSnapshot({
+    stdout: 'late\n',
+    journalOutput: 'late\n',
+    stdoutBytes: 5,
+    nextSequence: 5,
+  })
+  const worker = {
+    snapshot: async () => {
+      await storage.appendOutput(session.id, [
+        { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'late\n' },
+      ])
+      return settled
+    },
+  }
+
+  await (
+    supervisor as unknown as {
+      finishNative: (
+        record: SessionRecord,
+        worker: unknown,
+        result: WorkerSnapshot
+      ) => Promise<unknown>
+    }
+  ).finishNative(session, worker, workerSnapshot())
+
+  expect(session).toMatchObject({ nextSequence: 5, outputBytes: 5, lineCount: 1 })
+  expect(await storage.loadSessions()).toMatchObject([
+    { id: session.id, nextSequence: 5, outputBytes: 5, status: 'running' },
+  ])
+})
+
+test('native finalization persists a lost storage failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-finalize-failure-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_native_finalization_failure')
+  await storage.writeSession(session)
+  await expect(
+    (
+      supervisor as unknown as {
+        finishNative: (
+          record: SessionRecord,
+          worker: unknown,
+          result: WorkerSnapshot
+        ) => Promise<unknown>
+      }
+    ).finishNative(
+      session,
+      { snapshot: async () => workerSnapshot({ exitCode: -1 }) },
+      workerSnapshot({ exitCode: -1 })
+    )
+  ).rejects.toMatchObject({ code: 'ESTORAGE' })
+  expect(await storage.loadSessions()).toMatchObject([
+    {
+      id: session.id,
+      status: 'lost',
+      exitReason: { kind: 'unknown', message: expect.stringContaining('invalid PTY session') },
+    },
+  ])
+})
+
+test('Windows native high exit status persists as an unsigned code', async () => {
+  if (process.platform !== 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-exit-code-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_windows_high_exit')
+  await storage.writeSession(session)
+  const exited = workerSnapshot({
+    status: 'exited',
+    exitCode: 0xc0000005,
+    exitReason: 'code',
+    exitedAt: new Date().toISOString(),
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+
+  await (
+    supervisor as unknown as {
+      finishNative: (
+        record: SessionRecord,
+        worker: unknown,
+        result: WorkerSnapshot
+      ) => Promise<unknown>
+    }
+  ).finishNative(session, { snapshot: async () => exited }, exited)
+
+  expect(await storage.loadSessions()).toMatchObject([
+    {
+      id: session.id,
+      status: 'exited',
+      exitCode: 0xc0000005,
+      exitReason: { kind: 'code', code: 0xc0000005 },
+    },
+  ])
+})
+
 test('stale worker recovery is bounded and parallel', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-parallel-recovery-'))
   roots.push(root)
@@ -2645,6 +2793,7 @@ test('restart cleanup stops a reconnected conversation worker published before r
     mode: 'pty',
     stdout: '',
     stderr: '',
+    journalOutput: '',
     stdoutBytes: 0,
     stderrBytes: 0,
     stdoutTruncated: false,
