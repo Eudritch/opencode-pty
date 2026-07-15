@@ -23,7 +23,9 @@ export const ptyKill = tool({
     const cleanup = args.cleanup ?? false
     const stop = await manager.stop(args.id, owner)
     const cleaned =
-      cleanup && stop.terminationConfirmed ? await manager.cleanup(args.id, owner) : false
+      cleanup && (stop.terminationConfirmed || session.status === 'lost')
+        ? await manager.cleanup(args.id, owner)
+        : false
     const action = stop.terminationConfirmed
       ? 'Termination confirmed'
       : stop.requested
@@ -32,7 +34,7 @@ export const ptyKill = tool({
     const cleanupNote = cleaned
       ? ' (exited session removed)'
       : cleanup
-        ? ' (record retained until termination is confirmed)'
+        ? ' (record retained until termination is confirmed, unless it is explicitly lost)'
         : ' (session retained for log access)'
 
     return [

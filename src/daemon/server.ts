@@ -7,7 +7,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from './types.ts'
-import { requiredProcessStartIdentity, type DaemonStorage } from './storage.ts'
+import type { DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
 import { effectiveMaxOutputBytes } from './supervisor.ts'
 import { realpathSync } from 'node:fs'
@@ -51,9 +51,9 @@ export class DaemonServer implements Disposable {
       throw new Error('PTY daemon start lock was lost.')
     }
     try {
-      await this.supervisor.initialize()
+      await this.supervisor.initialize(false)
       this.ownershipSecret = await this.storage.ownershipSecret()
-      this.processIdentity = await requiredProcessStartIdentity(process.pid, deadline)
+      this.processIdentity = await this.storage.requiredCurrentProcessStartIdentity(deadline)
       this.token ||= crypto.randomUUID().replaceAll('-', '')
       if (await this.storage.descriptorOwnerAlive(deadline)) {
         throw new Error('PTY daemon is already running.')
@@ -72,6 +72,9 @@ export class DaemonServer implements Disposable {
       }
       await this.storage.writeDescriptor(descriptor)
       await this.storage.releaseStartLock(startLockToken, deadline)
+      void this.supervisor
+        .reconcileWorkers()
+        .catch((error) => console.warn(`PTY daemon session recovery failed: ${String(error)}`))
       return descriptor
     } catch (error) {
       this.server?.stop(true)

@@ -18,6 +18,9 @@ const START_LOCK_FILE = 'daemon-start.lock'
 const START_LOCK_RECOVERY_FILE = 'daemon-start-recovery.lock'
 const QUARANTINE_DIRECTORY = 'quarantine'
 const OUTPUT_SEGMENT_BYTES = 64 * 1024
+const WINDOWS_PROBE_TIMEOUT_MS = 5000
+const WINDOWS_RENAME_RETRIES = 3
+const WINDOWS_RENAME_RETRY_MS = 10
 
 class InvalidSessionError extends Error {}
 class InvalidJournalError extends InvalidSessionError {}
@@ -93,16 +96,44 @@ export async function processIdentityProbe(
   try {
     const child = Bun.spawn({ cmd: command, stdout: 'pipe', stderr: 'ignore' })
     const output = new Response(child.stdout).text()
-    const completed = await Promise.race([
-      child.exited.then(async (exitCode) => (exitCode === 0 ? output : null)),
-      Bun.sleep(Math.max(0, deadline - Date.now())).then(() => null),
-    ])
-    if (completed !== null) return completed
-    child.kill(9)
-    void child.exited
-    return null
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const completed = await Promise.race([
+        child.exited.then((exitCode) => ({ exitCode })),
+        new Promise<{ timedOut: true }>((resolve) => {
+          timeout = setTimeout(resolve, Math.max(0, deadline - Date.now()), { timedOut: true })
+        }),
+      ])
+      if ('timedOut' in completed) {
+        child.kill(9)
+        await child.exited.catch(() => undefined)
+        return null
+      }
+      return completed.exitCode === 0 ? await output : null
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
   } catch {
     return null
+  }
+}
+
+export async function renameWithWindowsRetry(
+  source: string,
+  destination: string,
+  renameFile: typeof rename = rename,
+  windows = process.platform === 'win32'
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await renameFile(source, destination)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (!windows || !['EPERM', 'EBUSY'].includes(code ?? '') || attempt >= WINDOWS_RENAME_RETRIES)
+        throw error
+      await Bun.sleep(WINDOWS_RENAME_RETRY_MS)
+    }
   }
 }
 
@@ -163,12 +194,18 @@ export function daemonDataDirectory(): string {
 }
 
 export class DaemonStorage {
+  private static readonly initializingRoots = new Map<string, Promise<void>>()
+  private static readonly currentProcessIdentities = new Map<
+    string,
+    { pid: number; identity: string }
+  >()
   private readonly outputTails = new Map<string, OutputChunk>()
   private readonly writes = new Map<string, Promise<void>>()
   private windowsUserSid: Promise<string> | undefined
   private windowsRootProtected = false
+  private currentProcessIdentity: string | undefined
 
-  constructor(private readonly root: string = daemonDataDirectory()) {}
+  constructor(private readonly root: string = resolve(daemonDataDirectory())) {}
 
   get rootDirectory(): string {
     return this.root
@@ -207,21 +244,60 @@ export class DaemonStorage {
   }
 
   async initialize(): Promise<void> {
+    if (this.windowsRootProtected) return
+    let initializing = DaemonStorage.initializingRoots.get(this.root)
+    if (!initializing) {
+      initializing = this.initializeRoot()
+      DaemonStorage.initializingRoots.set(this.root, initializing)
+    }
+    try {
+      await initializing
+      this.windowsRootProtected = true
+    } catch (error) {
+      if (DaemonStorage.initializingRoots.get(this.root) === initializing)
+        DaemonStorage.initializingRoots.delete(this.root)
+      throw error
+    }
+  }
+
+  private async initializeRoot(): Promise<void> {
     if (process.platform === 'win32') {
       await mkdir(this.root, { recursive: true, mode: 0o700 })
-      if (!this.windowsRootProtected) {
-        await this.protectWindowsPath(this.root, true)
-        this.windowsRootProtected = true
-      }
+      await this.protectWindowsPath(this.root, true)
       await Promise.all([
         mkdir(join(this.root, SESSIONS_DIRECTORY), { recursive: true, mode: 0o700 }),
         mkdir(join(this.root, QUARANTINE_DIRECTORY), { recursive: true, mode: 0o700 }),
       ])
       return
     }
-    await this.privateDirectory(this.root)
-    await this.privateDirectory(join(this.root, SESSIONS_DIRECTORY))
-    await this.privateDirectory(join(this.root, QUARANTINE_DIRECTORY))
+    for (const path of [
+      this.root,
+      join(this.root, SESSIONS_DIRECTORY),
+      join(this.root, QUARANTINE_DIRECTORY),
+    ]) {
+      await mkdir(path, { recursive: true, mode: 0o700 })
+      await chmod(path, 0o700)
+    }
+  }
+
+  async requiredCurrentProcessStartIdentity(deadline?: number): Promise<string> {
+    const cached =
+      this.currentProcessIdentity ??
+      (DaemonStorage.currentProcessIdentities.get(this.root)?.pid === process.pid
+        ? DaemonStorage.currentProcessIdentities.get(this.root)?.identity
+        : undefined)
+    if (cached) return cached
+    const identity = await processStartIdentity(process.pid, deadline)
+    if (identity) {
+      this.currentProcessIdentity = identity
+      DaemonStorage.currentProcessIdentities.set(this.root, { pid: process.pid, identity })
+      return identity
+    }
+    const probe =
+      process.platform === 'win32'
+        ? 'Windows process creation-time probe'
+        : 'process start-time probe'
+    throw new Error(`Unable to verify daemon process identity: ${probe} failed.`)
   }
 
   async readDescriptor(): Promise<DaemonDescriptor | null> {
@@ -310,7 +386,7 @@ export class DaemonStorage {
   }
 
   private async newStartLock(deadline?: number): Promise<StartLock & { handoffToken: string }> {
-    const processIdentity = await requiredProcessStartIdentity(process.pid, deadline)
+    const processIdentity = await this.requiredCurrentProcessStartIdentity(deadline)
     return {
       token: crypto.randomUUID(),
       handoffToken: crypto.randomUUID(),
@@ -324,7 +400,9 @@ export class DaemonStorage {
     try {
       const lock = await this.readStartLock()
       if (!lock || lock.handoffToken !== handoffToken) return null
-      const processIdentity = await processStartIdentity(process.pid, deadline)
+      const processIdentity = await this.requiredCurrentProcessStartIdentity(deadline).catch(
+        () => null
+      )
       if (!processIdentity) return null
       const token = crypto.randomUUID()
       await this.writeStartLock({
@@ -341,7 +419,9 @@ export class DaemonStorage {
 
   async releaseStartLock(token: string, deadline?: number): Promise<void> {
     const lock = await this.readStartLock()
-    const processIdentity = await processStartIdentity(process.pid, deadline)
+    const processIdentity = await this.requiredCurrentProcessStartIdentity(deadline).catch(
+      () => null
+    )
     if (
       lock?.token === token &&
       lock.pid === process.pid &&
@@ -382,7 +462,7 @@ export class DaemonStorage {
       token: crypto.randomUUID(),
       handoffToken: null,
       pid: process.pid,
-      processIdentity: await requiredProcessStartIdentity(process.pid, deadline),
+      processIdentity: await this.requiredCurrentProcessStartIdentity(deadline),
     }
     if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
       return true
@@ -1021,16 +1101,20 @@ export class DaemonStorage {
 
   private async writeAtomicNow(path: string, contents: string): Promise<void> {
     const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`
-    const handle = await open(temporaryPath, 'w', 0o600)
     try {
-      await handle.writeFile(contents, 'utf8')
-      await handle.sync()
+      const handle = await open(temporaryPath, 'w', 0o600)
+      try {
+        await handle.writeFile(contents, 'utf8')
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      await renameWithWindowsRetry(temporaryPath, path)
+      await this.privateFile(path)
+      await this.syncDirectory(dirname(path))
     } finally {
-      await handle.close()
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
     }
-    await rename(temporaryPath, path)
-    await this.privateFile(path)
-    await this.syncDirectory(dirname(path))
   }
 
   private async syncDirectory(path: string): Promise<void> {
@@ -1072,9 +1156,15 @@ export class DaemonStorage {
 
   private async protectWindowsPath(path: string, recursive: boolean): Promise<void> {
     const sid = await this.currentWindowsUserSid()
+    const command = windowsProcessIdentityCommand(process.pid)
+    if (!command)
+      throw new Error('Unable to locate Windows PowerShell for daemon storage protection.')
+    const [powershell] = command
+    if (!powershell)
+      throw new Error('Unable to locate Windows PowerShell for daemon storage protection.')
     const child = Bun.spawn({
       cmd: [
-        'powershell.exe',
+        powershell,
         '-NoProfile',
         '-NonInteractive',
         '-Command',
@@ -1129,10 +1219,15 @@ foreach ($item in $items) { Test-PrivateDacl $item }`,
         PTY_DAEMON_ACL_USER_SID: sid,
       },
     })
-    const exitCode = await child.exited
+    const exitCode = await this.waitForWindowsPowerShell(
+      child,
+      Date.now() + WINDOWS_PROBE_TIMEOUT_MS
+    )
     if (exitCode === 0) return
     const error =
-      `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`.trim()
+      exitCode === null
+        ? 'Windows PowerShell DACL probe timed out.'
+        : `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`.trim()
     throw new Error(
       `Unable to protect daemon storage with a Windows DACL${error ? `: ${error}` : '.'}`
     )
@@ -1140,9 +1235,15 @@ foreach ($item in $items) { Test-PrivateDacl $item }`,
 
   private async currentWindowsUserSid(): Promise<string> {
     this.windowsUserSid ??= (async () => {
+      const command = windowsProcessIdentityCommand(globalThis.process.pid)
+      if (!command)
+        throw new Error('Unable to locate Windows PowerShell for daemon storage protection.')
+      const [powershell] = command
+      if (!powershell)
+        throw new Error('Unable to locate Windows PowerShell for daemon storage protection.')
       const process = Bun.spawn({
         cmd: [
-          'powershell.exe',
+          powershell,
           '-NoProfile',
           '-NonInteractive',
           '-Command',
@@ -1151,19 +1252,46 @@ foreach ($item in $items) { Test-PrivateDacl $item }`,
         stdout: 'pipe',
         stderr: 'ignore',
       })
-      const sid = (await new Response(process.stdout).text()).trim()
-      if ((await process.exited) !== 0 || !/^S-\d+(?:-\d+)+$/.test(sid)) {
+      const output = new Response(process.stdout).text()
+      if (
+        (await this.waitForWindowsPowerShell(process, Date.now() + WINDOWS_PROBE_TIMEOUT_MS)) !==
+          0 ||
+        !/^S-\d+(?:-\d+)+$/.test((await output).trim())
+      ) {
         throw new Error(
           'Unable to identify the current Windows user for daemon storage protection.'
         )
       }
-      return sid
+      return (await output).trim()
     })()
     try {
       return await this.windowsUserSid
     } catch (error) {
       this.windowsUserSid = undefined
       throw error
+    }
+  }
+
+  private async waitForWindowsPowerShell(
+    child: ReturnType<typeof Bun.spawn>,
+    deadline: number
+  ): Promise<number | null> {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([
+        child.exited.then((exitCode) => ({ exitCode })),
+        new Promise<{ timedOut: true }>((resolve) => {
+          timeout = setTimeout(resolve, Math.max(0, deadline - Date.now()), { timedOut: true })
+        }),
+      ])
+      if ('timedOut' in result) {
+        child.kill(9)
+        await child.exited.catch(() => undefined)
+        return null
+      }
+      return result.exitCode
+    } finally {
+      if (timeout) clearTimeout(timeout)
     }
   }
 }

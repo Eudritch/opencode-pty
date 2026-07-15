@@ -25,6 +25,7 @@ const TERMINATION_HARD_KILL_MS = 1000
 const NATIVE_READER_DRAIN_MS = 2000
 const NATIVE_WAIT_MARGIN_MS =
   NATIVE_READER_DRAIN_MS + TERMINATION_GRACE_MS + TERMINATION_HARD_KILL_MS
+const RECOVERY_CONCURRENCY = 4
 const SAFE_ENVIRONMENT_KEYS = new Set([
   'PATH',
   'HOME',
@@ -240,10 +241,12 @@ export class SessionSupervisor {
 
   constructor(
     private readonly storage: DaemonStorage,
-    private readonly maxOutputBytes: number = effectiveMaxOutputBytes()
+    private readonly maxOutputBytes: number = effectiveMaxOutputBytes(),
+    private readonly recoveryAttempts = 30,
+    private readonly recoveryRetryMs = 100
   ) {}
 
-  async initialize(): Promise<void> {
+  async initialize(reconnect = true): Promise<void> {
     await this.storage.initialize()
     for (const record of await this.storage.loadSessions()) {
       if (record.containment) {
@@ -263,6 +266,7 @@ export class SessionSupervisor {
         record.status === 'spawn_failed' ||
         record.status === 'output_limited'
       record.directChildExited ??= record.terminationConfirmed
+      this.records.set(record.id, record)
       if (record.worker && record.worker.protocolVersion !== 4) {
         record.status = 'lost'
         record.terminationConfirmed = false
@@ -272,41 +276,54 @@ export class SessionSupervisor {
         }
         record.updatedAt = new Date().toISOString()
         await this.storage.writeSession(record)
-        this.records.set(record.id, record)
-        continue
       }
-      if (
-        record.status === 'starting' ||
-        record.status === 'running' ||
-        record.status === 'stopping'
-      ) {
-        if (record.worker) {
-          let worker: WorkerClient | null = null
-          for (let attempt = 0; attempt < 30 && !worker; attempt += 1) {
-            worker = await NativeWorkerClient.reconnect(
-              join(this.storage.rootDirectory, 'sessions', record.id),
-              record.worker
-            )
-            if (!worker) await Bun.sleep(100)
-          }
-          if (worker) {
-            this.nativeWorkers.set(record.id, worker)
-            this.records.set(record.id, record)
-            void this.monitorNative(record, worker)
-            continue
-          }
-        }
-        const output = await this.storage.readOutput(record.id)
-        record.status = 'lost'
-        record.exitReason = { kind: 'unknown' }
-        record.outputBytes = Buffer.byteLength(output)
-        record.lineCount = lineCount(output)
-        record.outputHasPartialLine = Boolean(output) && !output.endsWith('\n')
-        record.updatedAt = new Date().toISOString()
-        await this.storage.writeSession(record)
-      }
-      this.records.set(record.id, record)
     }
+    if (reconnect) await this.reconcileWorkers()
+  }
+
+  async reconcileWorkers(): Promise<void> {
+    const pending = [...this.records.values()].filter(activeStatus)
+    let next = 0
+    await Promise.all(
+      Array.from({ length: Math.min(RECOVERY_CONCURRENCY, pending.length) }, async () => {
+        while (next < pending.length) {
+          const record = pending[next++]
+          if (!record) continue
+          await this.reconcileWorker(record).catch((error) =>
+            console.warn(
+              `Skipped PTY worker recovery for ${JSON.stringify(record.id)}: ${String(error)}.`
+            )
+          )
+        }
+      })
+    )
+  }
+
+  private async reconcileWorker(record: SessionRecord): Promise<void> {
+    const reference = record.worker
+    let worker: WorkerClient | null = null
+    if (reference) {
+      for (let attempt = 0; attempt < this.recoveryAttempts && !worker; attempt += 1) {
+        worker = await NativeWorkerClient.reconnect(
+          join(this.storage.rootDirectory, 'sessions', record.id),
+          reference
+        )
+        if (!worker && attempt + 1 < this.recoveryAttempts) await Bun.sleep(this.recoveryRetryMs)
+      }
+    }
+    if (worker) {
+      this.nativeWorkers.set(record.id, worker)
+      void this.monitorNative(record, worker)
+      return
+    }
+    const output = await this.storage.readOutput(record.id)
+    record.status = 'lost'
+    record.exitReason = { kind: 'unknown' }
+    record.outputBytes = Buffer.byteLength(output)
+    record.lineCount = lineCount(output)
+    record.outputHasPartialLine = Boolean(output) && !output.endsWith('\n')
+    record.updatedAt = new Date().toISOString()
+    await this.storage.writeSession(record)
   }
 
   async spawn(options: SpawnOptions): Promise<PTYSessionInfo> {
@@ -1111,7 +1128,15 @@ export class SessionSupervisor {
   async cleanup(id: string): Promise<boolean> {
     await this.flush()
     const record = this.records.get(id)
-    if (!record || (!this.isTerminal(record) && !this.incompatibleWorker(record))) return false
+    if (!record) return false
+    if (record.status === 'lost') {
+      this.nativeWorkers.delete(id)
+      await this.storage.removeWorkerDescriptor(id)
+      await this.storage.deleteSession(id)
+      this.records.delete(id)
+      return true
+    }
+    if (!this.isTerminal(record)) return false
     const worker = this.nativeWorkers.get(id)
     if (worker) {
       try {
@@ -1411,14 +1436,6 @@ export class SessionSupervisor {
 
   private isTerminal(record: SessionRecord): boolean {
     return terminalDirectChild(record)
-  }
-
-  private incompatibleWorker(record: SessionRecord): boolean {
-    return (
-      record.status === 'lost' &&
-      record.worker?.protocolVersion !== undefined &&
-      record.worker.protocolVersion !== 4
-    )
   }
 
   private toInfo(record: SessionRecord): PTYSessionInfo {

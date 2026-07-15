@@ -12,7 +12,7 @@ Usage:
 Behavior:
 - A stop request is not proof that the process has exited. Check `Termination confirmed` in the response.
 - If cleanup=false (default), the session remains in the list with its persisted output intact.
-- If cleanup=true, an unconfirmed session remains until a later cleanup call.
+- If cleanup=true, an unconfirmed session remains until a later cleanup call; a lost record can be explicitly discarded without claiming termination.
 - Keeping sessions without cleanup allows you to compare logs between runs
 
 Tips:

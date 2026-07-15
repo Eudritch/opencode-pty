@@ -9,6 +9,7 @@ import {
   parseWindowsProcessIdentity,
   processIdentityProbe,
   processStartIdentity,
+  renameWithWindowsRetry,
   requiredProcessStartIdentity,
   windowsProcessIdentityCommand,
 } from '../src/daemon/storage.ts'
@@ -586,6 +587,36 @@ test('start lock creation fails safely when its identity probe deadline expires'
   await expect(new DaemonStorage(root).acquireStartLock(Date.now())).rejects.toThrow(
     /process.*probe failed/
   )
+})
+
+test('same-root storage initialization shares one attempt and retries failures', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-initialize-'))
+  roots.push(root)
+  const first = new DaemonStorage(root)
+  const second = new DaemonStorage(join(root, '.'))
+  let calls = 0
+  const internals = first as unknown as { initializeRoot: () => Promise<void> }
+  const original = internals.initializeRoot
+  internals.initializeRoot = async () => {
+    calls += 1
+    await Bun.sleep(20)
+  }
+  try {
+    await Promise.all([first.initialize(), second.initialize()])
+    expect(calls).toBe(1)
+  } finally {
+    internals.initializeRoot = original
+  }
+})
+
+test('storage caches only the current process identity per root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-identity-cache-'))
+  roots.push(root)
+  const first = new DaemonStorage(root)
+  const second = new DaemonStorage(root)
+  const identity = await first.requiredCurrentProcessStartIdentity()
+  expect(await second.requiredCurrentProcessStartIdentity(Date.now())).toBe(identity)
+  expect(await processStartIdentity(process.pid)).toBe(identity)
 })
 
 test('start locks retain live owners and recover exactly one dead owner', async () => {
@@ -2534,7 +2565,7 @@ foreach ($item in $items) {
   }
 })
 
-test('lost sessions cannot be cleaned up', async () => {
+test('lost sessions can only be discarded by explicit cleanup', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lost-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -2542,8 +2573,67 @@ test('lost sessions cannot be cleaned up', async () => {
   await storage.writeSession(record(root, 'pty_lost', 'lost'))
   await supervisor.initialize()
 
-  expect(await supervisor.cleanup('pty_lost')).toBeFalse()
-  expect(await storage.loadSessions()).toHaveLength(1)
+  expect(await supervisor.cleanup('pty_lost')).toBeTrue()
+  expect(await storage.loadSessions()).toHaveLength(0)
+})
+
+test('stale worker recovery is bounded and parallel', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-parallel-recovery-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  for (let index = 0; index < 6; index += 1) {
+    const session = record(root, `pty_stale_${index}`)
+    session.worker = {
+      pid: 1,
+      startIdentity: 'start',
+      processIdentity: 'identity',
+      endpoint: 'http://127.0.0.1:1',
+      protocolVersion: 4,
+    }
+    await storage.writeSession(session)
+  }
+  const reconnect = NativeWorkerClient.reconnect
+  let active = 0
+  let maximum = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    active += 1
+    maximum = Math.max(maximum, active)
+    await Bun.sleep(50)
+    active -= 1
+    return null
+  }
+  try {
+    const started = Date.now()
+    await new SessionSupervisor(storage, undefined, 1).initialize()
+    expect(Date.now() - started).toBeLessThan(240)
+    expect(maximum).toBe(4)
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
+
+test('Windows rename retries only transient contention', async () => {
+  let attempts = 0
+  await renameWithWindowsRetry(
+    'source',
+    'destination',
+    async () => {
+      attempts += 1
+      if (attempts < 3) throw Object.assign(new Error('busy'), { code: 'EPERM' })
+    },
+    true
+  )
+  expect(attempts).toBe(3)
+  await expect(
+    renameWithWindowsRetry(
+      'source',
+      'destination',
+      async () => {
+        throw Object.assign(new Error('denied'), { code: 'EACCES' })
+      },
+      true
+    )
+  ).rejects.toThrow('denied')
 })
 
 test('journal orders chunks, retains complete UTF-8 chunks, and paginates by stable sequence', async () => {
