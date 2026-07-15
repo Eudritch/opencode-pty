@@ -55,12 +55,14 @@ async function processGone(pid: number) {
 }
 
 const roots: string[] = []
-const nativeWorkerPath = join(
-  process.cwd(),
-  'target',
-  'debug',
-  `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
-)
+const nativeWorkerPath =
+  process.env.PTY_NATIVE_WORKER_PATH ??
+  join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
 if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_PATH ??= nativeWorkerPath
 
 afterEach(async () => {
