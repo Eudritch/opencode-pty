@@ -2655,14 +2655,14 @@ test('native monitor snapshots exclude journal output and persist terminal outpu
     },
     shutdown: async () => terminal,
   }
-  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(session.id, worker)
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(
+    session.id,
+    worker
+  )
 
   await (
     supervisor as unknown as {
-      monitorNative: (
-        record: SessionRecord,
-        worker: unknown
-      ) => Promise<unknown>
+      monitorNative: (record: SessionRecord, worker: unknown) => Promise<unknown>
     }
   ).monitorNative(session, worker)
 
@@ -2672,6 +2672,87 @@ test('native monitor snapshots exclude journal output and persist terminal outpu
   expect(await storage.loadSessions()).toMatchObject([
     { id: session.id, nextSequence: 11, outputBytes: 11, lineCount: 2, status: 'exited' },
   ])
+})
+
+test('native get and list snapshots cannot overwrite monitor finalization', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-snapshot-race-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_native_snapshot_race')
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'process',
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+  const running = workerSnapshot()
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitedAt: new Date().toISOString(),
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  let snapshots = 0
+  let snapshotsStarted!: () => void
+  let releaseSnapshots!: () => void
+  let finalizationStarted!: () => void
+  const started = new Promise<void>((resolve) => {
+    snapshotsStarted = resolve
+  })
+  const release = new Promise<void>((resolve) => {
+    releaseSnapshots = resolve
+  })
+  const finalizing = new Promise<void>((resolve) => {
+    finalizationStarted = resolve
+  })
+  const worker = {
+    snapshot: async () => {
+      snapshots += 1
+      if (snapshots === 2) snapshotsStarted()
+      await release
+      return running
+    },
+    wait: async () => {
+      await started
+      return terminal
+    },
+    finalSnapshot: async () => {
+      finalizationStarted()
+      return terminal
+    },
+    shutdown: async () => terminal,
+  }
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(
+    session.id,
+    worker
+  )
+
+  const get = supervisor.get(session.id)
+  const list = supervisor.list()
+  await started
+  const monitor = (
+    supervisor as unknown as {
+      monitorNative: (record: SessionRecord, worker: unknown) => Promise<unknown>
+    }
+  ).monitorNative(session, worker)
+  await finalizing
+  releaseSnapshots()
+
+  await monitor
+  expect(await get).toMatchObject({ status: 'exited' })
+  expect(await list).toMatchObject([{ id: session.id, status: 'exited' }])
+  expect(await storage.loadSessions()).toMatchObject([{ id: session.id, status: 'exited' }])
+  expect(await supervisor.cleanup(session.id)).toBeTrue()
 })
 
 test('native finalization persists a lost storage failure', async () => {
@@ -2684,10 +2765,7 @@ test('native finalization persists a lost storage failure', async () => {
   await expect(
     (
       supervisor as unknown as {
-        finishNative: (
-          record: SessionRecord,
-          result: WorkerSnapshot
-        ) => Promise<unknown>
+        finishNative: (record: SessionRecord, result: WorkerSnapshot) => Promise<unknown>
       }
     ).finishNative(session, workerSnapshot({ exitCode: -1 }))
   ).rejects.toMatchObject({ code: 'ESTORAGE' })
@@ -2722,12 +2800,9 @@ test('Windows native high exit status persists as an unsigned code', async () =>
 
   await (
     supervisor as unknown as {
-        finishNative: (
-          record: SessionRecord,
-          result: WorkerSnapshot
-        ) => Promise<unknown>
-      }
-    ).finishNative(session, exited)
+      finishNative: (record: SessionRecord, result: WorkerSnapshot) => Promise<unknown>
+    }
+  ).finishNative(session, exited)
 
   expect(await storage.loadSessions()).toMatchObject([
     {

@@ -237,6 +237,9 @@ export class SessionSupervisor {
   private readonly records = new Map<string, SessionRecord>()
   private readonly waits = new Map<string, PendingWait[]>()
   private readonly nativeWorkers = new Map<string, WorkerClient>()
+  private readonly nativeVersions = new Map<string, number>()
+  private readonly nativePersists = new Map<string, Promise<void>>()
+  private readonly nativeFinalizations = new Map<string, Promise<ExecResult | PTYSessionInfo>>()
   private readonly pendingConversationCleanup = new Map<string, Promise<void>>()
   private persistQueue = Promise.resolve()
 
@@ -851,6 +854,7 @@ export class SessionSupervisor {
     worker: WorkerClient,
     error: unknown
   ): Promise<void> {
+    const version = this.bumpNativeVersion(record.id)
     const cleanup = await worker.rollback().catch((rollbackError) => ({
       requested: false,
       terminationConfirmed: false,
@@ -865,7 +869,11 @@ export class SessionSupervisor {
       message: `Native worker control failed: ${String(error)}; cleanup=${JSON.stringify(cleanup)}`,
     }
     record.updatedAt = new Date().toISOString()
-    await this.storage.writeSession(record)
+    await this.enqueueNativePersist(record.id, async () => {
+      if (version !== this.nativeVersion(record.id)) return
+      await this.storage.writeSession(record)
+      this.bumpNativeVersion(record.id)
+    })
     await this.storage.removeWorkerDescriptor(record.id)
     this.nativeWorkers.delete(record.id)
   }
@@ -875,10 +883,34 @@ export class SessionSupervisor {
     worker: WorkerClient,
     result: WorkerSnapshot
   ): Promise<ExecResult | PTYSessionInfo> {
+    const existing = this.nativeFinalizations.get(record.id)
+    if (existing) return existing
+    const version = this.bumpNativeVersion(record.id)
+    const finalization = this.finalizeNativeVersion(record, worker, result, version)
+    this.nativeFinalizations.set(record.id, finalization)
+    void finalization.then(
+      () => {
+        if (this.nativeFinalizations.get(record.id) === finalization)
+          this.nativeFinalizations.delete(record.id)
+      },
+      () => {
+        if (this.nativeFinalizations.get(record.id) === finalization)
+          this.nativeFinalizations.delete(record.id)
+      }
+    )
+    return finalization
+  }
+
+  private async finalizeNativeVersion(
+    record: SessionRecord,
+    worker: WorkerClient,
+    result: WorkerSnapshot,
+    version: number
+  ): Promise<ExecResult | PTYSessionInfo> {
     let final = result
     try {
       if (this.nativeTerminal(result)) final = await worker.finalSnapshot()
-      return await this.finishNative(record, final)
+      return await this.finishNative(record, final, version, this.nativeTerminal(final))
     } catch (error) {
       await this.persistNativeFinalizationFailure(record, final, error)
       const failure = new Error(`Native finalization failed: ${String(error)}`)
@@ -896,6 +928,23 @@ export class SessionSupervisor {
   }
 
   private async finishNative(
+    record: SessionRecord,
+    result: WorkerSnapshot,
+    version = this.nativeVersion(record.id),
+    terminal = false
+  ): Promise<ExecResult | PTYSessionInfo> {
+    return this.enqueueNativePersist(record.id, async () => {
+      if (version !== this.nativeVersion(record.id)) return this.toInfo(record)
+      try {
+        return await this.finishNativeVersion(record, result)
+      } finally {
+        // A terminal write invalidates snapshots that completed while it was in flight.
+        if (terminal) this.bumpNativeVersion(record.id)
+      }
+    })
+  }
+
+  private async finishNativeVersion(
     record: SessionRecord,
     result: WorkerSnapshot
   ): Promise<ExecResult | PTYSessionInfo> {
@@ -1080,7 +1129,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finishNative(record, await native.snapshot())
+      await this.syncNative(record, native)
     }
     return record ? this.toInfo(record) : null
   }
@@ -1090,7 +1139,7 @@ export class SessionSupervisor {
     await Promise.all(
       [...this.nativeWorkers.entries()].map(async ([id, worker]) => {
         const record = this.records.get(id)
-        if (record?.worker) await this.finishNative(record, await worker.snapshot())
+        if (record?.worker) await this.syncNative(record, worker)
       })
     )
     return [...this.records.values()].map((record) => this.toInfo(record))
@@ -1134,7 +1183,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finishNative(record, await native.snapshot())
+      await this.syncNative(record, native)
     }
     return record?.execOutput
       ? { ...record.execOutput, containment: record.containment, termination: record.termination }
@@ -1271,6 +1320,46 @@ export class SessionSupervisor {
 
   private enqueuePersist(task: () => Promise<void>): void {
     this.persistQueue = this.persistQueue.then(task, task)
+  }
+
+  private nativeVersion(id: string): number {
+    return this.nativeVersions.get(id) ?? 0
+  }
+
+  private bumpNativeVersion(id: string): number {
+    const version = this.nativeVersion(id) + 1
+    this.nativeVersions.set(id, version)
+    return version
+  }
+
+  private async syncNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
+    const version = this.nativeVersion(record.id)
+    const result = await worker.snapshot()
+    if (this.nativeWorkers.get(record.id) !== worker) {
+      await this.nativeFinalizations.get(record.id)?.catch(() => undefined)
+      return
+    }
+    if (this.nativeTerminal(result)) {
+      await this.finalizeNative(record, worker, result)
+      return
+    }
+    await this.finishNative(record, result, version)
+    if (version !== this.nativeVersion(record.id))
+      await this.nativeFinalizations.get(record.id)?.catch(() => undefined)
+  }
+
+  private enqueueNativePersist<T>(id: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.nativePersists.get(id) ?? Promise.resolve()
+    const result = previous.then(task, task)
+    const settled = result.then(
+      () => undefined,
+      () => undefined
+    )
+    this.nativePersists.set(id, settled)
+    void settled.then(() => {
+      if (this.nativePersists.get(id) === settled) this.nativePersists.delete(id)
+    })
+    return result
   }
 
   private idempotentSession(options: SpawnOptions, args: string[]): SessionRecord | undefined {
