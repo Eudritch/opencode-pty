@@ -29,8 +29,8 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::{ReadFile, WriteFile},
@@ -39,6 +39,7 @@ use windows_sys::Win32::{
             COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
             SetConsoleCtrlHandler,
         },
+        IO::CancelSynchronousIo,
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -48,7 +49,8 @@ use windows_sys::Win32::{
         Pipes::CreatePipe,
         Threading::{
             CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+            GetCurrentThread, GetExitCodeProcess, GetThreadIOPendingFlag,
             InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
             PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -60,6 +62,8 @@ use windows_sys::Win32::{
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const READER_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const TERMINATION_HARD_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
@@ -258,6 +262,12 @@ struct State {
     stderr_reader_error: Option<String>,
     reader_drain_deadline: Option<SystemTime>,
     output_incomplete: bool,
+    #[cfg(windows)]
+    reader_cancel_requested: bool,
+    #[cfg(windows)]
+    reader_cancel_deadline: Option<SystemTime>,
+    #[cfg(windows)]
+    terminal_reader_done: bool,
     diagnostics: Vec<String>,
     termination: Option<TerminationResult>,
 }
@@ -344,6 +354,10 @@ struct Worker {
     deadline: Option<SystemTime>,
     containment: Containment,
     mode: String,
+    #[cfg(windows)]
+    terminal_reader: Mutex<Option<WinHandle>>,
+    #[cfg(windows)]
+    terminal_close_started: AtomicBool,
 }
 
 #[cfg(windows)]
@@ -444,14 +458,10 @@ impl Drop for WindowsPty {
 
 #[cfg(windows)]
 impl WindowsPty {
-    fn close(&mut self) {
-        if let Some(console) = self.console.take() {
-            // Closing the producer releases the host output pipe for its reader to drain.
-            unsafe {
-                ClosePseudoConsole(console);
-            }
-        }
+    fn take_terminal(&mut self) -> Option<HPCON> {
+        // ConPTY accepts no further ordinary host input before its output producer is closed.
         self.input.take();
+        self.console.take()
     }
 }
 
@@ -764,15 +774,13 @@ fn windows_job() -> Result<WinHandle, String> {
 #[cfg(windows)]
 fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     let job = windows_job()?;
-    let application = wide(&resolve_windows_executable(
-        &bootstrap.command,
-        &bootstrap.workdir,
-        &bootstrap.env,
-    )?)?;
+    let application_path =
+        resolve_windows_executable(&bootstrap.command, &bootstrap.workdir, &bootstrap.env)?;
+    let application = wide(&application_path)?;
     let cwd = wide(&bootstrap.workdir)?;
     let environment = windows_environment(&bootstrap.env)?;
     let mut command_line = wide(
-        &std::iter::once(bootstrap.command.as_str())
+        &std::iter::once(application_path.as_str())
             .chain(bootstrap.args.iter().map(String::as_str))
             .map(quote_windows_arg)
             .collect::<Vec<_>>()
@@ -846,14 +854,15 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         .as_ref()
         .map(|attributes| attributes.list)
         .unwrap_or(null_mut());
-    let mut pseudo_console = pty.as_ref().and_then(|pty| pty.console).unwrap_or(0);
+    let pseudo_console = pty.as_ref().and_then(|pty| pty.console).unwrap_or(0);
     if pty.is_some()
         && unsafe {
             UpdateProcThreadAttribute(
                 list,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                (&mut pseudo_console as *mut HPCON).cast(),
+                // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE receives the HPCON handle value.
+                pseudo_console as *const std::ffi::c_void,
                 size_of::<HPCON>(),
                 null_mut(),
                 null(),
@@ -1741,9 +1750,49 @@ fn release_windows_terminal(worker: &Arc<Worker>) {
     {
         return;
     }
-    if let Some(pty) = worker.child.lock().expect("child lock").pty.as_mut() {
-        pty.close();
+    if worker.mode != "pty" {
+        return;
     }
+    if worker.terminal_close_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let worker = worker.clone();
+    thread::spawn(move || {
+        loop {
+            let mut pending = 0;
+            let reader = worker.terminal_reader.lock().expect("terminal reader lock");
+            let pending_read = reader.as_ref().is_some_and(|reader| unsafe {
+                GetThreadIOPendingFlag(reader.raw(), &mut pending) != 0 && pending != 0
+            });
+            drop(reader);
+            if pending_read {
+                // Do not hold the child lock while ClosePseudoConsole drains output.
+                let console = worker
+                    .child
+                    .lock()
+                    .expect("child lock")
+                    .pty
+                    .as_mut()
+                    .and_then(WindowsPty::take_terminal);
+                if let Some(console) = console {
+                    unsafe {
+                        ClosePseudoConsole(console);
+                    }
+                }
+                return;
+            }
+            if worker
+                .state
+                .lock()
+                .expect("state lock")
+                .reader_cancel_deadline
+                .is_some_and(|deadline| SystemTime::now() >= deadline)
+            {
+                return;
+            }
+            thread::yield_now();
+        }
+    });
 }
 
 fn observe_exit(worker: &Arc<Worker>) {
@@ -1759,8 +1808,6 @@ fn observe_exit(worker: &Arc<Worker>) {
     }
     if worker.state.lock().expect("state lock").root_exited {
         let _ = refresh_termination_confirmed(worker);
-        #[cfg(windows)]
-        release_windows_terminal(worker);
     }
 }
 
@@ -2181,6 +2228,7 @@ fn output_complete(state: &State) -> bool {
         && state.stderr_reader_error.is_none()
 }
 
+#[cfg(not(windows))]
 fn update_reader_drain_state(state: &mut State) {
     if state.termination_confirmed
         && (!output_complete(state))
@@ -2196,8 +2244,74 @@ fn update_reader_drain_state(state: &mut State) {
 }
 
 fn update_reader_drain(worker: &Arc<Worker>) {
-    let mut state = worker.state.lock().expect("state lock");
-    update_reader_drain_state(&mut state);
+    #[cfg(not(windows))]
+    update_reader_drain_state(&mut worker.state.lock().expect("state lock"));
+    #[cfg(windows)]
+    {
+        let mut cancel = false;
+        let mut state = worker.state.lock().expect("state lock");
+        if worker.mode != "pty" {
+            if state.termination_confirmed
+                && !output_complete(&state)
+                && state
+                    .reader_drain_deadline
+                    .is_some_and(|deadline| SystemTime::now() >= deadline)
+            {
+                state.output_incomplete = true;
+            }
+            return;
+        }
+        if state.termination_confirmed
+            && !output_complete(&state)
+            && state
+                .reader_drain_deadline
+                .is_some_and(|deadline| SystemTime::now() >= deadline)
+            && !state.reader_cancel_requested
+        {
+            state.reader_cancel_requested = true;
+            state.reader_cancel_deadline = Some(SystemTime::now() + READER_CANCEL_TIMEOUT);
+            push_diagnostic(
+                &mut state,
+                "reader drain deadline elapsed; cancelling reader".into(),
+                &[],
+            );
+            cancel = true;
+        }
+        if state.reader_cancel_requested
+            && !state.terminal_reader_done
+            && state
+                .reader_cancel_deadline
+                .is_some_and(|deadline| SystemTime::now() >= deadline)
+        {
+            state.output_incomplete = true;
+            push_diagnostic(
+                &mut state,
+                "reader cancellation deadline elapsed".into(),
+                &[],
+            );
+        }
+        if state.reader_cancel_requested && state.terminal_reader_done && !output_complete(&state) {
+            state.output_incomplete = true;
+        }
+        drop(state);
+        if cancel {
+            if let Some(reader_thread) =
+                &*worker.terminal_reader.lock().expect("terminal reader lock")
+            {
+                unsafe {
+                    CancelSynchronousIo(reader_thread.raw());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminal_reader_finished(state: &State) -> bool {
+    state.terminal_reader_done
+        || state
+            .reader_cancel_deadline
+            .is_some_and(|deadline| SystemTime::now() >= deadline)
 }
 
 fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: bool) {
@@ -2249,6 +2363,22 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
 #[cfg(windows)]
 fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
     thread::spawn(move || {
+        let mut reader_thread = null_mut();
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut reader_thread,
+                0,
+                0,
+                2,
+            )
+        } != 0
+        {
+            *worker.terminal_reader.lock().expect("terminal reader lock") =
+                WinHandle::new(reader_thread).ok();
+        }
         let mut buffer = [0_u8; 8192];
         let mut tail = String::new();
         loop {
@@ -2260,6 +2390,11 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         redact_stream(String::new(), &mut tail, &worker.secrets, true),
                     );
                     mark_reader_eof(&worker, true);
+                    worker
+                        .state
+                        .lock()
+                        .expect("state lock")
+                        .terminal_reader_done = true;
                     return;
                 }
                 Err(error) => {
@@ -2274,6 +2409,11 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         let mut state = worker.state.lock().expect("state lock");
                         mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                     }
+                    worker
+                        .state
+                        .lock()
+                        .expect("state lock")
+                        .terminal_reader_done = true;
                     return;
                 }
                 Ok(size) => append_output(
@@ -2377,11 +2517,14 @@ fn monitor(worker: Arc<Worker>) {
     thread::spawn(move || {
         loop {
             observe_exit(&worker);
+            #[cfg(windows)]
+            release_windows_terminal(&worker);
             update_reader_drain(&worker);
             let terminal = {
                 let state = worker.state.lock().expect("state lock");
                 state.termination_confirmed
                     && (state.output_incomplete || (state.stdout_eof && state.stderr_eof))
+                    && (worker.mode != "pty" || !cfg!(windows) || terminal_reader_finished(&state))
             };
             if terminal {
                 return;
@@ -2412,7 +2555,9 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
         .collect::<Vec<_>>()
         .join("; ");
     let diagnostics = state.diagnostics.clone();
-    let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
+    let terminal = state.termination_confirmed
+        && (output_complete || state.output_incomplete)
+        && (worker.mode != "pty" || !cfg!(windows) || terminal_reader_finished(&state));
     let containment_unavailable = containment.status == "posix_containment_unknown"
         || containment.status == "windows_job_unknown";
     let macos_direct_exit = cfg!(all(unix, not(target_os = "linux"))) && state.root_exited;
@@ -2598,6 +2743,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn reader_drain_timeout_marks_output_incomplete() {
         let mut state = State {
             termination_confirmed: true,
@@ -2846,13 +2992,6 @@ mod tests {
     }
 }
 
-#[cfg(windows)]
-fn wait_for_final_snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
-    // terminate_contained already performed the bounded Job drain poll.
-    snapshot(worker, include_exec_output)
-}
-
-#[cfg(not(windows))]
 fn wait_for_final_snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
     loop {
         let result = snapshot(worker, include_exec_output);
@@ -3493,6 +3632,10 @@ fn main() -> Result<(), String> {
             .map(|seconds| SystemTime::now() + Duration::from_secs(seconds)),
         containment,
         mode: bootstrap.mode.clone(),
+        #[cfg(windows)]
+        terminal_reader: Mutex::new(None),
+        #[cfg(windows)]
+        terminal_close_started: AtomicBool::new(false),
     });
     if bootstrap.mode == "pty" {
         #[cfg(unix)]

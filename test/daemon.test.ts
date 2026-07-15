@@ -2400,7 +2400,7 @@ test('native PTY writes, resizes, rejects exec resize, and recovers after daemon
   }
 }, 15_000)
 
-test('Windows ConPTY cmd more accepts input and finite output drains before cleanup', async () => {
+test('Windows ConPTY cmd more accepts unique input, resizes, and cleans up', async () => {
   if (process.platform !== 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-'))
   roots.push(root)
@@ -2410,6 +2410,8 @@ test('Windows ConPTY cmd more accepts input and finite output drains before clea
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'windows-conpty')
   let descriptor: { endpoint: string; token: string } | undefined
   let id: string | undefined
+  let cmdPid: number | undefined
+  let workerPid: number | undefined
   try {
     descriptor = await server.start()
     const context = await owner(storage, 'windows-conpty', root)
@@ -2431,38 +2433,41 @@ test('Windows ConPTY cmd more accepts input and finite output drains before clea
     if (!spawned.result || typeof spawned.result.id !== 'string')
       throw new Error(JSON.stringify(spawned.error ?? spawned))
     id = spawned.result.id
-    const resized = await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then(
-      (response) => response.json()
-    )
-    if (!(resized as { ok?: unknown }).ok) {
-      const [session, output] = await Promise.all([
-        rpc(descriptor, 'get', { id }, context).then((response) => response.json()),
-        rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json()),
-      ])
-      throw new Error(
-        `Windows ConPTY closed before resize: ${JSON.stringify({ resized, session, output })}`
-      )
-    }
-    expect(resized).toMatchObject({ result: { cols: 100, rows: 30 } })
+    const running = (await rpc(descriptor, 'get', { id }, context).then((response) =>
+      response.json()
+    )) as { result?: { pid?: unknown } }
+    if (typeof running.result?.pid !== 'number')
+      throw new Error('Windows ConPTY cmd pid is invalid')
+    cmdPid = running.result.pid
+    const worker = JSON.parse(
+      await readFile(join(root, 'sessions', id, 'worker.json'), 'utf8')
+    ) as { pid?: unknown }
+    if (typeof worker.pid !== 'number') throw new Error('Windows ConPTY worker pid is invalid')
+    workerPid = worker.pid
+    const marker = `conpty-more-${crypto.randomUUID()}`
     expect(
       await rpc(
         descriptor,
         'sendWait',
         {
           id,
-          data: 'conpty-more\r\n',
-          condition: { kind: 'output', literal: 'conpty-more' },
+          data: `${marker}\r\n`,
+          condition: { kind: 'output', literal: marker },
           timeoutSeconds: 2,
         },
         context
       ).then((response) => response.json())
     ).toMatchObject({ result: { satisfied: true } })
+    const resized = await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then(
+      (response) => response.json()
+    )
+    expect(resized).toMatchObject({ result: { cols: 100, rows: 30 } })
     expect(
       await rpc(descriptor, 'list', {}, context).then((response) => response.json())
     ).toMatchObject({ result: [{ id, status: 'running' }] })
     expect(
       await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: { raw: expect.stringContaining('conpty-more') } })
+    ).toMatchObject({ result: { raw: expect.stringContaining(marker) } })
     const stopped = await rpc(descriptor, 'stop', { id }, context).then((response) =>
       response.json()
     )
@@ -2476,21 +2481,58 @@ test('Windows ConPTY cmd more accepts input and finite output drains before clea
         status: 'exited',
         terminationConfirmed: true,
         containment: { status: 'windows_job_empty' },
+        stdoutEof: true,
+        stderrEof: true,
+        outputComplete: true,
+        outputIncomplete: false,
       },
     })
     expect(
       await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
     ).toMatchObject({ result: {} })
     id = undefined
+    expect(await processGone(cmdPid)).toBeTrue()
+    expect(await processGone(workerPid)).toBeTrue()
+  } finally {
+    if (descriptor && id) {
+      const context = await owner(storage, 'windows-conpty', root).catch(() => undefined)
+      if (context) {
+        await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
+        await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
+      }
+    }
+    await server.stop().catch(() => undefined)
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
 
-    const finite = (await rpc(
+test('Windows ConPTY cmd echo drains terminal output and its Job', async () => {
+  if (process.platform !== 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-finite-'))
+  roots.push(root)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'windows-conpty-finite')
+  let descriptor: { endpoint: string; token: string } | undefined
+  let id: string | undefined
+  try {
+    descriptor = await server.start()
+    const context = await owner(storage, 'windows-conpty-finite', root)
+    const markerPath = join(root, 'marker.txt')
+    const spawned = (await rpc(
       descriptor,
       'spawn',
-      { command: 'cmd.exe', args: ['/d', '/c', 'echo ok'], description: 'Windows ConPTY drain' },
+      {
+        command: 'cmd.exe',
+        args: ['/d', '/c', `echo conpty-ok & echo conpty-ok > ${markerPath}`],
+        description: 'Windows ConPTY echo',
+      },
       context
-    ).then((response) => response.json())) as { result: { id: unknown } }
-    if (typeof finite.result.id !== 'string') throw new Error('finite PTY id is invalid')
-    id = finite.result.id
+    ).then((response) => response.json())) as { result?: { id?: unknown } }
+    if (typeof spawned.result?.id !== 'string') throw new Error('finite ConPTY id is invalid')
+    id = spawned.result.id
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const session = (await rpc(descriptor, 'get', { id }, context).then((response) =>
         response.json()
@@ -2498,16 +2540,31 @@ test('Windows ConPTY cmd more accepts input and finite output drains before clea
       if (session.result?.status !== 'running') break
       await Bun.sleep(20)
     }
+    expect(existsSync(markerPath)).toBeTrue()
+    expect(await readFile(markerPath, 'utf8')).toContain('conpty-ok')
+    expect(
+      await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: { raw: expect.stringContaining('conpty-ok') } })
     expect(
       await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: { status: 'exited', terminationConfirmed: true } })
+    ).toMatchObject({
+      result: {
+        status: 'exited',
+        terminationConfirmed: true,
+        containment: { status: 'windows_job_empty' },
+        stdoutEof: true,
+        stderrEof: true,
+        outputComplete: true,
+        outputIncomplete: false,
+      },
+    })
     expect(
       await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
     ).toMatchObject({ result: {} })
     id = undefined
   } finally {
     if (descriptor && id) {
-      const context = await owner(storage, 'windows-conpty', root).catch(() => undefined)
+      const context = await owner(storage, 'windows-conpty-finite', root).catch(() => undefined)
       if (context) {
         await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
         await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
