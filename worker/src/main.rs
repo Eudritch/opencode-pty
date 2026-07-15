@@ -50,11 +50,11 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-            GetCurrentThread, GetExitCodeProcess, GetThreadIOPendingFlag,
-            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+            GetCurrentThread, GetExitCodeProcess, InitializeProcThreadAttributeList,
+            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+            WaitForSingleObject,
         },
     },
 };
@@ -267,7 +267,15 @@ struct State {
     #[cfg(windows)]
     reader_cancel_deadline: Option<SystemTime>,
     #[cfg(windows)]
+    terminal_reader_active: bool,
+    #[cfg(windows)]
     terminal_reader_done: bool,
+    #[cfg(windows)]
+    terminal_reader_completions: usize,
+    #[cfg(windows)]
+    terminal_reader_exit_completion: Option<usize>,
+    #[cfg(windows)]
+    terminal_reader_post_exit_completion: bool,
     diagnostics: Vec<String>,
     termination: Option<TerminationResult>,
 }
@@ -458,9 +466,11 @@ impl Drop for WindowsPty {
 
 #[cfg(windows)]
 impl WindowsPty {
-    fn take_terminal(&mut self) -> Option<HPCON> {
-        // ConPTY accepts no further ordinary host input before its output producer is closed.
+    fn close_input(&mut self) {
         self.input.take();
+    }
+
+    fn take_terminal(&mut self) -> Option<HPCON> {
         self.console.take()
     }
 }
@@ -1736,63 +1746,56 @@ fn record_exit(worker: &Arc<Worker>, exit: WindowsExit) {
     state.exited_at = Some(now());
     state.root_exited = true;
     state.reader_drain_deadline = Some(SystemTime::now() + READER_DRAIN_TIMEOUT);
+    state.terminal_reader_exit_completion = Some(state.terminal_reader_completions);
     drop(state);
+    close_windows_input(worker);
     let _ = refresh_termination_confirmed(worker);
 }
 
 #[cfg(windows)]
-fn release_windows_terminal(worker: &Arc<Worker>) {
-    if !worker
-        .state
-        .lock()
-        .expect("state lock")
-        .termination_confirmed
-    {
-        return;
+fn close_windows_input(worker: &Arc<Worker>) {
+    if let Some(pty) = worker.child.lock().expect("child lock").pty.as_mut() {
+        pty.close_input();
     }
+}
+
+#[cfg(windows)]
+fn release_windows_terminal(worker: &Arc<Worker>) {
     if worker.mode != "pty" {
         return;
     }
-    if worker.terminal_close_started.swap(true, Ordering::AcqRel) {
+    let close = {
+        let state = worker.state.lock().expect("state lock");
+        state.termination_confirmed
+            && (state.terminal_reader_done
+                || (state.terminal_reader_active
+                    && (state.terminal_reader_post_exit_completion
+                        || state
+                            .reader_drain_deadline
+                            .and_then(|deadline| deadline.checked_sub(READER_CANCEL_TIMEOUT))
+                            .is_some_and(|deadline| SystemTime::now() >= deadline))))
+    };
+    if !close || worker.terminal_close_started.swap(true, Ordering::AcqRel) {
         return;
     }
-    let worker = worker.clone();
-    thread::spawn(move || {
-        loop {
-            let mut pending = 0;
-            let reader = worker.terminal_reader.lock().expect("terminal reader lock");
-            let pending_read = reader.as_ref().is_some_and(|reader| unsafe {
-                GetThreadIOPendingFlag(reader.raw(), &mut pending) != 0 && pending != 0
-            });
-            drop(reader);
-            if pending_read {
-                // Do not hold the child lock while ClosePseudoConsole drains output.
-                let console = worker
-                    .child
-                    .lock()
-                    .expect("child lock")
-                    .pty
-                    .as_mut()
-                    .and_then(WindowsPty::take_terminal);
-                if let Some(console) = console {
-                    unsafe {
-                        ClosePseudoConsole(console);
-                    }
-                }
-                return;
-            }
-            if worker
-                .state
-                .lock()
-                .expect("state lock")
-                .reader_cancel_deadline
-                .is_some_and(|deadline| SystemTime::now() >= deadline)
-            {
-                return;
-            }
-            thread::yield_now();
+    // A read completion after exit lets ConPTY publish final bytes before its producer closes.
+    let console = worker
+        .child
+        .lock()
+        .expect("child lock")
+        .pty
+        .as_mut()
+        .and_then(WindowsPty::take_terminal);
+    if let Some(console) = console {
+        unsafe {
+            ClosePseudoConsole(console);
         }
-    });
+    }
+    let mut state = worker.state.lock().expect("state lock");
+    state.reader_cancel_deadline = state.reader_drain_deadline;
+    if state.terminal_reader_done && !output_complete(&state) {
+        state.output_incomplete = true;
+    }
 }
 
 fn observe_exit(worker: &Arc<Worker>) {
@@ -2261,23 +2264,7 @@ fn update_reader_drain(worker: &Arc<Worker>) {
             }
             return;
         }
-        if state.termination_confirmed
-            && !output_complete(&state)
-            && state
-                .reader_drain_deadline
-                .is_some_and(|deadline| SystemTime::now() >= deadline)
-            && !state.reader_cancel_requested
-        {
-            state.reader_cancel_requested = true;
-            state.reader_cancel_deadline = Some(SystemTime::now() + READER_CANCEL_TIMEOUT);
-            push_diagnostic(
-                &mut state,
-                "reader drain deadline elapsed; cancelling reader".into(),
-                &[],
-            );
-            cancel = true;
-        }
-        if state.reader_cancel_requested
+        if worker.terminal_close_started.load(Ordering::Acquire)
             && !state.terminal_reader_done
             && state
                 .reader_cancel_deadline
@@ -2286,9 +2273,13 @@ fn update_reader_drain(worker: &Arc<Worker>) {
             state.output_incomplete = true;
             push_diagnostic(
                 &mut state,
-                "reader cancellation deadline elapsed".into(),
+                "reader drain deadline elapsed after console closure".into(),
                 &[],
             );
+            if !state.reader_cancel_requested {
+                state.reader_cancel_requested = true;
+                cancel = true;
+            }
         }
         if state.reader_cancel_requested && state.terminal_reader_done && !output_complete(&state) {
             state.output_incomplete = true;
@@ -2379,6 +2370,11 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
             *worker.terminal_reader.lock().expect("terminal reader lock") =
                 WinHandle::new(reader_thread).ok();
         }
+        worker
+            .state
+            .lock()
+            .expect("state lock")
+            .terminal_reader_active = true;
         let mut buffer = [0_u8; 8192];
         let mut tail = String::new();
         loop {
@@ -2390,11 +2386,8 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         redact_stream(String::new(), &mut tail, &worker.secrets, true),
                     );
                     mark_reader_eof(&worker, true);
-                    worker
-                        .state
-                        .lock()
-                        .expect("state lock")
-                        .terminal_reader_done = true;
+                    let mut state = worker.state.lock().expect("state lock");
+                    state.terminal_reader_done = true;
                     return;
                 }
                 Err(error) => {
@@ -2409,23 +2402,28 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         let mut state = worker.state.lock().expect("state lock");
                         mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                     }
-                    worker
-                        .state
-                        .lock()
-                        .expect("state lock")
-                        .terminal_reader_done = true;
+                    let mut state = worker.state.lock().expect("state lock");
+                    state.terminal_reader_done = true;
                     return;
                 }
-                Ok(size) => append_output(
-                    &worker,
-                    true,
-                    redact_stream(
-                        String::from_utf8_lossy(&buffer[..size]).into_owned(),
-                        &mut tail,
-                        &worker.secrets,
-                        false,
-                    ),
-                ),
+                Ok(size) => {
+                    let mut state = worker.state.lock().expect("state lock");
+                    state.terminal_reader_completions += 1;
+                    state.terminal_reader_post_exit_completion = state
+                        .terminal_reader_exit_completion
+                        .is_some_and(|completion| state.terminal_reader_completions > completion);
+                    drop(state);
+                    append_output(
+                        &worker,
+                        true,
+                        redact_stream(
+                            String::from_utf8_lossy(&buffer[..size]).into_owned(),
+                            &mut tail,
+                            &worker.secrets,
+                            false,
+                        ),
+                    );
+                }
             }
         }
     });
@@ -2677,6 +2675,24 @@ mod tests {
     #[test]
     fn windows_exit_status_preserves_high_ntstatus() {
         assert_eq!(WindowsExit(0xc000_0005u32).code(), Some(0xc000_0005u32));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_close_requires_a_post_exit_read_completion() {
+        let mut state = State {
+            termination_confirmed: true,
+            terminal_reader_active: true,
+            terminal_reader_exit_completion: Some(1),
+            terminal_reader_completions: 1,
+            ..State::default()
+        };
+        assert!(!state.terminal_reader_post_exit_completion);
+        state.terminal_reader_completions += 1;
+        state.terminal_reader_post_exit_completion = state
+            .terminal_reader_exit_completion
+            .is_some_and(|completion| state.terminal_reader_completions > completion);
+        assert!(state.terminal_reader_post_exit_completion);
     }
 
     #[cfg(windows)]
