@@ -35,7 +35,10 @@ use windows_sys::Win32::{
     Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::{ReadFile, WriteFile},
     System::{
-        Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole},
+        Console::{
+            COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+            SetConsoleCtrlHandler,
+        },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -3096,6 +3099,11 @@ fn serve(mut stream: TcpStream, worker: Arc<Worker>, token: String, shutdown: Ar
 }
 
 fn main() -> Result<(), String> {
+    #[cfg(windows)]
+    unsafe {
+        // The plugin host can receive Ctrl+C while this durable worker owns a ConPTY child.
+        SetConsoleCtrlHandler(None, 1);
+    }
     let mut stdin = std::io::stdin();
     let bootstrap: Bootstrap =
         serde_json::from_slice(&read_frame(&mut stdin)?).map_err(|error| error.to_string())?;
