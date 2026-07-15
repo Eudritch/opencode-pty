@@ -547,6 +547,56 @@ test('start locks retain live owners and recover exactly one dead owner', async 
   await storage.releaseStartLock(recoveredLock.token)
 })
 
+test('concurrent recoverers claim one stale recovery lock', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-stale-recovery-lock-'))
+  roots.push(root)
+  const stale = JSON.stringify({
+    token: 'dead',
+    handoffToken: null,
+    pid: 2147483647,
+    processIdentity: 'dead',
+  })
+  await writeFile(join(root, 'daemon-start.lock'), stale)
+  await writeFile(join(root, 'daemon-start-recovery.lock'), stale)
+
+  const recovered = await Promise.all([
+    new DaemonStorage(root).acquireStartLock(),
+    new DaemonStorage(root).acquireStartLock(),
+  ])
+  expect(recovered.filter(Boolean)).toHaveLength(1)
+  const recoveredLock = recovered.find((lock) => lock !== null)
+  if (!recoveredLock) throw new Error('Expected recovered start lock.')
+  await new DaemonStorage(root).releaseStartLock(recoveredLock.token)
+})
+
+test('recovery retains a lock replaced after observation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-replaced-recovery-lock-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const stale = { token: 'dead', handoffToken: null, pid: 2147483647, processIdentity: 'dead' }
+  const replacement = { ...stale, token: 'replacement' }
+  await storage.initialize()
+  await writeFile(join(root, 'daemon-start-recovery.lock'), JSON.stringify(stale))
+  const internals = storage as unknown as {
+    startLockOwnerAlive: (...args: never[]) => Promise<boolean>
+    acquireStartLockRecovery: () => Promise<boolean>
+  }
+  const ownerAlive = internals.startLockOwnerAlive
+  internals.startLockOwnerAlive = async () => {
+    await rm(join(root, 'daemon-start-recovery.lock'))
+    await writeFile(join(root, 'daemon-start-recovery.lock'), JSON.stringify(replacement))
+    return false
+  }
+  try {
+    expect(await internals.acquireStartLockRecovery()).toBeFalse()
+  } finally {
+    internals.startLockOwnerAlive = ownerAlive
+  }
+  expect(JSON.parse(await readFile(join(root, 'daemon-start-recovery.lock'), 'utf8'))).toEqual(
+    replacement
+  )
+})
+
 test('start lock handoff permits one distinct daemon identity', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-handoff-'))
   roots.push(root)

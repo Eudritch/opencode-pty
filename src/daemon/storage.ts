@@ -356,7 +356,25 @@ export class DaemonStorage {
     }
     const recovery = await this.readStartLock(this.startLockRecoveryPath)
     if (recovery && (await this.startLockOwnerAlive(recovery, deadline))) return false
-    await rm(this.startLockRecoveryPath, { force: true })
+    const quarantine = join(this.root, `.${START_LOCK_RECOVERY_FILE}.${crypto.randomUUID()}`)
+    try {
+      await rename(this.startLockRecoveryPath, quarantine)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+        return this.acquireStartLockRecovery(deadline)
+      throw error
+    }
+    const quarantined = await this.readStartLock(quarantine)
+    if (!recovery || quarantined?.token !== recovery.token) {
+      try {
+        await link(quarantine, this.startLockRecoveryPath)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+      await rm(quarantine, { force: true })
+      return false
+    }
+    await rm(quarantine, { force: true })
     return this.acquireStartLockRecovery(deadline)
   }
 
