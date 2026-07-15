@@ -1,5 +1,5 @@
 import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import {
   type DaemonDescriptor,
   type ExitReason,
@@ -39,6 +39,7 @@ export async function processStartIdentity(
   deadline = Date.now() + 5000
 ): Promise<string | null> {
   if (!Number.isSafeInteger(pid) || pid < 1) return null
+  if (Date.now() >= deadline) return null
   if (process.platform !== 'win32' && process.platform !== 'darwin') {
     try {
       const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
@@ -51,37 +52,71 @@ export async function processStartIdentity(
       return null
     }
   }
-  const command =
-    process.platform === 'win32'
-      ? [
-          'powershell.exe',
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          `$process = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($process) { [Console]::Write("windows:${pid}:$($process.StartTime.ToFileTimeUtc())") }`,
-        ]
-      : ['ps', '-p', String(pid), '-o', 'lstart=']
+  if (process.platform === 'win32') {
+    const command = windowsProcessIdentityCommand(pid)
+    if (!command) return null
+    return parseWindowsProcessIdentity(pid, await processIdentityProbe(command, deadline))
+  }
+  const output = (
+    await processIdentityProbe(['ps', '-p', String(pid), '-o', 'lstart='], deadline)
+  )?.trim()
+  return output ? `darwin:${pid}:${output}` : null
+}
+
+export function parseWindowsProcessIdentity(pid: number, output: string | null): string | null {
+  if (!output) return null
+  const identity = output.trim()
+  const match = /^windows:(\d+):([1-9]\d*)$/.exec(identity)
+  const observedPid = match?.[1]
+  const creationTime = match?.[2]
+  return observedPid && creationTime && Number(observedPid) === pid ? identity : null
+}
+
+export function windowsProcessIdentityCommand(pid: number, systemRoot?: string): string[] | null {
+  const root =
+    systemRoot === undefined ? (process.env.SystemRoot ?? process.env.WINDIR) : systemRoot
+  if (!root) return null
+  return [
+    resolve(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `$process = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($process) { [Console]::Write("windows:${pid}:$($process.StartTime.ToFileTimeUtc())") }`,
+  ]
+}
+
+export async function processIdentityProbe(
+  command: string[],
+  deadline: number
+): Promise<string | null> {
+  if (Date.now() >= deadline) return null
   try {
     const child = Bun.spawn({ cmd: command, stdout: 'pipe', stderr: 'ignore' })
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const result = await Promise.race([
-      child.exited.then(async () => {
-        const output = await new Response(child.stdout).text()
-        return { output }
-      }),
-      new Promise<null>((resolve) => {
-        timer = setTimeout(resolve, Math.max(0, deadline - Date.now()), null)
-      }),
-    ]).finally(() => clearTimeout(timer))
-    if (!result) {
-      child.kill()
-      return null
-    }
-    const output = result.output.trim()
-    return output ? (process.platform === 'win32' ? output : `darwin:${pid}:${output}`) : null
+    const output = new Response(child.stdout).text()
+    const completed = await Promise.race([
+      child.exited.then(async (exitCode) => (exitCode === 0 ? output : null)),
+      Bun.sleep(Math.max(0, deadline - Date.now())).then(() => null),
+    ])
+    if (completed !== null) return completed
+    child.kill(9)
+    void child.exited
+    return null
   } catch {
     return null
   }
+}
+
+export async function requiredProcessStartIdentity(
+  pid: number,
+  deadline?: number
+): Promise<string> {
+  const identity = await processStartIdentity(pid, deadline)
+  if (identity) return identity
+  const probe =
+    process.platform === 'win32'
+      ? 'Windows process creation-time probe'
+      : 'process start-time probe'
+  throw new Error(`Unable to verify daemon process identity: ${probe} failed.`)
 }
 
 const SESSION_STATUSES = new Set([
@@ -275,8 +310,7 @@ export class DaemonStorage {
   }
 
   private async newStartLock(deadline?: number): Promise<StartLock & { handoffToken: string }> {
-    const processIdentity = await processStartIdentity(process.pid, deadline)
-    if (!processIdentity) throw new Error('Unable to verify daemon process identity.')
+    const processIdentity = await requiredProcessStartIdentity(process.pid, deadline)
     return {
       token: crypto.randomUUID(),
       handoffToken: crypto.randomUUID(),
@@ -348,9 +382,8 @@ export class DaemonStorage {
       token: crypto.randomUUID(),
       handoffToken: null,
       pid: process.pid,
-      processIdentity: await processStartIdentity(process.pid, deadline),
+      processIdentity: await requiredProcessStartIdentity(process.pid, deadline),
     }
-    if (!lock.processIdentity) throw new Error('Unable to verify daemon process identity.')
     if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
       return true
     }

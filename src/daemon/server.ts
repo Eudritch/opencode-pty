@@ -7,7 +7,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from './types.ts'
-import { processStartIdentity, type DaemonStorage } from './storage.ts'
+import { requiredProcessStartIdentity, type DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
 import { effectiveMaxOutputBytes } from './supervisor.ts'
 import { realpathSync } from 'node:fs'
@@ -53,8 +53,7 @@ export class DaemonServer implements Disposable {
     try {
       await this.supervisor.initialize()
       this.ownershipSecret = await this.storage.ownershipSecret()
-      this.processIdentity = (await processStartIdentity(process.pid, deadline)) ?? ''
-      if (!this.processIdentity) throw new Error('Unable to verify daemon process identity.')
+      this.processIdentity = await requiredProcessStartIdentity(process.pid, deadline)
       this.token ||= crypto.randomUUID().replaceAll('-', '')
       if (await this.storage.descriptorOwnerAlive(deadline)) {
         throw new Error('PTY daemon is already running.')

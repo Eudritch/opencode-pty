@@ -2,9 +2,16 @@ import { afterEach, expect, test } from 'bun:test'
 import { existsSync, realpathSync, watch } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
-import { DaemonStorage, processStartIdentity } from '../src/daemon/storage.ts'
+import {
+  DaemonStorage,
+  parseWindowsProcessIdentity,
+  processIdentityProbe,
+  processStartIdentity,
+  requiredProcessStartIdentity,
+  windowsProcessIdentityCommand,
+} from '../src/daemon/storage.ts'
 import { WorkerClient as NativeWorkerClient } from '../src/daemon/worker-client.ts'
 import {
   effectiveMaxOutputBytes,
@@ -524,6 +531,61 @@ test('private and signing key environment values are redacted across chunks', ()
       `${redactor.write('before private-')}${redactor.write('key-value after')}${redactor.finish()}`
     ).toBe('before [REDACTED] after')
   }
+})
+
+test('Windows process identities require the queried PID and a creation time', () => {
+  expect(parseWindowsProcessIdentity(42, 'windows:42:133713371337')).toBe('windows:42:133713371337')
+  expect(parseWindowsProcessIdentity(42, 'windows:43:133713371337')).toBeNull()
+  expect(parseWindowsProcessIdentity(42, 'windows:42:0')).toBeNull()
+  expect(parseWindowsProcessIdentity(42, 'windows:42:0001')).toBeNull()
+  expect(parseWindowsProcessIdentity(42, 'unexpected output')).toBeNull()
+})
+
+test('Windows process probe uses the system PowerShell path', () => {
+  expect(windowsProcessIdentityCommand(42, 'C:\\Windows')?.[0]).toBe(
+    resolve('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  )
+  expect(windowsProcessIdentityCommand(42, 'C:\\Windows')?.at(-1)).toContain('Get-Process -Id 42')
+  expect(windowsProcessIdentityCommand(42, '')).toBeNull()
+})
+
+test('process identity probe returns null when its executable cannot launch', async () => {
+  expect(
+    await processIdentityProbe(
+      ['opencode-pty-process-identity-probe-does-not-exist'],
+      Date.now() + 1000
+    )
+  ).toBeNull()
+})
+
+test('process identity probe stops at its deadline', async () => {
+  expect(
+    await processIdentityProbe(
+      [process.execPath, '-e', 'setTimeout(() => {}, 10_000)'],
+      Date.now() + 25
+    )
+  ).toBeNull()
+})
+
+test('Windows process identity probe identifies the current process', async () => {
+  if (process.platform !== 'win32') return
+  expect(await processStartIdentity(process.pid)).toMatch(
+    new RegExp(`^windows:${process.pid}:\\d+$`)
+  )
+})
+
+test('required process identity reports the failed probe', async () => {
+  await expect(requiredProcessStartIdentity(process.pid, Date.now())).rejects.toThrow(
+    /process.*probe failed/
+  )
+})
+
+test('start lock creation fails safely when its identity probe deadline expires', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-probe-failure-'))
+  roots.push(root)
+  await expect(new DaemonStorage(root).acquireStartLock(Date.now())).rejects.toThrow(
+    /process.*probe failed/
+  )
 })
 
 test('start locks retain live owners and recover exactly one dead owner', async () => {
