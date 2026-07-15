@@ -3,31 +3,6 @@
   "instructions": ["README.md"],
   "plugin": ["file:///C:/Users/User/Desktop/Need/05%20-%20Coding/opencode-pty/index.ts"],
   "permission": {
-    "bash": {
-      "bun typecheck": "allow",
-      "bun unittest": "allow",
-      "bun lint": "allow",
-      "bun format": "allow",
-      "bun build:prod": "allow",
-      "bun package:smoke": "allow",
-      "npm pack --dry-run": "allow",
-      "cargo fmt --check": "allow",
-      "cargo build --locked --workspace": "allow",
-      "cargo test --locked --workspace": "allow",
-      "cargo clippy --locked --workspace -- -D warnings": "allow",
-      "git status --short": "allow",
-      "git diff --check": "allow",
-      "git add worker/src/main.rs test/daemon.test.ts test/packaged-native-daemon.ts .github/workflows/ci.yml": "allow",
-      "git commit -m *": "allow",
-      "git push origin main": "allow",
-      "cargo fmt --check --manifest-path worker/Cargo.toml": "allow",
-      "cargo build --locked -p opencode-pty-worker": "allow",
-      "cargo test --locked -p opencode-pty-worker": "allow",
-      "cargo clippy --locked -p opencode-pty-worker -- -D warnings": "allow",
-      "bun test test/daemon.test.ts": "allow",
-      "bun test test/daemon.test.ts --test-name-pattern \"*\"": "allow",
-      "bun test test/daemon.test.ts --test-name-pattern start lock handoff permits one distinct daemon identity": "allow",
-      "bun test test/daemon.test.ts --test-name-pattern plugin client starts its daemon from the configured data directory": "allow"
-    }
+    "bash": "allow"
   }
 }
