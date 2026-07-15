@@ -135,9 +135,6 @@ function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot
     status: 'running',
     pid: 1,
     mode: 'pty',
-    stdout: '',
-    stderr: '',
-    journalOutput: '',
     stdoutBytes: 0,
     stderrBytes: 0,
     stdoutTruncated: false,
@@ -145,6 +142,8 @@ function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot
     nextSequence: 0,
     firstRetainedSequence: 0,
     outputTruncated: false,
+    outputLineCount: 0,
+    outputHasPartialLine: false,
     startedAt: new Date().toISOString(),
     timedOut: false,
     terminationRequested: false,
@@ -1975,7 +1974,7 @@ test('worker recovery rejects an authenticated health identity mismatch', async 
     fetch: () =>
       Response.json({
         ok: true,
-        result: { protocolVersion: 4, pid: 123, processIdentity: 'different-worker' },
+        result: { protocolVersion: 5, pid: 123, processIdentity: 'different-worker' },
       }),
   })
   const sessionDirectory = join(root, 'session')
@@ -1988,7 +1987,7 @@ test('worker recovery rejects an authenticated health identity mismatch', async 
       processIdentity: 'expected-worker',
       endpoint: server.url.origin,
       token,
-      protocolVersion: 4,
+      protocolVersion: 5,
     })
   )
   try {
@@ -1999,7 +1998,7 @@ test('worker recovery rejects an authenticated health identity mismatch', async 
         processIdentity: 'expected-worker',
         endpoint: server.url.origin,
         tokenFingerprint: new Bun.CryptoHasher('sha256').update(token).digest('hex'),
-        protocolVersion: 4,
+        protocolVersion: 5,
       })
     ).toBeNull()
   } finally {
@@ -2619,41 +2618,59 @@ test('lost sessions can only be discarded by explicit cleanup', async () => {
   expect(await storage.loadSessions()).toHaveLength(0)
 })
 
-test('native finalization resnapshots after journal output arrives', async () => {
+test('native monitor snapshots exclude journal output and persist terminal output interleaving', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-finalize-race-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
   const session = record(root, 'pty_native_finalization_race')
   await storage.writeSession(session)
-  const settled = workerSnapshot({
-    stdout: 'late\n',
-    journalOutput: 'late\n',
-    stdoutBytes: 5,
-    nextSequence: 5,
+  const running = workerSnapshot()
+  const terminal = workerSnapshot({
+    status: 'exited',
+    nextSequence: 11,
+    outputLineCount: 2,
+    exitedAt: new Date().toISOString(),
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
   })
+  let waits = 0
   const worker = {
-    snapshot: async () => {
+    wait: async () => {
+      waits += 1
+      if (waits === 1) return running
       await storage.appendOutput(session.id, [
-        { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'late\n' },
+        { startSequence: 0, endSequence: 6, timestamp: session.updatedAt, data: 'early\n' },
       ])
-      return settled
+      return terminal
     },
+    finalSnapshot: async () => {
+      await storage.appendOutput(session.id, [
+        { startSequence: 6, endSequence: 11, timestamp: session.updatedAt, data: 'late\n' },
+      ])
+      return terminal
+    },
+    shutdown: async () => terminal,
   }
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(session.id, worker)
 
   await (
     supervisor as unknown as {
-      finishNative: (
+      monitorNative: (
         record: SessionRecord,
-        worker: unknown,
-        result: WorkerSnapshot
+        worker: unknown
       ) => Promise<unknown>
     }
-  ).finishNative(session, worker, workerSnapshot())
+  ).monitorNative(session, worker)
 
-  expect(session).toMatchObject({ nextSequence: 5, outputBytes: 5, lineCount: 1 })
+  expect(JSON.stringify(running)).not.toContain('journalOutput')
+  expect(session).toMatchObject({ nextSequence: 11, outputBytes: 11, lineCount: 2 })
+  expect(await storage.readOutput(session.id)).toBe('early\nlate\n')
   expect(await storage.loadSessions()).toMatchObject([
-    { id: session.id, nextSequence: 5, outputBytes: 5, status: 'running' },
+    { id: session.id, nextSequence: 11, outputBytes: 11, lineCount: 2, status: 'exited' },
   ])
 })
 
@@ -2669,15 +2686,10 @@ test('native finalization persists a lost storage failure', async () => {
       supervisor as unknown as {
         finishNative: (
           record: SessionRecord,
-          worker: unknown,
           result: WorkerSnapshot
         ) => Promise<unknown>
       }
-    ).finishNative(
-      session,
-      { snapshot: async () => workerSnapshot({ exitCode: -1 }) },
-      workerSnapshot({ exitCode: -1 })
-    )
+    ).finishNative(session, workerSnapshot({ exitCode: -1 }))
   ).rejects.toMatchObject({ code: 'ESTORAGE' })
   expect(await storage.loadSessions()).toMatchObject([
     {
@@ -2710,13 +2722,12 @@ test('Windows native high exit status persists as an unsigned code', async () =>
 
   await (
     supervisor as unknown as {
-      finishNative: (
-        record: SessionRecord,
-        worker: unknown,
-        result: WorkerSnapshot
-      ) => Promise<unknown>
-    }
-  ).finishNative(session, { snapshot: async () => exited }, exited)
+        finishNative: (
+          record: SessionRecord,
+          result: WorkerSnapshot
+        ) => Promise<unknown>
+      }
+    ).finishNative(session, exited)
 
   expect(await storage.loadSessions()).toMatchObject([
     {
@@ -2739,7 +2750,7 @@ test('stale worker recovery is bounded and parallel', async () => {
       startIdentity: 'start',
       processIdentity: 'identity',
       endpoint: 'http://127.0.0.1:1',
-      protocolVersion: 4,
+      protocolVersion: 5,
     }
     await storage.writeSession(session)
   }
@@ -2776,7 +2787,7 @@ test('restart cleanup stops a reconnected conversation worker published before r
     processIdentity: 'identity',
     endpoint: 'http://127.0.0.1:1',
     tokenFingerprint: 'fingerprint',
-    protocolVersion: 4,
+    protocolVersion: 5,
   }
   await storage.writeSession(session)
   let allowReconnect: () => void = () => {}
@@ -2791,9 +2802,6 @@ test('restart cleanup stops a reconnected conversation worker published before r
     status: 'exited',
     pid: 1,
     mode: 'pty',
-    stdout: '',
-    stderr: '',
-    journalOutput: '',
     stdoutBytes: 0,
     stderrBytes: 0,
     stdoutTruncated: false,
@@ -2801,6 +2809,8 @@ test('restart cleanup stops a reconnected conversation worker published before r
     nextSequence: 0,
     firstRetainedSequence: 0,
     outputTruncated: false,
+    outputLineCount: 0,
+    outputHasPartialLine: false,
     exitReason: 'stopped',
     startedAt: session.createdAt,
     exitedAt: new Date().toISOString(),
@@ -2830,6 +2840,7 @@ test('restart cleanup stops a reconnected conversation worker published before r
       stops += 1
       return terminal
     },
+    finalSnapshot: async () => terminal,
     shutdown: async () => terminal,
   }
   const reconnect = NativeWorkerClient.reconnect

@@ -827,7 +827,7 @@ export class DaemonStorage {
         validText(value.endpoint) &&
         validNonnegativeInteger(value.protocolVersion) &&
         value.protocolVersion >= 1 &&
-        value.protocolVersion <= 4 &&
+        value.protocolVersion <= 5 &&
         (value.tokenFingerprint === undefined || validText(value.tokenFingerprint))
       )
     }

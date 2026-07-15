@@ -269,7 +269,7 @@ export class SessionSupervisor {
       record.directChildExited ??= record.terminationConfirmed
       record.pendingCleanup ??= false
       this.records.set(record.id, record)
-      if (record.worker && record.worker.protocolVersion !== 4) {
+      if (record.worker && record.worker.protocolVersion !== 5) {
         record.status = 'lost'
         record.terminationConfirmed = false
         record.exitReason = {
@@ -815,7 +815,7 @@ export class SessionSupervisor {
       try {
         let result = await worker.wait(1000)
         while (!this.nativeTerminal(result)) {
-          await this.finishNative(record, worker, result)
+          await this.finishNative(record, result)
           result = await worker.wait(1000)
         }
         await this.finalizeNative(record, worker, result)
@@ -875,10 +875,17 @@ export class SessionSupervisor {
     worker: WorkerClient,
     result: WorkerSnapshot
   ): Promise<ExecResult | PTYSessionInfo> {
+    let final = result
     try {
-      return await this.finishNative(record, worker, result)
+      if (this.nativeTerminal(result)) final = await worker.finalSnapshot()
+      return await this.finishNative(record, final)
+    } catch (error) {
+      await this.persistNativeFinalizationFailure(record, final, error)
+      const failure = new Error(`Native finalization failed: ${String(error)}`)
+      Object.assign(failure, { code: 'ESTORAGE' })
+      throw failure
     } finally {
-      if (this.nativeTerminal(result)) {
+      if (this.nativeTerminal(final)) {
         try {
           await worker.shutdown().catch(() => undefined)
         } finally {
@@ -890,25 +897,15 @@ export class SessionSupervisor {
 
   private async finishNative(
     record: SessionRecord,
-    worker: WorkerClient,
     result: WorkerSnapshot
   ): Promise<ExecResult | PTYSessionInfo> {
-    const previous = structuredClone(record)
-    try {
-      result = await worker.snapshot()
-    } catch (error) {
-      await this.persistNativeFinalizationFailure(record, result, error)
-      const failure = new Error(`Native finalization failed: ${String(error)}`)
-      Object.assign(failure, { code: 'ESTORAGE' })
-      throw failure
-    }
     record.pid = result.pid
     record.nextSequence = result.nextSequence
     record.firstRetainedSequence = result.firstRetainedSequence
     record.outputBytes = result.stdoutBytes + result.stderrBytes
     record.outputTruncated = result.outputTruncated
     record.timedOut = result.timedOut
-    if (record.mode === 'exec')
+    if (record.mode === 'exec' && result.stdout !== undefined && result.stderr !== undefined)
       record.execOutput = {
         stdout: result.stdout,
         stderr: result.stderr,
@@ -963,13 +960,12 @@ export class SessionSupervisor {
       record.mode === 'exec'
         ? result.stdoutBytes + result.stderrBytes
         : result.nextSequence - result.firstRetainedSequence
-    record.lineCount = lineCount(result.journalOutput)
-    record.outputHasPartialLine =
-      Boolean(result.journalOutput) && !result.journalOutput.endsWith('\n')
+    record.lineCount = result.outputLineCount
+    record.outputHasPartialLine = result.outputHasPartialLine
     try {
       await this.storage.writeSession(record)
     } catch (error) {
-      await this.persistNativeFinalizationFailure(record, result, error, previous)
+      await this.persistNativeFinalizationFailure(record, result, error)
       const failure = new Error(`Native finalization failed: ${String(error)}`)
       Object.assign(failure, { code: 'ESTORAGE' })
       throw failure
@@ -991,8 +987,8 @@ export class SessionSupervisor {
     if (record.mode === 'pty') return this.toInfo(record)
     return {
       session: { id: record.id, status: record.status, mode: 'exec', pid: record.pid },
-      stdout: result.stdout,
-      stderr: result.stderr,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
       exitCode: record.exitCode,
       exitSignal: record.exitSignal,
       timedOut: record.timedOut,
@@ -1084,7 +1080,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finishNative(record, native, await native.snapshot())
+      await this.finishNative(record, await native.snapshot())
     }
     return record ? this.toInfo(record) : null
   }
@@ -1094,7 +1090,7 @@ export class SessionSupervisor {
     await Promise.all(
       [...this.nativeWorkers.entries()].map(async ([id, worker]) => {
         const record = this.records.get(id)
-        if (record?.worker) await this.finishNative(record, worker, await worker.snapshot())
+        if (record?.worker) await this.finishNative(record, await worker.snapshot())
       })
     )
     return [...this.records.values()].map((record) => this.toInfo(record))
@@ -1138,7 +1134,7 @@ export class SessionSupervisor {
     const record = this.records.get(id)
     const native = this.nativeWorkers.get(id)
     if (record?.worker && native) {
-      await this.finishNative(record, native, await native.snapshot())
+      await this.finishNative(record, await native.snapshot())
     }
     return record?.execOutput
       ? { ...record.execOutput, containment: record.containment, termination: record.termination }

@@ -68,7 +68,7 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
     typeof descriptor.endpoint === 'string' &&
     typeof descriptor.token === 'string' &&
     descriptor.token.length >= 16 &&
-    descriptor.protocolVersion === 4
+    descriptor.protocolVersion === 5
   )
 }
 
@@ -483,6 +483,10 @@ export class WorkerClient {
     return this.call('snapshot')
   }
 
+  async finalSnapshot(): Promise<WorkerSnapshot> {
+    return this.call('finalSnapshot', {}, 10_000)
+  }
+
   private async health(): Promise<{
     protocolVersion: number
     pid: number
@@ -595,9 +599,8 @@ export interface WorkerSnapshot {
   status: 'running' | 'exited' | 'lost'
   pid: number
   mode: 'exec' | 'pty'
-  stdout: string
-  stderr: string
-  journalOutput: string
+  stdout?: string
+  stderr?: string
   stdoutBytes: number
   stderrBytes: number
   stdoutTruncated: boolean
@@ -605,6 +608,8 @@ export interface WorkerSnapshot {
   nextSequence: number
   firstRetainedSequence: number
   outputTruncated: boolean
+  outputLineCount: number
+  outputHasPartialLine: boolean
   exitCode?: number | null
   exitSignal?: string | null
   exitReason?:

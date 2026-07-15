@@ -237,6 +237,7 @@ struct State {
     first_retained_sequence: usize,
     output_truncated: bool,
     retained_bytes: usize,
+    retained_newlines: usize,
     chunks: Vec<JournalChunk>,
     exit_code: Option<u32>,
     exit_signal: Option<String>,
@@ -2053,6 +2054,7 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
                 }
                 state.next_sequence = end;
                 state.retained_bytes += kept.len();
+                state.retained_newlines += kept.bytes().filter(|byte| *byte == b'\n').count();
                 if worker.mode == "exec" {
                     if stdout {
                         state.stdout.push_str(kept);
@@ -2075,6 +2077,8 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
                         break;
                     }
                     state.retained_bytes -= removed.data.len();
+                    state.retained_newlines -=
+                        removed.data.bytes().filter(|byte| *byte == b'\n').count();
                     state.output_truncated = true;
                 }
                 state.first_retained_sequence = state
@@ -2332,7 +2336,7 @@ fn monitor(worker: Arc<Worker>) {
     });
 }
 
-fn snapshot(worker: &Arc<Worker>) -> Value {
+fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
     observe_exit(worker);
     update_reader_drain(worker);
     let containment = containment_report(&worker.containment);
@@ -2364,9 +2368,8 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
     } else {
         "running"
     };
-    json!({
-        "status": status, "pid": pid, "mode": worker.mode, "stdout": state.stdout, "stderr": state.stderr,
-        "journalOutput": state.chunks.iter().map(|chunk| chunk.data.as_str()).collect::<String>(),
+    let mut result = json!({
+        "status": status, "pid": pid, "mode": worker.mode,
         "stdoutBytes": state.stdout_bytes, "stderrBytes": state.stderr_bytes,
         "stdoutTruncated": state.stdout_truncated, "stderrTruncated": state.stderr_truncated,
         "nextSequence": state.next_sequence, "firstRetainedSequence": state.first_retained_sequence,
@@ -2378,8 +2381,17 @@ fn snapshot(worker: &Arc<Worker>) -> Value {
         "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
         "readerFailure": if reader_failure.is_empty() { Value::Null } else { Value::String(reader_failure) },
         "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
+        "outputLineCount": state.retained_newlines
+            + usize::from(state.retained_bytes > 0 && !state.chunks.last().is_some_and(|chunk| chunk.data.ends_with('\n'))),
+        "outputHasPartialLine": state.retained_bytes > 0
+            && !state.chunks.last().is_some_and(|chunk| chunk.data.ends_with('\n')),
         "containment": containment, "termination": state.termination,
-    })
+    });
+    if include_exec_output {
+        result["stdout"] = Value::String(state.stdout.clone());
+        result["stderr"] = Value::String(state.stderr.clone());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2413,6 +2425,17 @@ mod tests {
                 .unwrap()
                 .contains("injected read failure")
         );
+    }
+
+    #[test]
+    fn live_snapshot_source_never_serializes_journal_data() {
+        let source = include_str!("main.rs");
+        let start = source.find("fn snapshot(").expect("snapshot function");
+        let end = source[start..]
+            .find("#[cfg(test)]")
+            .expect("snapshot function end")
+            + start;
+        assert!(!source[start..end].contains("journalOutput"));
     }
 
     #[test]
@@ -2603,7 +2626,7 @@ mod tests {
                 .is_none()
         );
         monitor(worker.clone());
-        let result = wait_for_final_snapshot(&worker);
+        let result = wait_for_final_snapshot(&worker, false);
         assert_eq!(result["status"], "lost");
         assert_eq!(result["timedOut"], true);
         assert_eq!(result["terminationConfirmed"], true);
@@ -2760,15 +2783,15 @@ mod tests {
 }
 
 #[cfg(windows)]
-fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
+fn wait_for_final_snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
     // terminate_contained already performed the bounded Job drain poll.
-    snapshot(worker)
+    snapshot(worker, include_exec_output)
 }
 
 #[cfg(not(windows))]
-fn wait_for_final_snapshot(worker: &Arc<Worker>) -> Value {
+fn wait_for_final_snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
     loop {
-        let result = snapshot(worker);
+        let result = snapshot(worker, include_exec_output);
         if result["status"] != "running" {
             return result;
         }
@@ -2787,7 +2810,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
     match operation {
         "health" => Ok((
             json!({
-                "protocolVersion": 4,
+                "protocolVersion": 5,
                 "pid": std::process::id(),
                 "processIdentity": process_identity().map_err(|message| WorkerError {
                     code: "process",
@@ -2796,7 +2819,8 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             }),
             false,
         )),
-        "snapshot" => Ok((snapshot(worker), false)),
+        "snapshot" => Ok((snapshot(worker, false), false)),
+        "finalSnapshot" => Ok((wait_for_final_snapshot(worker, true), false)),
         "write" => {
             let data = request
                 .get("data")
@@ -2963,7 +2987,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                 .min(3_600_000);
             let deadline = SystemTime::now() + Duration::from_millis(timeout_ms);
             loop {
-                let result = snapshot(worker);
+                let result = snapshot(worker, false);
                 if result["status"] != "running" || SystemTime::now() >= deadline {
                     return Ok((result, false));
                 }
@@ -2972,7 +2996,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
         }
         "stop" => {
             terminate_and_wait(worker, "stopped");
-            Ok((wait_for_final_snapshot(worker), false))
+            Ok((wait_for_final_snapshot(worker, false), false))
         }
         "shutdown" => {
             if !worker
@@ -2983,7 +3007,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
             {
                 terminate_and_wait(worker, "stopped");
             }
-            Ok((wait_for_final_snapshot(worker), true))
+            Ok((wait_for_final_snapshot(worker, false), true))
         }
         _ => Err(WorkerError {
             code: "validation",
@@ -3101,7 +3125,7 @@ fn main() -> Result<(), String> {
             listener.local_addr().map_err(|error| error.to_string())?
         ),
         token: bootstrap.worker_control_token.clone(),
-        protocol_version: 4,
+        protocol_version: 5,
     };
     write_atomic(
         &descriptor_path,
