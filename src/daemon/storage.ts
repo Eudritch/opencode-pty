@@ -34,7 +34,10 @@ interface StartLockLease {
   handoffToken: string
 }
 
-export async function processStartIdentity(pid: number): Promise<string | null> {
+export async function processStartIdentity(
+  pid: number,
+  deadline = Date.now() + 5000
+): Promise<string | null> {
   if (!Number.isSafeInteger(pid) || pid < 1) return null
   if (process.platform !== 'win32' && process.platform !== 'darwin') {
     try {
@@ -60,8 +63,21 @@ export async function processStartIdentity(pid: number): Promise<string | null> 
       : ['ps', '-p', String(pid), '-o', 'lstart=']
   try {
     const child = Bun.spawn({ cmd: command, stdout: 'pipe', stderr: 'ignore' })
-    const output = (await new Response(child.stdout).text()).trim()
-    await child.exited
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const result = await Promise.race([
+      child.exited.then(async () => {
+        const output = await new Response(child.stdout).text()
+        return { output }
+      }),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, deadline - Date.now()), null)
+      }),
+    ]).finally(() => clearTimeout(timer))
+    if (!result) {
+      child.kill()
+      return null
+    }
+    const output = result.output.trim()
     return output ? (process.platform === 'win32' ? output : `darwin:${pid}:${output}`) : null
   } catch {
     return null
@@ -198,13 +214,14 @@ export class DaemonStorage {
     }
   }
 
-  async descriptorOwnerAlive(): Promise<boolean> {
+  async descriptorOwnerAlive(deadline?: number): Promise<boolean> {
     const descriptor = await this.readDescriptor()
     if (!descriptor || !this.validDescriptor(descriptor)) return false
-    const identity = await processStartIdentity(descriptor.pid)
+    const identity = await processStartIdentity(descriptor.pid, deadline)
     return identity
       ? identity === descriptor.processIdentity
-      : this.authenticatedDescriptorHealthy(descriptor)
+      : this.processExists(descriptor.pid) ||
+          this.authenticatedDescriptorHealthy(descriptor, deadline)
   }
 
   async ownershipSecret(): Promise<string> {
@@ -234,21 +251,21 @@ export class DaemonStorage {
     }
   }
 
-  async acquireStartLock(): Promise<StartLockLease | null> {
+  async acquireStartLock(deadline?: number): Promise<StartLockLease | null> {
     await this.initialize()
-    const lock = await this.newStartLock()
+    const lock = await this.newStartLock(deadline)
     if (await this.writeExclusiveLock(this.startLockPath, lock)) {
       return { token: lock.token, handoffToken: lock.handoffToken }
     }
     const current = await this.readStartLock()
-    if (current && (await this.startLockOwnerAlive(current))) return null
-    if (!(await this.acquireStartLockRecovery())) return null
+    if (current && (await this.startLockOwnerAlive(current, deadline))) return null
+    if (!(await this.acquireStartLockRecovery(true, deadline))) return null
     try {
       const replacement = await this.readStartLock()
-      if (replacement && (await this.startLockOwnerAlive(replacement))) return null
+      if (replacement && (await this.startLockOwnerAlive(replacement, deadline))) return null
       await rm(this.startLockPath, { force: true })
       await this.syncDirectory(this.root)
-      const recoveredLock = await this.newStartLock()
+      const recoveredLock = await this.newStartLock(deadline)
       if (await this.writeExclusiveLock(this.startLockPath, recoveredLock))
         return { token: recoveredLock.token, handoffToken: recoveredLock.handoffToken }
       return null
@@ -257,8 +274,8 @@ export class DaemonStorage {
     }
   }
 
-  private async newStartLock(): Promise<StartLock & { handoffToken: string }> {
-    const processIdentity = await processStartIdentity(process.pid)
+  private async newStartLock(deadline?: number): Promise<StartLock & { handoffToken: string }> {
+    const processIdentity = await processStartIdentity(process.pid, deadline)
     if (!processIdentity) throw new Error('Unable to verify daemon process identity.')
     return {
       token: crypto.randomUUID(),
@@ -268,18 +285,20 @@ export class DaemonStorage {
     }
   }
 
-  async claimStartLock(handoffToken: string): Promise<string | null> {
+  async claimStartLock(handoffToken: string, deadline?: number): Promise<string | null> {
     // Claim before Windows DACL and identity probes; the handoff token authorizes this replacement.
-    if (!(await this.acquireStartLockRecovery(false))) return null
+    if (!(await this.acquireStartLockRecovery(false, deadline))) return null
     try {
       const lock = await this.readStartLock()
       if (!lock || lock.handoffToken !== handoffToken) return null
+      const processIdentity = await processStartIdentity(process.pid, deadline)
+      if (!processIdentity) return null
       const token = crypto.randomUUID()
       await this.writeStartLock({
         token,
         handoffToken: null,
         pid: process.pid,
-        processIdentity: null,
+        processIdentity,
       })
       return token
     } finally {
@@ -287,12 +306,13 @@ export class DaemonStorage {
     }
   }
 
-  async releaseStartLock(token: string): Promise<void> {
+  async releaseStartLock(token: string, deadline?: number): Promise<void> {
     const lock = await this.readStartLock()
-    const processIdentity = await processStartIdentity(process.pid)
+    const processIdentity = await processStartIdentity(process.pid, deadline)
     if (
       lock?.token === token &&
       lock.pid === process.pid &&
+      processIdentity !== null &&
       (lock.processIdentity === null || lock.processIdentity === processIdentity)
     ) {
       await rm(this.startLockPath, { force: true })
@@ -324,12 +344,15 @@ export class DaemonStorage {
     await this.writeAtomic(this.startLockPath, JSON.stringify(lock))
   }
 
-  private async acquireStartLockRecovery(verifyIdentity = true): Promise<boolean> {
+  private async acquireStartLockRecovery(
+    verifyIdentity = true,
+    deadline?: number
+  ): Promise<boolean> {
     const lock: StartLock = {
       token: crypto.randomUUID(),
       handoffToken: null,
       pid: process.pid,
-      processIdentity: verifyIdentity ? await processStartIdentity(process.pid) : null,
+      processIdentity: verifyIdentity ? await processStartIdentity(process.pid, deadline) : null,
     }
     if (verifyIdentity && !lock.processIdentity)
       throw new Error('Unable to verify daemon process identity.')
@@ -339,11 +362,13 @@ export class DaemonStorage {
     const recovery = await this.readStartLock(this.startLockRecoveryPath)
     if (
       recovery &&
-      (verifyIdentity ? await this.startLockOwnerAlive(recovery) : this.processExists(recovery.pid))
+      (verifyIdentity
+        ? await this.startLockOwnerAlive(recovery, deadline)
+        : this.processExists(recovery.pid))
     )
       return false
     await rm(this.startLockRecoveryPath, { force: true })
-    return this.acquireStartLockRecovery(verifyIdentity)
+    return this.acquireStartLockRecovery(verifyIdentity, deadline)
   }
 
   private async writeExclusiveLock(path: string, lock: StartLock): Promise<boolean> {
@@ -368,9 +393,9 @@ export class DaemonStorage {
     }
   }
 
-  private async startLockOwnerAlive(lock: StartLock): Promise<boolean> {
+  private async startLockOwnerAlive(lock: StartLock, deadline?: number): Promise<boolean> {
     if (!lock.processIdentity) return this.processExists(lock.pid)
-    const identity = await processStartIdentity(lock.pid)
+    const identity = await processStartIdentity(lock.pid, deadline)
     return identity ? identity === lock.processIdentity : this.processExists(lock.pid)
   }
 
@@ -394,8 +419,16 @@ export class DaemonStorage {
     )
   }
 
-  private async authenticatedDescriptorHealthy(descriptor: DaemonDescriptor): Promise<boolean> {
+  private async authenticatedDescriptorHealthy(
+    descriptor: DaemonDescriptor,
+    deadline?: number
+  ): Promise<boolean> {
     try {
+      const timeout = Math.min(
+        250,
+        deadline === undefined ? 250 : Math.max(0, deadline - Date.now())
+      )
+      if (timeout === 0) return false
       const response = await fetch(`${descriptor.endpoint}/rpc`, {
         method: 'POST',
         headers: {
@@ -407,7 +440,7 @@ export class DaemonStorage {
           version: descriptor.protocolVersion,
           operation: 'health',
         }),
-        signal: AbortSignal.timeout(250),
+        signal: AbortSignal.timeout(timeout),
       })
       const result = (await response.json()) as {
         ok?: boolean

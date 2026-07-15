@@ -16,8 +16,6 @@ import { realpathSync } from 'node:fs'
 const RPC_TIMEOUT_MS = 5000
 const DAEMON_START_TIMEOUT_MS = 20_000
 const STARTUP_STDERR_TAIL_CHARS = 4096
-const UNSAFE_STARTUP_STDERR =
-  /\b(?:token|secret|password|passwd|api[_-]?key|authorization|bearer)\b|(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=/i
 
 export function resolveDaemonLauncher(which: (command: string) => string | null): string {
   const launcher = which('bun')
@@ -62,22 +60,8 @@ async function captureStartupStderr(
   }
 }
 
-function safeStartupStderrTail(
-  stderr: string,
-  launchToken: string,
-  launchOptions: string
-): string | null {
-  const tail = stderr.trim()
-  if (
-    !tail ||
-    UNSAFE_STARTUP_STDERR.test(tail) ||
-    tail.includes(launchToken) ||
-    tail.includes(launchOptions) ||
-    Object.values(process.env).some((value) => value && value.length > 3 && tail.includes(value))
-  ) {
-    return null
-  }
-  return tail
+export function safeStartupStderrTail(..._values: string[]): null {
+  return null
 }
 
 function isSafeDescriptor(value: unknown): value is DaemonDescriptor {
@@ -269,13 +253,13 @@ export class DaemonClient {
   }
 
   private async ensureDaemon(): Promise<DaemonDescriptor> {
+    const deadline = daemonReadinessDeadline(Date.now())
     if (this.descriptor && isSafeDescriptor(this.descriptor)) {
-      const state = await this.probe(this.descriptor)
+      const state = await this.probe(this.descriptor, deadline)
       if (state === 'healthy') return this.descriptor
       if (state === 'incompatible') throw this.incompatibleProtocol(this.descriptor)
     }
     this.descriptor = null
-    let deadline: number | undefined
     let startLock: { token: string; handoffToken: string } | null = null
     let started = false
     let startupStderr = ''
@@ -284,7 +268,7 @@ export class DaemonClient {
     let startupExitCode: number | undefined
     let startupStderrDone: Promise<void> | undefined
     try {
-      while (deadline === undefined || Date.now() < deadline) {
+      while (Date.now() < deadline) {
         let descriptor: unknown = null
         try {
           descriptor = await this.storage.readDescriptor()
@@ -292,22 +276,20 @@ export class DaemonClient {
           // Invalid descriptor data is only replaced by the lock owner.
         }
         if (isSafeDescriptor(descriptor)) {
-          const state = await this.probe(descriptor)
+          const state = await this.probe(descriptor, deadline)
           if (state === 'healthy') {
             this.descriptor = descriptor
             return descriptor
           }
           if (state === 'incompatible') throw this.incompatibleProtocol(descriptor)
-          if (await this.storage.descriptorOwnerAlive()) {
-            deadline ??= daemonReadinessDeadline(Date.now())
+          if (await this.storage.descriptorOwnerAlive(deadline)) {
             await Bun.sleep(25)
             continue
           }
         }
         if (!startLock) {
-          startLock = await this.storage.acquireStartLock()
+          startLock = await this.storage.acquireStartLock(deadline)
           if (startLock) continue
-          deadline ??= daemonReadinessDeadline(Date.now())
         }
         if (startLock && !started) {
           let lockedDescriptor: unknown = null
@@ -317,7 +299,7 @@ export class DaemonClient {
             // This lock owner may replace an unreadable descriptor.
           }
           if (isSafeDescriptor(lockedDescriptor)) {
-            const state = await this.probe(lockedDescriptor)
+            const state = await this.probe(lockedDescriptor, deadline)
             if (state === 'healthy') {
               this.descriptor = lockedDescriptor
               return lockedDescriptor
@@ -361,7 +343,6 @@ export class DaemonClient {
             startupExitCode = exitCode
           })
           started = true
-          deadline = daemonReadinessDeadline(Date.now())
           continue
         }
         if (started && startupExitCode !== undefined) {
@@ -374,7 +355,7 @@ export class DaemonClient {
         await Bun.sleep(25)
       }
     } finally {
-      if (startLock) await this.storage.releaseStartLock(startLock.token)
+      if (startLock) await this.storage.releaseStartLock(startLock.token, deadline)
     }
     const diagnostic = safeStartupStderrTail(startupStderr, startupToken, startupOptions)
     throw new Error(
@@ -383,9 +364,15 @@ export class DaemonClient {
   }
 
   private async probe(
-    descriptor: DaemonDescriptor
+    descriptor: DaemonDescriptor,
+    deadline?: number
   ): Promise<'healthy' | 'incompatible' | 'unreachable'> {
     try {
+      const timeout = Math.min(
+        250,
+        deadline === undefined ? 250 : Math.max(0, deadline - Date.now())
+      )
+      if (timeout === 0) return 'unreachable'
       const response = await fetch(`${descriptor.endpoint}/rpc`, {
         method: 'POST',
         headers: {
@@ -397,7 +384,7 @@ export class DaemonClient {
           version: descriptor.protocolVersion,
           operation: 'health',
         }),
-        signal: AbortSignal.timeout(250),
+        signal: AbortSignal.timeout(timeout),
       })
       const result = (await response.json()) as RpcResponse<{
         protocolVersion: number

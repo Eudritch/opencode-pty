@@ -43,19 +43,20 @@ export class DaemonServer implements Disposable {
   ) {}
 
   async start(): Promise<DaemonDescriptor> {
+    const deadline = Date.now() + 20_000
     const startLockToken = this.startLockHandoffToken
-      ? await this.storage.claimStartLock(this.startLockHandoffToken)
-      : (await this.storage.acquireStartLock())?.token
+      ? await this.storage.claimStartLock(this.startLockHandoffToken, deadline)
+      : (await this.storage.acquireStartLock(deadline))?.token
     if (!startLockToken) {
       throw new Error('PTY daemon start lock was lost.')
     }
     try {
       await this.supervisor.initialize()
       this.ownershipSecret = await this.storage.ownershipSecret()
-      this.processIdentity = (await processStartIdentity(process.pid)) ?? ''
+      this.processIdentity = (await processStartIdentity(process.pid, deadline)) ?? ''
       if (!this.processIdentity) throw new Error('Unable to verify daemon process identity.')
       this.token ||= crypto.randomUUID().replaceAll('-', '')
-      if (await this.storage.descriptorOwnerAlive()) {
+      if (await this.storage.descriptorOwnerAlive(deadline)) {
         throw new Error('PTY daemon is already running.')
       }
       this.server = Bun.serve({
@@ -71,12 +72,12 @@ export class DaemonServer implements Disposable {
         token: this.token,
       }
       await this.storage.writeDescriptor(descriptor)
-      await this.storage.releaseStartLock(startLockToken)
+      await this.storage.releaseStartLock(startLockToken, deadline)
       return descriptor
     } catch (error) {
       this.server?.stop(true)
       this.server = null
-      await this.storage.releaseStartLock(startLockToken)
+      await this.storage.releaseStartLock(startLockToken, deadline)
       throw error
     }
   }

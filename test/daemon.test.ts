@@ -21,6 +21,7 @@ import {
   DaemonClient,
   ownerContext,
   resolveDaemonLauncher,
+  safeStartupStderrTail,
 } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine, formatSessionInfo } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
@@ -657,6 +658,38 @@ test('start locks reject reused PIDs with a different process identity', async (
   expect(typeof token?.token).toBe('string')
   expect(typeof token?.handoffToken).toBe('string')
   if (token) await storage.releaseStartLock(token.token)
+})
+
+test('claimed start locks recover a reused PID', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-claimed-lock-identity-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const identity = await processStartIdentity(process.pid)
+  if (!identity) return
+  const lock = await storage.acquireStartLock()
+  if (!lock) throw new Error('Expected start lock.')
+  const claimed = await storage.claimStartLock(lock.handoffToken)
+  if (!claimed) throw new Error('Expected claimed start lock.')
+  const persisted = JSON.parse(await readFile(join(root, 'daemon-start.lock'), 'utf8')) as {
+    processIdentity: string | null
+  }
+  expect(persisted.processIdentity).toBe(identity)
+  await writeFile(
+    join(root, 'daemon-start.lock'),
+    JSON.stringify({
+      token: claimed,
+      handoffToken: null,
+      pid: process.pid,
+      processIdentity: `${identity}-old`,
+    })
+  )
+  const recovered = await storage.acquireStartLock()
+  expect(typeof recovered?.token).toBe('string')
+  if (recovered) await storage.releaseStartLock(recovered.token)
+})
+
+test('startup stderr never reports a three-character environment secret', () => {
+  expect(safeStartupStderrTail('daemon failed: abc', 'token', 'options')).toBeNull()
 })
 
 test('descriptor ownership rejects a reused PID with a different process identity', async () => {
