@@ -43,43 +43,42 @@ export class DaemonServer implements Disposable {
   ) {}
 
   async start(): Promise<DaemonDescriptor> {
-    await this.supervisor.initialize()
-    this.ownershipSecret = await this.storage.ownershipSecret()
-    this.processIdentity = (await processStartIdentity(process.pid)) ?? ''
-    if (!this.processIdentity) throw new Error('Unable to verify daemon process identity.')
-    this.token ||= crypto.randomUUID().replaceAll('-', '')
     const startLockToken = this.startLockHandoffToken
       ? await this.storage.claimStartLock(this.startLockHandoffToken)
       : (await this.storage.acquireStartLock())?.token
     if (!startLockToken) {
       throw new Error('PTY daemon start lock was lost.')
     }
-    if (await this.storage.descriptorOwnerAlive()) {
-      await this.storage.releaseStartLock(startLockToken)
-      throw new Error('PTY daemon is already running.')
-    }
-    this.server = Bun.serve({
-      hostname: '127.0.0.1',
-      port: 0,
-      fetch: (request) => this.handle(request),
-    })
-    const descriptor = {
-      pid: process.pid,
-      processIdentity: this.processIdentity,
-      endpoint: this.server.url.origin,
-      protocolVersion: DAEMON_PROTOCOL_VERSION,
-      token: this.token,
-    }
     try {
+      await this.supervisor.initialize()
+      this.ownershipSecret = await this.storage.ownershipSecret()
+      this.processIdentity = (await processStartIdentity(process.pid)) ?? ''
+      if (!this.processIdentity) throw new Error('Unable to verify daemon process identity.')
+      this.token ||= crypto.randomUUID().replaceAll('-', '')
+      if (await this.storage.descriptorOwnerAlive()) {
+        throw new Error('PTY daemon is already running.')
+      }
+      this.server = Bun.serve({
+        hostname: '127.0.0.1',
+        port: 0,
+        fetch: (request) => this.handle(request),
+      })
+      const descriptor = {
+        pid: process.pid,
+        processIdentity: this.processIdentity,
+        endpoint: this.server.url.origin,
+        protocolVersion: DAEMON_PROTOCOL_VERSION,
+        token: this.token,
+      }
       await this.storage.writeDescriptor(descriptor)
       await this.storage.releaseStartLock(startLockToken)
+      return descriptor
     } catch (error) {
-      this.server.stop(true)
+      this.server?.stop(true)
       this.server = null
       await this.storage.releaseStartLock(startLockToken)
       throw error
     }
-    return descriptor
   }
 
   async stop(): Promise<void> {

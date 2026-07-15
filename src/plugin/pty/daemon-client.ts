@@ -13,7 +13,8 @@ import { DaemonStorage } from '../../daemon/storage.ts'
 import { fileURLToPath } from 'node:url'
 import { realpathSync } from 'node:fs'
 
-const START_TIMEOUT_MS = 5000
+const RPC_TIMEOUT_MS = 5000
+const DAEMON_START_TIMEOUT_MS = 20_000
 const STARTUP_STDERR_TAIL_CHARS = 4096
 const UNSAFE_STARTUP_STDERR =
   /\b(?:token|secret|password|passwd|api[_-]?key|authorization|bearer)\b|(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=/i
@@ -34,7 +35,7 @@ export function daemonLaunchCommand(
 }
 
 export function daemonReadinessDeadline(startedAt: number): number {
-  return startedAt + START_TIMEOUT_MS
+  return startedAt + DAEMON_START_TIMEOUT_MS
 }
 
 function retainStartupStderrTail(tail: string, chunk: string): string {
@@ -117,7 +118,7 @@ export class DaemonClient {
   private descriptor: DaemonDescriptor | null = null
 
   async spawn(options: SpawnOptions, owner?: OwnerContext): Promise<PTYSessionInfo> {
-    return this.call('spawn', options, START_TIMEOUT_MS, owner)
+    return this.call('spawn', options, RPC_TIMEOUT_MS, owner)
   }
 
   async exec(
@@ -157,7 +158,7 @@ export class DaemonClient {
   }
 
   async write(id: string, data: string, owner: OwnerContext): Promise<WriteResult> {
-    return this.call('write', { id, data }, START_TIMEOUT_MS, owner)
+    return this.call('write', { id, data }, RPC_TIMEOUT_MS, owner)
   }
 
   async resize(
@@ -166,7 +167,7 @@ export class DaemonClient {
     rows: number,
     owner: OwnerContext
   ): Promise<{ cols: number; rows: number }> {
-    return this.call('resize', { id, cols, rows }, START_TIMEOUT_MS, owner)
+    return this.call('resize', { id, cols, rows }, RPC_TIMEOUT_MS, owner)
   }
 
   async read(
@@ -176,7 +177,7 @@ export class DaemonClient {
     sequence?: number,
     owner?: OwnerContext
   ): Promise<ReadResult> {
-    return this.call('read', { id, offset, limit, sequence }, START_TIMEOUT_MS, owner)
+    return this.call('read', { id, offset, limit, sequence }, RPC_TIMEOUT_MS, owner)
   }
 
   async search(
@@ -191,17 +192,17 @@ export class DaemonClient {
     return this.call(
       'search',
       { id, pattern, ignoreCase, offset, limit, sequence },
-      START_TIMEOUT_MS,
+      RPC_TIMEOUT_MS,
       owner
     )
   }
 
   async list(owner?: OwnerContext): Promise<PTYSessionInfo[]> {
-    return this.call('list', {}, START_TIMEOUT_MS, owner)
+    return this.call('list', {}, RPC_TIMEOUT_MS, owner)
   }
 
   async get(id: string, owner?: OwnerContext): Promise<PTYSessionInfo | null> {
-    return this.call('get', { id }, START_TIMEOUT_MS, owner)
+    return this.call('get', { id }, RPC_TIMEOUT_MS, owner)
   }
 
   async getRawBuffer(
@@ -213,26 +214,26 @@ export class DaemonClient {
     containment?: import('../../daemon/types.ts').ContainmentReport
     termination?: import('../../daemon/types.ts').TerminationResult
   } | null> {
-    return this.call('rawOutput', { id }, START_TIMEOUT_MS, owner)
+    return this.call('rawOutput', { id }, RPC_TIMEOUT_MS, owner)
   }
 
   async getExecOutput(id: string, owner?: OwnerContext) {
-    return this.call('execOutput', { id }, START_TIMEOUT_MS, owner)
+    return this.call('execOutput', { id }, RPC_TIMEOUT_MS, owner)
   }
 
   async stop(id: string, owner?: OwnerContext): Promise<StopResult> {
-    return this.call('stop', { id }, START_TIMEOUT_MS, owner)
+    return this.call('stop', { id }, RPC_TIMEOUT_MS, owner)
   }
 
   async cleanup(id: string, owner?: OwnerContext): Promise<boolean> {
-    return this.call('cleanup', { id }, START_TIMEOUT_MS, owner)
+    return this.call('cleanup', { id }, RPC_TIMEOUT_MS, owner)
   }
 
   async cleanupBySession(owner?: OwnerContext): Promise<void> {
     await this.call(
       'cleanupByParentSession',
       { parentSessionId: owner?.parentSessionId },
-      START_TIMEOUT_MS,
+      RPC_TIMEOUT_MS,
       owner
     )
   }
@@ -240,7 +241,7 @@ export class DaemonClient {
   private async call<T>(
     operation: string,
     payload?: unknown,
-    timeout = START_TIMEOUT_MS,
+    timeout = RPC_TIMEOUT_MS,
     owner?: OwnerContext
   ): Promise<T> {
     const descriptor = await this.ensureDaemon()
@@ -280,6 +281,8 @@ export class DaemonClient {
     let startupStderr = ''
     let startupToken = ''
     let startupOptions = ''
+    let startupExitCode: number | undefined
+    let startupStderrDone: Promise<void> | undefined
     try {
       while (deadline === undefined || Date.now() < deadline) {
         let descriptor: unknown = null
@@ -351,12 +354,22 @@ export class DaemonClient {
           if (!(child.stderr instanceof ReadableStream)) {
             throw new Error('PTY daemon stderr could not be captured.')
           }
-          void captureStartupStderr(child.stderr, (tail) => {
+          startupStderrDone = captureStartupStderr(child.stderr, (tail) => {
             startupStderr = tail
           }).catch(() => undefined)
+          void child.exited.then((exitCode) => {
+            startupExitCode = exitCode
+          })
           started = true
           deadline = daemonReadinessDeadline(Date.now())
           continue
+        }
+        if (started && startupExitCode !== undefined) {
+          await startupStderrDone
+          const diagnostic = safeStartupStderrTail(startupStderr, startupToken, startupOptions)
+          throw new Error(
+            `PTY daemon exited before publishing its descriptor (exit code ${startupExitCode}).${diagnostic ? ` Startup stderr: ${diagnostic}` : ''}`
+          )
         }
         await Bun.sleep(25)
       }
@@ -365,7 +378,7 @@ export class DaemonClient {
     }
     const diagnostic = safeStartupStderrTail(startupStderr, startupToken, startupOptions)
     throw new Error(
-      `PTY daemon did not start within 5 seconds.${diagnostic ? ` Startup stderr: ${diagnostic}` : ''}`
+      `PTY daemon did not start within 20 seconds.${diagnostic ? ` Startup stderr: ${diagnostic}` : ''}`
     )
   }
 
@@ -432,5 +445,5 @@ export function ownerContext(parentSessionId: string, projectDirectory: string):
 }
 
 function requestTimeout(timeoutSeconds: number): number {
-  return timeoutSeconds * 1000 + START_TIMEOUT_MS
+  return timeoutSeconds * 1000 + RPC_TIMEOUT_MS
 }

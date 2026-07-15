@@ -26,7 +26,7 @@ interface StartLock {
   token: string
   handoffToken: string | null
   pid: number
-  processIdentity: string
+  processIdentity: string | null
 }
 
 interface StartLockLease {
@@ -269,20 +269,18 @@ export class DaemonStorage {
   }
 
   async claimStartLock(handoffToken: string): Promise<string | null> {
-    const processIdentity = await processStartIdentity(process.pid)
-    if (!processIdentity || !(await this.acquireStartLockRecovery())) return null
+    // Claim before Windows DACL and identity probes; the handoff token authorizes this replacement.
+    if (!(await this.acquireStartLockRecovery(false))) return null
     try {
       const lock = await this.readStartLock()
-      if (
-        !lock ||
-        lock.handoffToken !== handoffToken ||
-        lock.processIdentity === processIdentity ||
-        !(await this.startLockOwnerAlive(lock))
-      ) {
-        return null
-      }
+      if (!lock || lock.handoffToken !== handoffToken) return null
       const token = crypto.randomUUID()
-      await this.writeStartLock({ token, handoffToken: null, pid: process.pid, processIdentity })
+      await this.writeStartLock({
+        token,
+        handoffToken: null,
+        pid: process.pid,
+        processIdentity: null,
+      })
       return token
     } finally {
       await rm(this.startLockRecoveryPath, { force: true })
@@ -295,7 +293,7 @@ export class DaemonStorage {
     if (
       lock?.token === token &&
       lock.pid === process.pid &&
-      lock.processIdentity === processIdentity
+      (lock.processIdentity === null || lock.processIdentity === processIdentity)
     ) {
       await rm(this.startLockPath, { force: true })
       await this.syncDirectory(this.root)
@@ -312,8 +310,7 @@ export class DaemonStorage {
         typeof pid === 'number' &&
         Number.isSafeInteger(pid) &&
         pid > 0 &&
-        typeof processIdentity === 'string' &&
-        processIdentity
+        (processIdentity === null || (typeof processIdentity === 'string' && processIdentity))
         ? (value as StartLock)
         : null
     } catch (error) {
@@ -327,15 +324,26 @@ export class DaemonStorage {
     await this.writeAtomic(this.startLockPath, JSON.stringify(lock))
   }
 
-  private async acquireStartLockRecovery(): Promise<boolean> {
-    const lock = { ...(await this.newStartLock()), handoffToken: null }
+  private async acquireStartLockRecovery(verifyIdentity = true): Promise<boolean> {
+    const lock: StartLock = {
+      token: crypto.randomUUID(),
+      handoffToken: null,
+      pid: process.pid,
+      processIdentity: verifyIdentity ? await processStartIdentity(process.pid) : null,
+    }
+    if (verifyIdentity && !lock.processIdentity)
+      throw new Error('Unable to verify daemon process identity.')
     if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
       return true
     }
     const recovery = await this.readStartLock(this.startLockRecoveryPath)
-    if (recovery && (await this.startLockOwnerAlive(recovery))) return false
+    if (
+      recovery &&
+      (verifyIdentity ? await this.startLockOwnerAlive(recovery) : this.processExists(recovery.pid))
+    )
+      return false
     await rm(this.startLockRecoveryPath, { force: true })
-    return this.acquireStartLockRecovery()
+    return this.acquireStartLockRecovery(verifyIdentity)
   }
 
   private async writeExclusiveLock(path: string, lock: StartLock): Promise<boolean> {
@@ -361,6 +369,7 @@ export class DaemonStorage {
   }
 
   private async startLockOwnerAlive(lock: StartLock): Promise<boolean> {
+    if (!lock.processIdentity) return this.processExists(lock.pid)
     const identity = await processStartIdentity(lock.pid)
     return identity ? identity === lock.processIdentity : this.processExists(lock.pid)
   }
