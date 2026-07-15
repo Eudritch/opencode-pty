@@ -13,7 +13,10 @@ import {
   requiredProcessStartIdentity,
   windowsProcessIdentityCommand,
 } from '../src/daemon/storage.ts'
-import { WorkerClient as NativeWorkerClient } from '../src/daemon/worker-client.ts'
+import {
+  WorkerClient as NativeWorkerClient,
+  type WorkerSnapshot,
+} from '../src/daemon/worker-client.ts'
 import {
   effectiveMaxOutputBytes,
   OutputRedactor,
@@ -2609,6 +2612,101 @@ test('stale worker recovery is bounded and parallel', async () => {
     expect(maximum).toBe(4)
   } finally {
     ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
+
+test('restart cleanup stops a reconnected conversation worker published before recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-restart-cleanup-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'parent', root)
+  const session = record(root, 'pty_reconnect_cleanup')
+  session.ownerCapabilityHash = context.capability
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'fingerprint',
+    protocolVersion: 4,
+  }
+  await storage.writeSession(session)
+  let allowReconnect: () => void = () => {}
+  let reconnecting: () => void = () => {}
+  const reconnectGate = new Promise<void>((resolve) => {
+    allowReconnect = resolve
+  })
+  const reconnectStarted = new Promise<void>((resolve) => {
+    reconnecting = resolve
+  })
+  const terminal: WorkerSnapshot = {
+    status: 'exited',
+    pid: 1,
+    mode: 'pty',
+    stdout: '',
+    stderr: '',
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    nextSequence: 0,
+    firstRetainedSequence: 0,
+    outputTruncated: false,
+    exitReason: 'stopped',
+    startedAt: session.createdAt,
+    exitedAt: new Date().toISOString(),
+    timedOut: false,
+    terminationRequested: true,
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+    outputIncomplete: false,
+    containment: {
+      platform: 'not_applicable',
+      status: 'not_applicable',
+      rootPid: 1,
+      rootStartIdentity: 'start',
+      rootIdentityVerified: true,
+      observedGroupPids: [],
+      observedSessionPids: [],
+      observedEscapedDescendantPids: [],
+      verifiedAt: new Date().toISOString(),
+    },
+  }
+  let stops = 0
+  const worker = {
+    stop: async () => {
+      stops += 1
+      return terminal
+    },
+    shutdown: async () => terminal,
+  }
+  const reconnect = NativeWorkerClient.reconnect
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    reconnecting()
+    await reconnectGate
+    return worker as never
+  }
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  try {
+    const descriptor = await server.start()
+    await reconnectStarted
+    const cleanup = await Promise.all([
+      rpc(descriptor, 'cleanupByParentSession', { parentSessionId: 'parent' }, context),
+      rpc(descriptor, 'cleanupByParentSession', { parentSessionId: 'parent' }, context),
+    ])
+    expect(cleanup.map((response) => response.status)).toEqual([200, 200])
+    allowReconnect()
+    for (let attempt = 0; attempt < 40 && (await storage.loadSessions()).length; attempt += 1) {
+      await Bun.sleep(10)
+    }
+    expect(stops).toBe(1)
+    expect(await storage.loadSessions()).toHaveLength(0)
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+    await server.stop().catch(() => undefined)
   }
 })
 

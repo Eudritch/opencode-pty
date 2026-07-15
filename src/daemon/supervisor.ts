@@ -237,6 +237,7 @@ export class SessionSupervisor {
   private readonly records = new Map<string, SessionRecord>()
   private readonly waits = new Map<string, PendingWait[]>()
   private readonly nativeWorkers = new Map<string, WorkerClient>()
+  private readonly pendingConversationCleanup = new Map<string, Promise<void>>()
   private persistQueue = Promise.resolve()
 
   constructor(
@@ -266,6 +267,7 @@ export class SessionSupervisor {
         record.status === 'spawn_failed' ||
         record.status === 'output_limited'
       record.directChildExited ??= record.terminationConfirmed
+      record.pendingCleanup ??= false
       this.records.set(record.id, record)
       if (record.worker && record.worker.protocolVersion !== 4) {
         record.status = 'lost'
@@ -313,6 +315,10 @@ export class SessionSupervisor {
     }
     if (worker) {
       this.nativeWorkers.set(record.id, worker)
+      if (record.pendingCleanup) {
+        await this.cleanupConversation(record)
+        return
+      }
       void this.monitorNative(record, worker)
       return
     }
@@ -1177,13 +1183,30 @@ export class SessionSupervisor {
             record.ownerProjectDirectory === projectDirectory &&
             record.ownerCapabilityHash === capabilityHash &&
             record.lifecycle === 'conversation' &&
+            record.status !== 'lost' &&
             (this.nativeWorkers.has(record.id) || record.worker)
         )
-        .map(async (record) => {
-          await this.stop(record.id)
-          if (record.worker) await this.cleanup(record.id)
-        })
+        .map((record) => this.cleanupConversation(record))
     )
+  }
+
+  private cleanupConversation(record: SessionRecord): Promise<void> {
+    const existing = this.pendingConversationCleanup.get(record.id)
+    if (existing) return existing
+    const cleanup = (async () => {
+      record.pendingCleanup = true
+      await this.storage.writeSession(record)
+      if (record.status === 'lost') return
+      if (!activeStatus(record)) {
+        await this.cleanup(record.id)
+        return
+      }
+      if (!this.nativeWorkers.has(record.id)) return
+      await this.stop(record.id)
+      await this.cleanup(record.id)
+    })().finally(() => this.pendingConversationCleanup.delete(record.id))
+    this.pendingConversationCleanup.set(record.id, cleanup)
+    return cleanup
   }
 
   async flush(): Promise<void> {

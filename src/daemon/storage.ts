@@ -913,6 +913,7 @@ export class DaemonStorage {
         typeof value.terminationRequested !== 'boolean') ||
       (value.terminationConfirmed !== undefined &&
         typeof value.terminationConfirmed !== 'boolean') ||
+      (value.pendingCleanup !== undefined && typeof value.pendingCleanup !== 'boolean') ||
       (value.directChildExited !== undefined && typeof value.directChildExited !== 'boolean') ||
       !validOptionalInteger(value.exitCode) ||
       (value.exitSignal !== undefined &&

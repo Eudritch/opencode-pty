@@ -162,6 +162,7 @@ export interface SessionRecord {
   timedOut: boolean
   terminationRequested: boolean
   terminationConfirmed: boolean
+  pendingCleanup?: boolean
   // Direct-child exit is distinct from descendant containment drain on POSIX.
   directChildExited?: boolean
   exitCode?: number
