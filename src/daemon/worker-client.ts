@@ -118,6 +118,16 @@ function workerCommand(): string[] {
   )
 }
 
+export function workerLaunchOptions(command: string[]) {
+  return {
+    cmd: command,
+    detached: process.platform === 'win32',
+    stdin: 'pipe' as const,
+    stdout: 'pipe' as const,
+    stderr: 'inherit' as const,
+  }
+}
+
 function linuxWorkerPackage(target: 'linux-x64-gnu' | 'linux-arm64-gnu'): string {
   const probe = Bun.spawnSync({ cmd: ['ldd', '--version'], stdout: 'pipe', stderr: 'pipe' })
   const output = `${Buffer.from(probe.stdout)}${Buffer.from(probe.stderr)}`.toLowerCase()
@@ -267,10 +277,7 @@ export class WorkerClient {
       throw new Error('native_worker_unavailable: bootstrap too large.')
     const command = workerCommand()
     const child = Bun.spawn({
-      cmd: command,
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'inherit',
+      ...workerLaunchOptions(command),
     })
     let identity: string | null = null
     let client: WorkerClient | undefined

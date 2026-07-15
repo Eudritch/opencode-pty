@@ -15,6 +15,7 @@ import {
 } from '../src/daemon/storage.ts'
 import {
   WorkerClient as NativeWorkerClient,
+  workerLaunchOptions,
   type WorkerSnapshot,
 } from '../src/daemon/worker-client.ts'
 import {
@@ -2516,6 +2517,16 @@ test('daemon launcher detaches from short-lived plugin hosts', () => {
     stdin: 'ignore',
     stdout: 'ignore',
     stderr: 'pipe',
+  })
+})
+
+test('Windows worker launcher isolates native workers from the plugin console group', () => {
+  expect(workerLaunchOptions(['worker.exe'])).toMatchObject({
+    cmd: ['worker.exe'],
+    detached: process.platform === 'win32',
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'inherit',
   })
 })
 
