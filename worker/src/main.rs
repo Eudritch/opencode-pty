@@ -258,6 +258,7 @@ struct State {
     stderr_reader_error: Option<String>,
     reader_drain_deadline: Option<SystemTime>,
     output_incomplete: bool,
+    diagnostics: Vec<String>,
     termination: Option<TerminationResult>,
 }
 
@@ -425,17 +426,32 @@ impl Write for WinHandle {
 
 #[cfg(windows)]
 struct WindowsPty {
-    console: HPCON,
-    input: WinHandle,
+    console: Option<HPCON>,
+    input: Option<WinHandle>,
     output: Option<WinHandle>,
 }
 
 #[cfg(windows)]
 impl Drop for WindowsPty {
     fn drop(&mut self) {
-        unsafe {
-            ClosePseudoConsole(self.console);
+        if let Some(console) = self.console.take() {
+            unsafe {
+                ClosePseudoConsole(console);
+            }
         }
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPty {
+    fn close(&mut self) {
+        if let Some(console) = self.console.take() {
+            // Closing the producer releases the host output pipe for its reader to drain.
+            unsafe {
+                ClosePseudoConsole(console);
+            }
+        }
+        self.input.take();
     }
 }
 
@@ -779,11 +795,12 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
                     &mut console,
                 )
             };
-            drop(console_input);
-            drop(console_output);
             if result < 0 {
                 return Err(format!("CreatePseudoConsole failed: 0x{result:08x}"));
             }
+            // ConPTY owns these endpoints after creation; release our duplicates immediately.
+            drop(console_input);
+            drop(console_output);
             (
                 None,
                 None,
@@ -792,8 +809,8 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
                 None,
                 None,
                 Some(WindowsPty {
-                    console,
-                    input: parent_input,
+                    console: Some(console),
+                    input: Some(parent_input),
                     output: Some(parent_output),
                 }),
             )
@@ -829,7 +846,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         .as_ref()
         .map(|attributes| attributes.list)
         .unwrap_or(null_mut());
-    let mut pseudo_console = pty.as_ref().map(|pty| pty.console).unwrap_or(0);
+    let mut pseudo_console = pty.as_ref().and_then(|pty| pty.console).unwrap_or(0);
     if pty.is_some()
         && unsafe {
             UpdateProcThreadAttribute(
@@ -1714,6 +1731,21 @@ fn record_exit(worker: &Arc<Worker>, exit: WindowsExit) {
     let _ = refresh_termination_confirmed(worker);
 }
 
+#[cfg(windows)]
+fn release_windows_terminal(worker: &Arc<Worker>) {
+    if !worker
+        .state
+        .lock()
+        .expect("state lock")
+        .termination_confirmed
+    {
+        return;
+    }
+    if let Some(pty) = worker.child.lock().expect("child lock").pty.as_mut() {
+        pty.close();
+    }
+}
+
 fn observe_exit(worker: &Arc<Worker>) {
     let exit = worker
         .child
@@ -1727,6 +1759,8 @@ fn observe_exit(worker: &Arc<Worker>) {
     }
     if worker.state.lock().expect("state lock").root_exited {
         let _ = refresh_termination_confirmed(worker);
+        #[cfg(windows)]
+        release_windows_terminal(worker);
     }
 }
 
@@ -2044,8 +2078,14 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
                 &path,
                 &serde_json::to_string(&chunk).expect("journal chunk serializes"),
             ) {
-                state.storage_failure = Some(error.to_string());
+                let error = error.to_string();
+                state.storage_failure = Some(error.clone());
                 state.exit_reason = Some("storage_failure".into());
+                push_diagnostic(
+                    &mut state,
+                    format!("output storage failure: {error}"),
+                    &worker.secrets,
+                );
                 terminate = Some("storage_failure");
             } else {
                 if state
@@ -2074,8 +2114,14 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
                             .output_directory
                             .join(format!("{:020}.json", removed.start_sequence)),
                     ) {
-                        state.storage_failure = Some(error.to_string());
+                        let error = error.to_string();
+                        state.storage_failure = Some(error.clone());
                         state.exit_reason = Some("storage_failure".into());
+                        push_diagnostic(
+                            &mut state,
+                            format!("output storage failure: {error}"),
+                            &worker.secrets,
+                        );
                         terminate = Some("storage_failure");
                         break;
                     }
@@ -2106,17 +2152,26 @@ fn mark_reader_eof(worker: &Arc<Worker>, stdout: bool) {
     }
 }
 
-fn mark_reader_failure(state: &mut State, stdout: bool, error: String) {
+fn mark_reader_failure(state: &mut State, stdout: bool, error: String, secrets: &[String]) {
     let diagnostic = format!(
         "{} reader error: {error}",
         if stdout { "stdout" } else { "stderr" }
     );
     if stdout {
-        state.stdout_reader_error = Some(diagnostic);
+        state.stdout_reader_error = Some(diagnostic.clone());
     } else {
-        state.stderr_reader_error = Some(diagnostic);
+        state.stderr_reader_error = Some(diagnostic.clone());
     }
     state.output_incomplete = true;
+    push_diagnostic(state, diagnostic, secrets);
+}
+
+fn push_diagnostic(state: &mut State, message: String, secrets: &[String]) {
+    if state.diagnostics.len() < 4 {
+        state
+            .diagnostics
+            .push(redact(message.chars().take(512).collect(), secrets));
+    }
 }
 
 fn output_complete(state: &State) -> bool {
@@ -2133,7 +2188,10 @@ fn update_reader_drain_state(state: &mut State) {
             .reader_drain_deadline
             .is_some_and(|deadline| SystemTime::now() >= deadline)
     {
-        state.output_incomplete = true;
+        if !state.output_incomplete {
+            state.output_incomplete = true;
+            push_diagnostic(state, "reader drain deadline elapsed".into(), &[]);
+        }
     }
 }
 
@@ -2169,7 +2227,7 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
                         mark_reader_eof(&worker, stdout);
                     } else {
                         let mut state = worker.state.lock().expect("state lock");
-                        mark_reader_failure(&mut state, stdout, error.to_string());
+                        mark_reader_failure(&mut state, stdout, error.to_string(), &worker.secrets);
                     }
                     return;
                 }
@@ -2214,7 +2272,7 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         mark_reader_eof(&worker, true);
                     } else {
                         let mut state = worker.state.lock().expect("state lock");
-                        mark_reader_failure(&mut state, true, error.to_string());
+                        mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                     }
                     return;
                 }
@@ -2278,7 +2336,7 @@ fn terminal_reader(worker: Arc<Worker>, mut terminal: File) {
                         mark_reader_eof(&worker, true);
                     } else {
                         let mut state = worker.state.lock().expect("state lock");
-                        mark_reader_failure(&mut state, true, error.to_string());
+                        mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                     }
                     return;
                 }
@@ -2303,7 +2361,7 @@ fn drain_terminal(worker: &Arc<Worker>, terminal: &mut File) {
             Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
             Err(error) => {
                 let mut state = worker.state.lock().expect("state lock");
-                mark_reader_failure(&mut state, true, error.to_string());
+                mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                 return;
             }
             Ok(size) => append_terminal_output(
@@ -2353,6 +2411,7 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
         .cloned()
         .collect::<Vec<_>>()
         .join("; ");
+    let diagnostics = state.diagnostics.clone();
     let terminal = state.termination_confirmed && (output_complete || state.output_incomplete);
     let containment_unavailable = containment.status == "posix_containment_unknown"
         || containment.status == "windows_job_unknown";
@@ -2384,6 +2443,7 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
         "storageFailure": state.storage_failure, "stdoutEof": state.stdout_eof, "stderrEof": state.stderr_eof,
         "readerFailure": if reader_failure.is_empty() { Value::Null } else { Value::String(reader_failure) },
         "outputComplete": output_complete, "outputIncomplete": state.output_incomplete,
+        "diagnostics": diagnostics,
         "outputLineCount": state.retained_newlines
             + usize::from(state.retained_bytes > 0 && !state.chunks.last().is_some_and(|chunk| chunk.data.ends_with('\n'))),
         "outputHasPartialLine": state.retained_bytes > 0
@@ -2418,7 +2478,7 @@ mod tests {
             termination_confirmed: true,
             ..State::default()
         };
-        mark_reader_failure(&mut state, true, "injected read failure".into());
+        mark_reader_failure(&mut state, true, "injected read failure".into(), &[]);
         assert!(!state.stdout_eof);
         assert!(!output_complete(&state));
         assert!(state.output_incomplete);
@@ -2547,6 +2607,7 @@ mod tests {
         update_reader_drain_state(&mut state);
         assert!(state.output_incomplete);
         assert!(!output_complete(&state));
+        assert_eq!(state.diagnostics, ["reader drain deadline elapsed"]);
     }
 
     #[cfg(unix)]
@@ -2876,27 +2937,52 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                 ));
             }
             #[cfg(windows)]
-            if let Some(pty) = worker.child.lock().expect("child lock").pty.as_ref() {
-                let input = pty.input.raw();
-                let mut written = 0;
-                if unsafe {
-                    WriteFile(
-                        input,
-                        data.as_ptr(),
-                        data.len().min(u32::MAX as usize) as u32,
-                        &mut written,
-                        null_mut(),
-                    )
-                } == 0
-                {
-                    return Err(WorkerError {
+            if worker.mode == "pty" {
+                let child = worker.child.lock().expect("child lock");
+                let pty = child.pty.as_ref().ok_or(WorkerError {
+                    code: "process",
+                    message: "session is not a PTY".into(),
+                })?;
+                let input = pty
+                    .input
+                    .as_ref()
+                    .ok_or(WorkerError {
                         code: "process",
-                        message: std::io::Error::last_os_error().to_string(),
-                    });
-                }
+                        message: "PTY input is unavailable".into(),
+                    })?
+                    .raw();
+                // ConPTY output reads block, so capture the cursor before accepting input.
+                // This includes an echo that the reader publishes immediately after WriteFile.
                 let arrival_sequence = worker.state.lock().expect("state lock").next_sequence;
+                let bytes = data.as_bytes();
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let mut written = 0;
+                    if unsafe {
+                        WriteFile(
+                            input,
+                            bytes[offset..].as_ptr(),
+                            (bytes.len() - offset).min(u32::MAX as usize) as u32,
+                            &mut written,
+                            null_mut(),
+                        )
+                    } == 0
+                    {
+                        return Err(WorkerError {
+                            code: "process",
+                            message: std::io::Error::last_os_error().to_string(),
+                        });
+                    }
+                    if written == 0 {
+                        return Err(WorkerError {
+                            code: "process",
+                            message: "PTY input write accepted no bytes".into(),
+                        });
+                    }
+                    offset += written as usize;
+                }
                 return Ok((
-                    json!({"acceptedBytes": written, "arrivalSequence": arrival_sequence}),
+                    json!({"acceptedBytes": bytes.len(), "arrivalSequence": arrival_sequence}),
                     false,
                 ));
             }
@@ -2958,9 +3044,13 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                         code: "process",
                         message: "session is not a PTY".into(),
                     })?;
+                    let console = pty.console.ok_or(WorkerError {
+                        code: "process",
+                        message: "PTY is closed".into(),
+                    })?;
                     let result = unsafe {
                         ResizePseudoConsole(
-                            pty.console,
+                            console,
                             COORD {
                                 X: cols as i16,
                                 Y: rows as i16,

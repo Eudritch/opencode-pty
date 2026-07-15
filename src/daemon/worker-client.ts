@@ -638,6 +638,7 @@ export interface WorkerSnapshot {
   outputComplete: boolean
   outputIncomplete: boolean
   readerFailure?: string
+  diagnostics?: string[]
   containment: ContainmentReport
   termination?: TerminationResult
 }

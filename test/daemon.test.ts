@@ -83,6 +83,30 @@ test('runtime environment keeps a single trusted PATH despite caller overrides',
   expect(Object.keys(environment).filter((key) => key.toUpperCase() === 'PATH')).toEqual(['PATH'])
 })
 
+test('runtime environment preserves native-cased Windows safe variables', () => {
+  const environment = runtimeEnvironment(
+    undefined,
+    false,
+    {
+      SystemRoot: 'C:\\Windows',
+      SystemDrive: 'C:',
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      TEMP: 'C:\\Temp',
+      Path: 'trusted-path',
+      PATHEXT: '.EXE;.CMD',
+    },
+    true
+  )
+
+  expect(environment).toEqual({
+    SystemRoot: 'C:\\Windows',
+    SystemDrive: 'C:',
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    TEMP: 'C:\\Temp',
+    PATH: 'trusted-path',
+  })
+})
+
 function record(
   root: string,
   id: string,
@@ -1623,6 +1647,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-limits')
   try {
     const descriptor = await server.start()
+    await Bun.sleep(100)
     const capped = await rpc(
       descriptor,
       'exec',
@@ -2374,6 +2399,125 @@ test('native PTY writes, resizes, rejects exec resize, and recovers after daemon
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
 }, 15_000)
+
+test('Windows ConPTY cmd more accepts input and finite output drains before cleanup', async () => {
+  if (process.platform !== 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-'))
+  roots.push(root)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'windows-conpty')
+  let descriptor: { endpoint: string; token: string } | undefined
+  let id: string | undefined
+  try {
+    descriptor = await server.start()
+    const context = await owner(storage, 'windows-conpty', root)
+    const spawned = (await rpc(
+      descriptor,
+      'spawn',
+      {
+        command: 'cmd.exe',
+        args: ['/d', '/c', 'more'],
+        description: 'Windows ConPTY more',
+      },
+      context
+    ).then((response) => response.json())) as {
+      ok: boolean
+      result?: { id: unknown }
+      error?: unknown
+    }
+    expect(spawned.ok).toBeTrue()
+    if (!spawned.result || typeof spawned.result.id !== 'string')
+      throw new Error(JSON.stringify(spawned.error ?? spawned))
+    id = spawned.result.id
+    const resized = await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then(
+      (response) => response.json()
+    )
+    if (!(resized as { ok?: unknown }).ok) {
+      const [session, output] = await Promise.all([
+        rpc(descriptor, 'get', { id }, context).then((response) => response.json()),
+        rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json()),
+      ])
+      throw new Error(
+        `Windows ConPTY closed before resize: ${JSON.stringify({ resized, session, output })}`
+      )
+    }
+    expect(resized).toMatchObject({ result: { cols: 100, rows: 30 } })
+    expect(
+      await rpc(
+        descriptor,
+        'sendWait',
+        {
+          id,
+          data: 'conpty-more\r\n',
+          condition: { kind: 'output', literal: 'conpty-more' },
+          timeoutSeconds: 2,
+        },
+        context
+      ).then((response) => response.json())
+    ).toMatchObject({ result: { satisfied: true } })
+    expect(
+      await rpc(descriptor, 'list', {}, context).then((response) => response.json())
+    ).toMatchObject({ result: [{ id, status: 'running' }] })
+    expect(
+      await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: { raw: expect.stringContaining('conpty-more') } })
+    const stopped = await rpc(descriptor, 'stop', { id }, context).then((response) =>
+      response.json()
+    )
+    expect(stopped).toMatchObject({
+      result: { terminationConfirmed: true, containment: { status: 'windows_job_empty' } },
+    })
+    expect(
+      await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
+    ).toMatchObject({
+      result: {
+        status: 'exited',
+        terminationConfirmed: true,
+        containment: { status: 'windows_job_empty' },
+      },
+    })
+    expect(
+      await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: {} })
+    id = undefined
+
+    const finite = (await rpc(
+      descriptor,
+      'spawn',
+      { command: 'cmd.exe', args: ['/d', '/c', 'echo ok'], description: 'Windows ConPTY drain' },
+      context
+    ).then((response) => response.json())) as { result: { id: unknown } }
+    if (typeof finite.result.id !== 'string') throw new Error('finite PTY id is invalid')
+    id = finite.result.id
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const session = (await rpc(descriptor, 'get', { id }, context).then((response) =>
+        response.json()
+      )) as { result?: { status?: string } }
+      if (session.result?.status !== 'running') break
+      await Bun.sleep(20)
+    }
+    expect(
+      await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: { status: 'exited', terminationConfirmed: true } })
+    expect(
+      await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
+    ).toMatchObject({ result: {} })
+    id = undefined
+  } finally {
+    if (descriptor && id) {
+      const context = await owner(storage, 'windows-conpty', root).catch(() => undefined)
+      if (context) {
+        await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
+        await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
+      }
+    }
+    await server.stop().catch(() => undefined)
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
 
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')

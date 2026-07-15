@@ -31,6 +31,7 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
   'HOME',
   'USERPROFILE',
   'SYSTEMROOT',
+  'SYSTEMDRIVE',
   'WINDIR',
   'TEMP',
   'TMP',
@@ -168,12 +169,16 @@ export function runtimeEnvironment(
   windows = process.platform === 'win32'
 ): Record<string, string> {
   const isPath = (key: string) => (windows ? key.toUpperCase() === 'PATH' : key === 'PATH')
+  const isSafe = (key: string) => {
+    if (!windows) return SAFE_ENVIRONMENT_KEYS.has(key)
+    return [...SAFE_ENVIRONMENT_KEYS].some((safe) => safe.toUpperCase() === key.toUpperCase())
+  }
   const trustedPath = Object.entries(source).find(([key]) => isPath(key))?.[1]
   const base = inherit
     ? source
     : Object.fromEntries(
         Object.entries(source).filter(
-          ([key]) => isPath(key) || SAFE_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_')
+          ([key]) => isPath(key) || isSafe(key) || key.startsWith('LC_')
         )
       )
   const environment = Object.fromEntries(
@@ -464,8 +469,8 @@ export class SessionSupervisor {
     if (!worker || record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
     let afterSequence: number
     try {
-      // The worker returns the cursor immediately after accepting input, excluding prior output
-      // while preserving an immediate reply.
+      // The worker returns the cursor at the input acceptance boundary. On Windows this is before
+      // WriteFile because ConPTY reads block and an immediate echo may be published concurrently.
       afterSequence = (await worker.write(data)).arrivalSequence
     } catch (error) {
       throw new ProcessError(
@@ -985,6 +990,7 @@ export class SessionSupervisor {
     record.containment = result.containment
     record.termination = result.termination
     record.storageFailure = result.storageFailure ?? undefined
+    record.diagnostics = result.diagnostics?.length ? result.diagnostics : undefined
     if (result.storageFailure || result.readerFailure || result.outputIncomplete)
       record.exitReason = {
         kind: 'unknown',
@@ -1005,7 +1011,7 @@ export class SessionSupervisor {
     else if (record.terminationConfirmed)
       record.exitReason = this.exitReason(result.exitCode ?? null, result.exitSignal ?? undefined)
     else record.exitReason = { kind: 'unknown' }
-    record.exitedAt = result.exitedAt
+    record.exitedAt = result.exitedAt ?? undefined
     record.updatedAt = new Date().toISOString()
     record.outputBytes =
       record.mode === 'exec'

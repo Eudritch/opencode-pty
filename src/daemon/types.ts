@@ -180,6 +180,7 @@ export interface SessionRecord {
   containment?: ContainmentReport
   termination?: TerminationResult
   storageFailure?: string
+  diagnostics?: string[]
   lastWaitResult?: WaitResult
 }
 

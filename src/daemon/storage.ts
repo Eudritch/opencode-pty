@@ -938,6 +938,12 @@ export class DaemonStorage {
       !validContainment(value.containment) ||
       !validTermination(value.termination) ||
       !validOptionalText(value.storageFailure) ||
+      (value.diagnostics !== undefined &&
+        (!Array.isArray(value.diagnostics) ||
+          value.diagnostics.length > 4 ||
+          !value.diagnostics.every(
+            (diagnostic) => validText(diagnostic) && [...diagnostic].length <= 512
+          ))) ||
       !validWait(value.lastWaitResult)
     ) {
       return false
