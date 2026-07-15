@@ -32,6 +32,16 @@ export function daemonLaunchCommand(
   return [resolveDaemonLauncher(which), entryPath, launchOptions]
 }
 
+export function daemonLaunchOptions(which: (command: string) => string | null, entryPath: string, launchOptions: string) {
+  return {
+    cmd: daemonLaunchCommand(which, entryPath, launchOptions),
+    detached: true,
+    stdin: 'ignore' as const,
+    stdout: 'ignore' as const,
+    stderr: 'pipe' as const,
+  }
+}
+
 export function daemonReadinessDeadline(startedAt: number): number {
   return startedAt + DAEMON_START_TIMEOUT_MS
 }
@@ -320,14 +330,11 @@ export class DaemonClient {
           let child: ReturnType<typeof Bun.spawn>
           try {
             child = Bun.spawn({
-              cmd: daemonLaunchCommand(
+              ...daemonLaunchOptions(
                 Bun.which,
                 fileURLToPath(new URL(`../../daemon/main.${extension}`, import.meta.url)),
                 launchOptions
               ),
-              stdin: 'ignore',
-              stdout: 'ignore',
-              stderr: 'pipe',
               env: process.env as Record<string, string>,
             })
           } catch {

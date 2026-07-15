@@ -28,6 +28,7 @@ import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types
 import type { SpawnOptions } from '../src/plugin/pty/types.ts'
 import {
   daemonLaunchCommand,
+  daemonLaunchOptions,
   daemonReadinessDeadline,
   DaemonClient,
   ownerContext,
@@ -2505,6 +2506,17 @@ test('daemon launcher resolves Bun instead of a non-Bun plugin host', () => {
   expect(command).toEqual([bun, 'daemon-entry.js', 'launch-options'])
   expect(command).not.toContain(pluginHost)
   expect(() => resolveDaemonLauncher(() => null)).toThrow('Bun executable')
+})
+
+test('daemon launcher detaches from short-lived plugin hosts', () => {
+  const options = daemonLaunchOptions(() => 'bun.exe', 'daemon-entry.js', 'launch-options')
+  expect(options).toMatchObject({
+    cmd: ['bun.exe', 'daemon-entry.js', 'launch-options'],
+    detached: true,
+    stdin: 'ignore',
+    stdout: 'ignore',
+    stderr: 'pipe',
+  })
 })
 
 test('daemon readiness budget starts after launch', () => {
