@@ -259,7 +259,7 @@ export class DaemonStorage {
     }
     const current = await this.readStartLock()
     if (current && (await this.startLockOwnerAlive(current, deadline))) return null
-    if (!(await this.acquireStartLockRecovery(true, deadline))) return null
+    if (!(await this.acquireStartLockRecovery(deadline))) return null
     try {
       const replacement = await this.readStartLock()
       if (replacement && (await this.startLockOwnerAlive(replacement, deadline))) return null
@@ -286,8 +286,7 @@ export class DaemonStorage {
   }
 
   async claimStartLock(handoffToken: string, deadline?: number): Promise<string | null> {
-    // Claim before Windows DACL and identity probes; the handoff token authorizes this replacement.
-    if (!(await this.acquireStartLockRecovery(false, deadline))) return null
+    if (!(await this.acquireStartLockRecovery(deadline))) return null
     try {
       const lock = await this.readStartLock()
       if (!lock || lock.handoffToken !== handoffToken) return null
@@ -344,31 +343,21 @@ export class DaemonStorage {
     await this.writeAtomic(this.startLockPath, JSON.stringify(lock))
   }
 
-  private async acquireStartLockRecovery(
-    verifyIdentity = true,
-    deadline?: number
-  ): Promise<boolean> {
+  private async acquireStartLockRecovery(deadline?: number): Promise<boolean> {
     const lock: StartLock = {
       token: crypto.randomUUID(),
       handoffToken: null,
       pid: process.pid,
-      processIdentity: verifyIdentity ? await processStartIdentity(process.pid, deadline) : null,
+      processIdentity: await processStartIdentity(process.pid, deadline),
     }
-    if (verifyIdentity && !lock.processIdentity)
-      throw new Error('Unable to verify daemon process identity.')
+    if (!lock.processIdentity) throw new Error('Unable to verify daemon process identity.')
     if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
       return true
     }
     const recovery = await this.readStartLock(this.startLockRecoveryPath)
-    if (
-      recovery &&
-      (verifyIdentity
-        ? await this.startLockOwnerAlive(recovery, deadline)
-        : this.processExists(recovery.pid))
-    )
-      return false
+    if (recovery && (await this.startLockOwnerAlive(recovery, deadline))) return false
     await rm(this.startLockRecoveryPath, { force: true })
-    return this.acquireStartLockRecovery(verifyIdentity, deadline)
+    return this.acquireStartLockRecovery(deadline)
   }
 
   private async writeExclusiveLock(path: string, lock: StartLock): Promise<boolean> {
@@ -394,9 +383,9 @@ export class DaemonStorage {
   }
 
   private async startLockOwnerAlive(lock: StartLock, deadline?: number): Promise<boolean> {
-    if (!lock.processIdentity) return this.processExists(lock.pid)
+    if (!lock.processIdentity) return false
     const identity = await processStartIdentity(lock.pid, deadline)
-    return identity ? identity === lock.processIdentity : this.processExists(lock.pid)
+    return identity === lock.processIdentity
   }
 
   private processExists(pid: number): boolean {

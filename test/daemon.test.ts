@@ -688,6 +688,21 @@ test('claimed start locks recover a reused PID', async () => {
   if (recovered) await storage.releaseStartLock(recovered.token)
 })
 
+test('claimed handoff recovery locks with a reused PID do not block startup', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-claimed-recovery-lock-identity-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const lock = await storage.acquireStartLock()
+  if (!lock) throw new Error('Expected start lock.')
+  await writeFile(
+    join(root, 'daemon-start-recovery.lock'),
+    JSON.stringify({ token: 'old', handoffToken: null, pid: process.pid, processIdentity: null })
+  )
+  const claimed = await storage.claimStartLock(lock.handoffToken)
+  expect(typeof claimed).toBe('string')
+  if (claimed) await storage.releaseStartLock(claimed)
+})
+
 test('startup stderr never reports a three-character environment secret', () => {
   expect(safeStartupStderrTail('daemon failed: abc', 'token', 'options')).toBeNull()
 })
