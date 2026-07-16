@@ -94,22 +94,30 @@ test('runtime environment keeps a single trusted PATH despite caller overrides',
   expect(Object.keys(environment).filter((key) => key.toUpperCase() === 'PATH')).toEqual(['PATH'])
 })
 
-test('runtime environment preserves native-cased Windows safe variables', () => {
+test('safe Windows environment retains credential locations but excludes secrets and automation', () => {
   const environment = runtimeEnvironment(
     undefined,
     false,
     {
+      AppData: 'C:\\Users\\test\\AppData\\Roaming',
+      LOCALAPPDATA: 'C:\\Users\\test\\AppData\\Local',
       SystemRoot: 'C:\\Windows',
       SystemDrive: 'C:',
       ComSpec: 'C:\\Windows\\System32\\cmd.exe',
       TEMP: 'C:\\Temp',
+      ProgramData: 'C:\\ProgramData',
       Path: 'trusted-path',
       PATHEXT: '.EXE;.CMD',
+      GH_TOKEN: 'secret',
+      GIT_TERMINAL_PROMPT: '0',
+      GCM_INTERACTIVE: 'never',
     },
     true
   )
 
   expect(environment).toEqual({
+    AppData: 'C:\\Users\\test\\AppData\\Roaming',
+    LOCALAPPDATA: 'C:\\Users\\test\\AppData\\Local',
     SystemRoot: 'C:\\Windows',
     SystemDrive: 'C:',
     ComSpec: 'C:\\Windows\\System32\\cmd.exe',
