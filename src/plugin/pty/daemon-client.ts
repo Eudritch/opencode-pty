@@ -420,7 +420,9 @@ export class DaemonClient {
     if (this.descriptor && isSafeDescriptor(this.descriptor)) {
       const state = await this.probe(this.descriptor, deadline)
       if (state === 'healthy') return this.descriptor
-      if (state === 'incompatible') throw this.incompatibleProtocol(this.descriptor)
+      if (state === 'incompatible' && !(await this.canRecoverIncompatibleDaemon(deadline))) {
+        throw this.incompatibleProtocol(this.descriptor)
+      }
     }
     this.descriptor = null
     let startLock: { token: string; handoffToken: string } | null = null
@@ -444,7 +446,9 @@ export class DaemonClient {
             this.descriptor = descriptor
             return descriptor
           }
-          if (state === 'incompatible') throw this.incompatibleProtocol(descriptor)
+          if (state === 'incompatible' && !(await this.canRecoverIncompatibleDaemon(deadline))) {
+            throw this.incompatibleProtocol(descriptor)
+          }
           if (await this.storage.descriptorOwnerAlive(deadline)) {
             await Bun.sleep(25)
             continue
@@ -467,7 +471,9 @@ export class DaemonClient {
               this.descriptor = lockedDescriptor
               return lockedDescriptor
             }
-            if (state === 'incompatible') throw this.incompatibleProtocol(lockedDescriptor)
+            if (state === 'incompatible' && !(await this.canRecoverIncompatibleDaemon(deadline))) {
+              throw this.incompatibleProtocol(lockedDescriptor)
+            }
           }
           const extension = import.meta.url.endsWith('.ts') ? 'ts' : 'js'
           const token = crypto.randomUUID()
@@ -527,6 +533,8 @@ export class DaemonClient {
     descriptor: DaemonDescriptor,
     deadline?: number
   ): Promise<'healthy' | 'incompatible' | 'unreachable'> {
+    // A versioned descriptor is enough to reject an old daemon without sending it an RPC.
+    if (descriptor.protocolVersion !== DAEMON_PROTOCOL_VERSION) return 'incompatible'
     try {
       const timeout = Math.min(
         250,
@@ -566,8 +574,12 @@ export class DaemonClient {
 
   private incompatibleProtocol(descriptor: DaemonDescriptor): Error {
     return new Error(
-      `PTY daemon protocol ${descriptor.protocolVersion} is incompatible with client protocol ${DAEMON_PROTOCOL_VERSION}.`
+      `PTY daemon protocol ${descriptor.protocolVersion} is incompatible with client protocol ${DAEMON_PROTOCOL_VERSION}; its owner could not be proven dead, so it was not replaced. Stop or restart the older OpenCode process, then retry.`
     )
+  }
+
+  private async canRecoverIncompatibleDaemon(deadline: number): Promise<boolean> {
+    return (await this.storage.descriptorOwnerStatus(deadline)) === 'dead'
   }
 
   private capability(secret: string, owner: Omit<OwnerContext, 'capability'>): string {

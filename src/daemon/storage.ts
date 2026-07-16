@@ -2,6 +2,7 @@ import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 
 import { dirname, join, resolve } from 'node:path'
 import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import {
+  DAEMON_PROTOCOL_VERSION,
   type DaemonDescriptor,
   type ApprovalLedger,
   type ExitReason,
@@ -335,11 +336,21 @@ export class DaemonStorage {
   async descriptorOwnerAlive(deadline?: number): Promise<boolean> {
     const descriptor = await this.readDescriptor()
     if (!descriptor || !this.validDescriptor(descriptor)) return false
+    const status = await this.descriptorOwnerStatus(deadline)
+    return (
+      status === 'alive' ||
+      (status === 'unknown' &&
+        (descriptor.protocolVersion !== DAEMON_PROTOCOL_VERSION ||
+          this.authenticatedDescriptorHealthy(descriptor, deadline)))
+    )
+  }
+
+  async descriptorOwnerStatus(deadline?: number): Promise<'alive' | 'dead' | 'unknown'> {
+    const descriptor = await this.readDescriptor()
+    if (!descriptor || !this.validDescriptor(descriptor)) return 'dead'
     const identity = await processStartIdentity(descriptor.pid, deadline)
-    return identity
-      ? identity === descriptor.processIdentity
-      : this.processExists(descriptor.pid) ||
-          this.authenticatedDescriptorHealthy(descriptor, deadline)
+    if (identity) return identity === descriptor.processIdentity ? 'alive' : 'dead'
+    return this.processExists(descriptor.pid) ? 'unknown' : 'dead'
   }
 
   async ownershipSecret(): Promise<string> {

@@ -3889,15 +3889,17 @@ test('cleanup retains a terminal record with unverified containment', async () =
   expect((await storage.loadSessions()).map((entry) => entry.id)).toContain(session.id)
 })
 
-test('client preserves a healthy incompatible daemon descriptor', async () => {
+test('client does not contact a live incompatible daemon descriptor', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-incompatible-'))
   roots.push(root)
   const processIdentity = (await processStartIdentity(process.pid)) ?? 'unavailable'
+  let requests = 0
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
-    fetch: () =>
-      Response.json({
+    fetch: () => {
+      requests += 1
+      return Response.json({
         id: 'health',
         ok: true,
         result: {
@@ -3905,7 +3907,8 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
           pid: process.pid,
           processIdentity,
         },
-      }),
+      })
+    },
   })
   const previousDirectory = process.env.PTY_DAEMON_DIR
   process.env.PTY_DAEMON_DIR = root
@@ -3921,6 +3924,7 @@ test('client preserves a healthy incompatible daemon descriptor', async () => {
 
   try {
     await expect(new DaemonClient().list()).rejects.toThrow('incompatible')
+    expect(requests).toBe(0)
     expect((await storage.readDescriptor())?.protocolVersion).toBe(DAEMON_PROTOCOL_VERSION + 1)
   } finally {
     server.stop(true)
@@ -4000,7 +4004,7 @@ Set-Acl -LiteralPath $env:PTY_DAEMON_ACL_PATH -AclObject $acl`,
       pid: process.pid,
       processIdentity: 'stale',
       endpoint: 'http://127.0.0.1:1',
-      protocolVersion: DAEMON_PROTOCOL_VERSION,
+      protocolVersion: DAEMON_PROTOCOL_VERSION - 1,
       token: 'x',
     })
     await storage.writeSession(record(root, 'pty_test', 'exited'))
