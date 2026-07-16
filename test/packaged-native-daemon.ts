@@ -2,8 +2,10 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DAEMON_PROTOCOL_VERSION } from '../src/daemon/types.ts'
+import { NATIVE_WORKER_PROTOCOL_VERSION } from '../src/shared/native-worker-targets.ts'
 
 const root = process.cwd()
+const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const packageDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-package-'))
 const stateDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-state-'))
 const platform =
@@ -150,8 +152,9 @@ async function workerHealth(worker: { endpoint: string; token: string }, timeout
     body: JSON.stringify({ operation: 'health' }),
     signal: AbortSignal.timeout(timeoutMs),
   })
-  const body = (await response.json()) as { ok?: boolean }
-  if (!body.ok) throw new Error('Native worker rejected its authenticated health probe.')
+  const body = (await response.json()) as { ok?: boolean; result?: { protocolVersion?: number } }
+  if (!body.ok || body.result?.protocolVersion !== NATIVE_WORKER_PROTOCOL_VERSION)
+    throw new Error('Native worker returned an incompatible authenticated health response.')
 }
 
 async function shutdownWorker(worker: { endpoint: string; token: string }) {
@@ -286,12 +289,12 @@ try {
     'prepare native package'
   )
   await requireCommand(
-    ['npm', 'pack', '--pack-destination', packageDirectory],
+    [npm, 'pack', '--pack-destination', packageDirectory],
     'npm pack worker',
     undefined,
     nativeDirectory
   )
-  await requireCommand(['npm', 'pack', '--pack-destination', packageDirectory], 'npm pack')
+  await requireCommand([npm, 'pack', '--pack-destination', packageDirectory], 'npm pack')
   const archives = await Array.fromAsync(new Bun.Glob('*.tgz').scan({ cwd: packageDirectory }))
   const archive = archives.find((file) => file.startsWith('opencode-pty-'))
   const nativeArchive = archives.find((file) =>
@@ -302,14 +305,42 @@ try {
   installed = join(installedRoot, 'node_modules', 'opencode-pty')
   await requireCommand(
     [
-      'npm',
+      npm,
       'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--prefer-offline',
       '--prefix',
       installedRoot,
       join(packageDirectory, archive),
       join(packageDirectory, nativeArchive),
     ],
     'npm install packaged native worker'
+  )
+  for (const [name, version] of [
+    ['@opencode-ai/plugin', '1.3.13'],
+    ['@opencode-ai/sdk', '1.3.13'],
+    ['@opentui/core', '0.1.95'],
+    ['@opentui/solid', '0.1.95'],
+  ] as const) {
+    const packageJSON = JSON.parse(
+      await readFile(join(installedRoot, 'node_modules', name, 'package.json'), 'utf8')
+    ) as { version?: string }
+    if (packageJSON.version !== version)
+      throw new Error(
+        `Packaged install resolved ${name}@${packageJSON.version}, expected ${version}.`
+      )
+  }
+  await requireCommand(
+    [
+      'bun',
+      '-e',
+      "const [plugin, server, tui] = await Promise.all(['opencode-pty', 'opencode-pty/server', 'opencode-pty/tui'].map(specifier => import(specifier))); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin || server.server !== plugin.PTYPlugin || typeof tui.tui !== 'function') throw new Error('Packaged exports have the wrong contract')",
+    ],
+    'import packaged exports',
+    10_000,
+    installedRoot
   )
   await stat(
     join(

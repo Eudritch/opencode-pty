@@ -7,6 +7,8 @@ export const NATIVE_WORKER_TARGETS = {
   'darwin-x64': { os: 'darwin', cpu: 'x64' },
 } as const
 
+export const NATIVE_WORKER_PROTOCOL_VERSION = 5
+
 export type NativeWorkerTarget = keyof typeof NATIVE_WORKER_TARGETS
 
 export function nativeWorkerTarget(

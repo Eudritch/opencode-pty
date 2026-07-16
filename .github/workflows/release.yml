@@ -145,7 +145,7 @@ jobs:
             $archive = (Get-ChildItem -Path $package -Filter *.tgz | Select-Object -First 1).FullName
             npm install --prefix (Join-Path $package installed) $archive
             $installed = Join-Path $package 'installed/node_modules/opencode-pty'
-            bun --cwd (Join-Path $package installed) -e "const plugin = await import('opencode-pty'); if (typeof plugin.PTYPlugin -ne 'function' -or plugin.server -ne plugin.PTYPlugin) { throw 'Package is missing compatible PTYPlugin/server exports.' }"
+            bun --cwd (Join-Path $package installed) -e "const [plugin, server, tui] = await Promise.all(['opencode-pty', 'opencode-pty/server', 'opencode-pty/tui'].map(specifier => import(specifier))); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin || server.server !== plugin.PTYPlugin || typeof tui.tui !== 'function') throw new Error('Package is missing compatible server or TUI exports.')"
             $env:PTY_DAEMON_DIR = $state
             $daemon = Start-Process -FilePath bun -ArgumentList @('--cwd', $installed, 'dist/src/daemon/main.js') -PassThru
             1..40 | ForEach-Object {
@@ -271,7 +271,7 @@ jobs:
           trap cleanup EXIT
           npm pack --pack-destination "$package"
           npm install --prefix "$package/installed" "$package"/*.tgz
-          bun --cwd "$package/installed" -e "const plugin = await import('opencode-pty'); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin) throw new Error('Package is missing compatible PTYPlugin/server exports.')"
+          bun --cwd "$package/installed" -e "const [plugin, server, tui] = await Promise.all(['opencode-pty', 'opencode-pty/server', 'opencode-pty/tui'].map(specifier => import(specifier))); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin || server.server !== plugin.PTYPlugin || typeof tui.tui !== 'function') throw new Error('Package is missing compatible server or TUI exports.')"
           PTY_DAEMON_DIR="$state" bun --cwd "$package/installed/node_modules/opencode-pty" dist/src/daemon/main.js &
           daemon_pid=$!
           for _ in $(seq 1 20); do test -f "$state/daemon.json" && break; sleep 0.1; done

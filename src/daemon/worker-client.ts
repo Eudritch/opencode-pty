@@ -1,7 +1,11 @@
 import { access, readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import { nativeWorkerPackageName, nativeWorkerTarget } from '../shared/native-worker-targets.ts'
+import {
+  NATIVE_WORKER_PROTOCOL_VERSION,
+  nativeWorkerPackageName,
+  nativeWorkerTarget,
+} from '../shared/native-worker-targets.ts'
 import type { ContainmentReport, SpawnCleanup, TerminationResult } from './types.ts'
 
 function readyTimeout(value: string | undefined): number {
@@ -68,7 +72,7 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
     typeof descriptor.endpoint === 'string' &&
     typeof descriptor.token === 'string' &&
     descriptor.token.length >= 16 &&
-    descriptor.protocolVersion === 5
+    descriptor.protocolVersion === NATIVE_WORKER_PROTOCOL_VERSION
   )
 }
 

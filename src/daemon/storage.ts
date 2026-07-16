@@ -1,5 +1,6 @@
 import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import {
   type DaemonDescriptor,
   type ApprovalLedger,
@@ -569,7 +570,18 @@ export class DaemonStorage {
     }
     try {
       await this.privateFile(temporary)
-      await link(temporary, path)
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await link(temporary, path)
+          break
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          if (code === 'EEXIST') return false
+          if (code !== 'EACCES' || attempt >= WINDOWS_RENAME_RETRIES)
+            throw error
+          await Bun.sleep(WINDOWS_RENAME_RETRY_MS)
+        }
+      }
       await this.syncDirectory(this.root)
       return true
     } catch (error) {
@@ -582,6 +594,7 @@ export class DaemonStorage {
 
   private async startLockOwnerAlive(lock: StartLock, deadline?: number): Promise<boolean> {
     if (!lock.processIdentity) return false
+    if (!this.processExists(lock.pid)) return false
     const identity = await processStartIdentity(lock.pid, deadline)
     return identity === lock.processIdentity
   }
@@ -894,7 +907,7 @@ export class DaemonStorage {
         validText(value.endpoint) &&
         validNonnegativeInteger(value.protocolVersion) &&
         value.protocolVersion >= 1 &&
-        value.protocolVersion <= 5 &&
+        value.protocolVersion <= NATIVE_WORKER_PROTOCOL_VERSION &&
         (value.tokenFingerprint === undefined || validText(value.tokenFingerprint))
       )
     }
