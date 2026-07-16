@@ -252,6 +252,21 @@ async function rpc(
   return response.json() as Promise<{ ok: boolean; result?: unknown; error?: unknown }>
 }
 
+async function stopAfterRestart(
+  descriptor: { endpoint: string; token: string },
+  id: string,
+  owner: Record<string, string>
+) {
+  const deadline = Date.now() + 5000
+  let stopped: { ok: boolean; result?: unknown; error?: unknown }
+  do {
+    stopped = await rpc(descriptor, 'stop', { id }, owner)
+    if ((stopped.result as { requested?: boolean } | undefined)?.requested) return stopped
+    await Bun.sleep(25)
+  } while (Date.now() < deadline)
+  return stopped
+}
+
 let testFailure: unknown
 let cleanupFailure: unknown
 
@@ -435,9 +450,10 @@ try {
   started = await startDaemon(installed)
   daemon = started.child
   active.descriptor = started.descriptor
-  const stopped = await rpc(started.descriptor, 'stop', { id: id.id }, owner)
+  const stopped = await stopAfterRestart(started.descriptor, id.id, owner)
   if (
     !stopped.ok ||
+    (stopped.result as { requested?: boolean } | undefined)?.requested !== true ||
     (stopped.result as { terminationConfirmed?: boolean } | undefined)?.terminationConfirmed !==
       true
   )
@@ -483,15 +499,20 @@ try {
   executeAbort?.abort()
   await waitForExecution().catch(() => undefined)
   if (active && installed) {
+    let restarted = false
     if (!daemon || daemon.exitCode !== null) {
-      const restarted = await startDaemon(installed).catch(() => undefined)
-      if (restarted) {
-        daemon = restarted.child
-        active.descriptor = restarted.descriptor
+      const recovered = await startDaemon(installed).catch(() => undefined)
+      if (recovered) {
+        daemon = recovered.child
+        active.descriptor = recovered.descriptor
+        restarted = true
       }
     }
     if (daemon?.exitCode === null)
-      await rpc(active.descriptor, 'stop', { id: active.id }, active.owner).catch(() => undefined)
+      await (restarted
+        ? stopAfterRestart(active.descriptor, active.id, active.owner)
+        : rpc(active.descriptor, 'stop', { id: active.id }, active.owner)
+      ).catch(() => undefined)
   }
   try {
     if (worker) {
