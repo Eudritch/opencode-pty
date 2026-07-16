@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs'
 
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const MAX_TIMEOUT_MS = 60 * 60 * 1000
+const MAX_ENV_ENTRIES = 128
+const MAX_ENV_KEY_LENGTH = 256
+const MAX_ENV_VALUE_LENGTH = 8192
 const CLEANUP_WAIT_MS = 750
 const DRAIN_WAIT_MS = 300
 const WAIT_TIMEOUT = Symbol('wait timeout')
@@ -58,6 +61,35 @@ function capture(stream) {
   }
   output.truncated = () => truncated
   return output
+}
+
+function validateEnv(env) {
+  if (env === undefined) return
+  if (
+    env === null ||
+    typeof env !== 'object' ||
+    Array.isArray(env) ||
+    Object.getPrototypeOf(env) !== Object.prototype
+  ) {
+    throw new Error('env must be a plain object')
+  }
+  const entries = Object.entries(env)
+  if (entries.length > MAX_ENV_ENTRIES) {
+    throw new Error(`env must have no more than ${MAX_ENV_ENTRIES} entries`)
+  }
+  for (const [key, value] of entries) {
+    if (
+      !key ||
+      key.length > MAX_ENV_KEY_LENGTH ||
+      key.includes('=') ||
+      key.includes('\0') ||
+      typeof value !== 'string' ||
+      value.length > MAX_ENV_VALUE_LENGTH ||
+      value.includes('\0')
+    ) {
+      throw new Error('env must contain bounded string keys and values without NUL or = in keys')
+    }
+  }
 }
 
 function baseResult(command) {
@@ -124,7 +156,7 @@ async function drain(child, closed) {
   return drained
 }
 
-export async function runWithTimeout({ command, args = [], timeoutMs, signal } = {}) {
+export async function runWithTimeout({ command, args = [], timeoutMs, signal, env } = {}) {
   if (
     typeof command !== 'string' ||
     !command ||
@@ -136,6 +168,7 @@ export async function runWithTimeout({ command, args = [], timeoutMs, signal } =
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) {
     throw new Error(`timeoutMs must be a positive integer no greater than ${MAX_TIMEOUT_MS}`)
   }
+  validateEnv(env)
   if (
     signal !== undefined &&
     (signal === null ||
@@ -163,6 +196,7 @@ export async function runWithTimeout({ command, args = [], timeoutMs, signal } =
   }
 
   const child = spawn(command, args, {
+    env: { ...process.env, ...env },
     shell: false,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -267,6 +301,11 @@ function assertResultSchema(result, label) {
 }
 
 async function selfTest(signal) {
+  await assert.rejects(
+    runWithTimeout({ command: process.execPath, timeoutMs: 2_500, env: [] }),
+    /env must be a plain object/,
+    'invalid env was not rejected before spawn'
+  )
   const finite = await runWithTimeout({
     command: process.execPath,
     args: ['-e', "console.log('ok')"],
@@ -292,6 +331,14 @@ async function selfTest(signal) {
     signal,
   })
   const cancellation = new AbortController()
+  const envValue = 'run-with-timeout-self-test'
+  const withEnv = await runWithTimeout({
+    command: process.execPath,
+    args: ['-e', "process.stdout.write(process.env.RUN_WITH_TIMEOUT_SELF_TEST ?? '')"],
+    timeoutMs: 2_500,
+    env: { RUN_WITH_TIMEOUT_SELF_TEST: envValue },
+    signal,
+  })
   const cancelledPromise = runWithTimeout({
     command: process.execPath,
     args: ['-e', 'setInterval(() => {}, 1_000)'],
@@ -304,6 +351,8 @@ async function selfTest(signal) {
   assert.equal(finite.exitCode, 0, 'finite child failed')
   assert.equal(finite.stdout.trim(), 'ok', 'finite child output failed')
   assert.equal(finite.status, 'exited', 'finite child status failed')
+  assert.equal(withEnv.exitCode, 0, 'env child failed')
+  assert.equal(withEnv.stdout, envValue, 'env child did not receive override')
   assertResultSchema(timedOut, 'timed out')
   assert.equal(timedOut.timedOut, true, 'hanging child did not time out')
   assert.equal(timedOut.status, 'timed_out', 'timed out status was overwritten')
