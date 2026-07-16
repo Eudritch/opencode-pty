@@ -76,10 +76,14 @@ export function bashTimeout(timeout = DEFAULT_TIMEOUT_MS): number {
   return seconds
 }
 
+export function bashApprovalCapability(agent: string): string {
+  return `bash:${new Bun.CryptoHasher('sha256').update(agent.normalize('NFC')).digest('hex')}`
+}
+
 export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manager) {
   return tool({
     description:
-      'Run one finite shell command in the foreground. This intentionally overrides OpenCode Bash rendering; use pty_spawn for durable background work.',
+      'Start one finite shell command in the background and collect its result asynchronously.',
     args: {
       command: tool.schema.string().describe('Raw shell command'),
       workdir: tool.schema.string().optional().describe('Working directory'),
@@ -91,17 +95,18 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
       ctx.metadata({
         title: 'Bash',
         metadata: {
-          output: '[opencode-pty · foreground · awaiting approval]',
+          output: '[opencode-pty · background · awaiting approval]',
         },
       })
       const policy = await authorize(args.command, args.workdir, ctx.agent)
       const owner = ownerContext(ctx.sessionID, ctx.directory)
+      const capability = bashApprovalCapability(ctx.agent)
       const approval =
         policy.action === 'ask'
           ? await daemon.prepareApproval(
               {
                 command: args.command,
-                capability: 'bash',
+                capability,
                 workdir: policy.workdir,
                 expirySeconds: APPROVAL_EXPIRY_SECONDS,
               },
@@ -116,7 +121,7 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
             approval.id,
             {
               command: args.command,
-              capability: 'bash',
+              capability,
               workdir: policy.workdir,
             },
             owner
@@ -135,7 +140,7 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
       ctx.metadata({
         title: 'Bash',
         metadata: {
-          output: '[opencode-pty · foreground · running]',
+          output: '[opencode-pty · background · running]',
         },
       })
       try {
@@ -163,11 +168,11 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
         ctx.metadata({
           title: 'Bash',
           metadata: {
-            output: '[opencode-pty · foreground · completed]',
+            output: '[opencode-pty · background · completed]',
           },
         })
         return [
-          `<bash origin="opencode-pty" mode="foreground" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" termination_confirmed="${result.terminationConfirmed}" terminal="true">`,
+          `<bash origin="opencode-pty" mode="background" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" termination_confirmed="${result.terminationConfirmed}" terminal="true">`,
           `<stdout>${escapeXml(result.stdout)}</stdout>`,
           `<stderr>${escapeXml(result.stderr)}</stderr>`,
           '</bash>',
@@ -176,7 +181,7 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
         ctx.metadata({
           title: 'Bash',
           metadata: {
-            output: '[opencode-pty · foreground · request failed]',
+            output: '[opencode-pty · background · request failed]',
           },
         })
         throw error
@@ -199,7 +204,7 @@ async function abortableAsk(ctx: ToolContext, command: string): Promise<void> {
         permission: 'bash',
         patterns: [command],
         always: [],
-        metadata: { output: '[opencode-pty · foreground · awaiting approval]' },
+        metadata: { output: '[opencode-pty · background · awaiting approval]' },
       }),
       cancelled,
     ])

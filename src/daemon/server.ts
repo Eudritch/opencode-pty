@@ -685,7 +685,7 @@ export class DaemonServer implements Disposable {
     return this.withApprovals(async (ledger) => {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
-      if (['pending', 'claimed', 'native_fallback'].includes(request.status)) {
+      if (['pending', 'claimed', 'native_fallback', 'approved_once'].includes(request.status)) {
         request.status = 'cancelled'
         request.claimExpiresAt = undefined
         this.approvalClaimTokens.delete(request.id)
@@ -741,7 +741,7 @@ export class DaemonServer implements Disposable {
 
   private refreshApproval(request: ApprovalRequest): void {
     if (
-      ['pending', 'claimed', 'native_fallback'].includes(request.status) &&
+      ['pending', 'claimed', 'native_fallback', 'approved_once'].includes(request.status) &&
       Date.parse(request.expiresAt) <= Date.now()
     ) {
       request.status = 'expired'

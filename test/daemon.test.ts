@@ -39,7 +39,12 @@ import {
 import { formatLine, formatSessionInfo } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { createBashAuthorizer } from '../src/plugin/pty/permissions.ts'
-import { bashArgv, bashTimeout, createBash } from '../src/plugin/pty/tools/bash.ts'
+import {
+  bashApprovalCapability,
+  bashArgv,
+  bashTimeout,
+  createBash,
+} from '../src/plugin/pty/tools/bash.ts'
 import { PTYPlugin } from '../src/plugin.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
@@ -460,6 +465,68 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
     })
     expect(((await replay.json()) as { error: { code: string } }).error.code).toBe('validation')
 
+    const expiringOnce = await request()
+    const expiringClaim = (await (
+      await approvalRpc('approvalClaim', { id: expiringOnce })
+    ).json()) as {
+      result: { claimToken: string }
+    }
+    await approvalRpc('approvalDecide', {
+      id: expiringOnce,
+      decision: 'approve_once',
+      claimToken: expiringClaim.result.claimToken,
+    })
+    const expiringLedger = await storage.readApprovals()
+    const expiredOnce = expiringLedger.requests.find((entry) => entry.id === expiringOnce)
+    if (!expiredOnce) throw new Error('Expected expiring one-shot approval.')
+    expiredOnce.expiresAt = new Date(0).toISOString()
+    await storage.writeApprovals(expiringLedger)
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalConsume', {
+            id: expiringOnce,
+            command: 'bun test',
+            reason: 'test approval',
+            capability: 'tool',
+            workdir: root,
+          })
+        ).json()) as { result: { status: string } }
+      ).result.status
+    ).toBe('expired')
+
+    const cancelledOnce = await request()
+    const cancelledClaim = (await (
+      await approvalRpc('approvalClaim', { id: cancelledOnce })
+    ).json()) as {
+      result: { claimToken: string }
+    }
+    await approvalRpc('approvalDecide', {
+      id: cancelledOnce,
+      decision: 'approve_once',
+      claimToken: cancelledClaim.result.claimToken,
+    })
+    expect(
+      (
+        (await (await approvalRpc('approvalCancel', { id: cancelledOnce })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('cancelled')
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalConsume', {
+            id: cancelledOnce,
+            command: 'bun test',
+            reason: 'test approval',
+            capability: 'tool',
+            workdir: root,
+          })
+        ).json()) as { result: { status: string } }
+      ).result.status
+    ).toBe('cancelled')
+
     const rejected = await request()
     const rejectedClaim = (await (await approvalRpc('approvalClaim', { id: rejected })).json()) as {
       result: { claimToken: string }
@@ -597,7 +664,7 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
   } finally {
     await server.stop()
   }
-})
+}, 10_000)
 
 test('approval preparation binds intent and retains a long native approval window', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-approval-prepare-'))
@@ -628,6 +695,65 @@ test('approval preparation binds intent and retains a long native approval windo
     const prepared = (await response.json()) as { result: { status: string; expiresAt?: string } }
     expect(prepared.result.status).toBe('pending')
     expect(Date.parse(prepared.result.expiresAt ?? '')).toBeGreaterThan(Date.now() + 3_500_000)
+  } finally {
+    await server.stop()
+  }
+})
+
+test('Bash session grants are isolated by an opaque agent capability', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-approval-agent-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'agent-token')
+  const descriptor = await server.start()
+  const context = await owner(storage, 'agent-session', root)
+  const approvals = await approvalCapability(storage, 'agent-session', root)
+  const approvalRpc = (operation: string, payload: unknown) =>
+    fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer agent-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation,
+        owner: context,
+        approvalCapability: approvals,
+        payload,
+      }),
+    })
+  const agentA = bashApprovalCapability('agent-a-private-name')
+  const agentB = bashApprovalCapability('agent-b-private-name')
+  expect(agentA).not.toContain('agent-a-private-name')
+  try {
+    const created = (await (
+      await approvalRpc('approvalCreate', {
+        command: 'bun test',
+        reason: 'test approval',
+        capability: agentA,
+        workdir: root,
+        expirySeconds: 30,
+      })
+    ).json()) as { result: { id: string } }
+    const claimed = (await (
+      await approvalRpc('approvalClaim', { id: created.result.id })
+    ).json()) as {
+      result: { claimToken: string }
+    }
+    await approvalRpc('approvalDecide', {
+      id: created.result.id,
+      decision: 'approve_session',
+      claimToken: claimed.result.claimToken,
+    })
+    const prepared = (await (
+      await approvalRpc('approvalPrepare', {
+        command: 'bun test',
+        reason: 'test approval',
+        capability: agentB,
+        workdir: root,
+        expirySeconds: 30,
+      })
+    ).json()) as { result: { status: string } }
+    expect(prepared.result.status).toBe('pending')
   } finally {
     await server.stop()
   }
@@ -1056,7 +1182,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
       calls.push('ask')
       expect(request.patterns).toEqual(['echo ok'])
       expect(request.metadata).toEqual({
-        output: '[opencode-pty · foreground · awaiting approval]',
+        output: '[opencode-pty · background · awaiting approval]',
       })
     },
     metadata: (input: { title?: string; metadata?: { output?: string; description?: string } }) => {
@@ -1072,12 +1198,12 @@ test('bash wrapper keeps host metadata private and consumes native approval once
     `exec:${process.platform === 'win32' ? process.env.ComSpec : '/bin/sh'}:${process.platform === 'win32' ? '/d,/s,/c,echo ok' : '-lc,echo ok'}`,
   ])
   expect(metadata).toEqual([
-    '[opencode-pty · foreground · awaiting approval]',
-    '[opencode-pty · foreground · running]',
-    '[opencode-pty · foreground · completed]',
+    '[opencode-pty · background · awaiting approval]',
+    '[opencode-pty · background · running]',
+    '[opencode-pty · background · completed]',
   ])
   expect(output).toContain(
-    '<bash origin="opencode-pty" mode="foreground" status="exited" exit_code="0"'
+    '<bash origin="opencode-pty" mode="background" status="exited" exit_code="0"'
   )
   const rejected: string[] = []
   const rejectingBash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
@@ -1196,6 +1322,45 @@ test('bash reuses a matching session grant without native approval', async () =>
     } as never)
   ).resolves.toContain('status="exited"')
   expect(calls).toEqual(['start'])
+})
+
+test('Bash asks again when a session grant belongs to another agent', async () => {
+  const calls: string[] = []
+  const granted = bashApprovalCapability('agent-a')
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    prepareApproval: async (request: { capability: string }) =>
+      request.capability === granted
+        ? { status: 'approved_session' }
+        : { id: 'approval', status: 'pending' },
+    approveNativeApproval: async () => ({ id: 'approval', status: 'approved_once' }),
+    consumeApproval: async () => ({ id: 'approval', status: 'consumed' }),
+    cancelApproval: async () => ({ id: 'approval', status: 'cancelled' }),
+    execStart: async () => ({ id: 'exec', status: 'running', mode: 'exec', pid: 1 }),
+    execWait: async () => ({
+      session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      outputLimited: false,
+      terminationConfirmed: true,
+      startedAt: '',
+      exitedAt: '',
+    }),
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  const context = (agent: string) =>
+    ({
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent,
+      abort: new AbortController().signal,
+      ask: async () => calls.push(`ask:${agent}`),
+      metadata: () => {},
+    }) as never
+
+  await bash.execute({ command: 'echo granted' }, context('agent-a'))
+  await bash.execute({ command: 'echo granted' }, context('agent-b'))
+  expect(calls).toEqual(['ask:agent-b'])
 })
 
 test('bash asks when no matching session grant is available', async () => {
