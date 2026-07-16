@@ -3520,6 +3520,7 @@ test('daemon classifies storage failures', async () => {
   const storage = new DaemonStorage(root)
   const supervisor = {
     initialize: async () => {},
+    reconcileWorkers: async () => {},
     flush: async () => {},
     list: async () => {
       throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
@@ -3554,6 +3555,7 @@ test('daemon classifies PTY failures as process failures', async () => {
   const storage = new DaemonStorage(root)
   const supervisor = {
     initialize: async () => {},
+    reconcileWorkers: async () => {},
     flush: async () => {},
     list: async () => [],
     spawn: async () => {
