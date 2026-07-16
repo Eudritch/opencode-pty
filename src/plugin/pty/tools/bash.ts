@@ -2,6 +2,7 @@ import { tool, type ToolContext } from '@opencode-ai/plugin'
 import { existsSync } from 'node:fs'
 import {
   MAX_EXEC_RUNTIME_SECONDS,
+  MAX_EXEC_WAIT_SECONDS,
   type ApprovalRequest,
   type ExecResult,
 } from '../../../daemon/types.ts'
@@ -153,17 +154,18 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
           daemon,
           session.id,
           owner,
-          Math.min(timeoutSeconds + 5, MAX_EXEC_RUNTIME_SECONDS)
+          Math.min(timeoutSeconds + 5, MAX_EXEC_WAIT_SECONDS)
         )
-        const terminal = terminalExecResult(result)
+        if (!terminalExecResult(result))
+          throw new Error('Bash execution completed without terminal evidence.')
         ctx.metadata({
           title: 'Bash',
           metadata: {
-            output: `[opencode-pty · foreground · ${terminal ? 'completed' : 'pending'}]`,
+            output: '[opencode-pty · foreground · completed]',
           },
         })
         return [
-          `<bash origin="opencode-pty" mode="foreground" status="${terminal ? escapeXml(result.session.status) : 'pending'}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" termination_confirmed="${result.terminationConfirmed}" terminal="${terminal}">`,
+          `<bash origin="opencode-pty" mode="foreground" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" termination_confirmed="${result.terminationConfirmed}" terminal="true">`,
           `<stdout>${escapeXml(result.stdout)}</stdout>`,
           `<stderr>${escapeXml(result.stderr)}</stderr>`,
           '</bash>',
@@ -183,21 +185,25 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
 
 async function abortableAsk(ctx: ToolContext, command: string): Promise<void> {
   if (ctx.abort.aborted) throw new Error('Bash approval cancelled before prompting.')
-  await Promise.race([
-    ctx.ask({
-      permission: 'bash',
-      patterns: [command],
-      always: [],
-      metadata: { output: '[opencode-pty · foreground · awaiting approval]' },
-    }),
-    new Promise<never>((_, reject) => {
-      ctx.abort.addEventListener(
-        'abort',
-        () => reject(new Error('Bash approval cancelled before prompting.')),
-        { once: true }
-      )
-    }),
-  ])
+  if (typeof ctx.ask !== 'function') throw new Error('Bash approval is unavailable in this host.')
+  let abort!: () => void
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(new Error('Bash approval cancelled before prompting.'))
+    ctx.abort.addEventListener('abort', abort, { once: true })
+  })
+  try {
+    await Promise.race([
+      ctx.ask({
+        permission: 'bash',
+        patterns: [command],
+        always: [],
+        metadata: { output: '[opencode-pty · foreground · awaiting approval]' },
+      }),
+      cancelled,
+    ])
+  } finally {
+    ctx.abort.removeEventListener('abort', abort)
+  }
   if (ctx.abort.aborted) throw new Error('Bash approval cancelled before execution.')
 }
 

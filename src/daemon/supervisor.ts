@@ -8,6 +8,7 @@ import {
   type ExecResult,
   type ExitReason,
   MAX_EXEC_RUNTIME_SECONDS,
+  MAX_EXEC_WAIT_SECONDS,
   OUTPUT_JOURNAL_VERSION,
   type SessionRecord,
   type StopResult,
@@ -24,7 +25,7 @@ const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
 const RECOVERY_CONCURRENCY = 4
-const EXEC_TERMINAL_WAIT_SECONDS = 5
+const EXEC_TERMINAL_WAIT_SECONDS = MAX_EXEC_WAIT_SECONDS - MAX_EXEC_RUNTIME_SECONDS
 const SAFE_ENVIRONMENT_KEYS = new Set([
   'PATH',
   'HOME',
@@ -728,7 +729,7 @@ export class SessionSupervisor {
     const session = await this.nativeExecStart(options)
     return this.nativeExecWait(
       session.id,
-      Math.min((options.timeoutSeconds ?? 0) + EXEC_TERMINAL_WAIT_SECONDS, MAX_EXEC_RUNTIME_SECONDS)
+      Math.min((options.timeoutSeconds ?? 0) + EXEC_TERMINAL_WAIT_SECONDS, MAX_EXEC_WAIT_SECONDS)
     )
   }
 
@@ -833,14 +834,18 @@ export class SessionSupervisor {
     if (
       !Number.isInteger(timeoutSeconds) ||
       timeoutSeconds <= 0 ||
-      timeoutSeconds > MAX_EXEC_RUNTIME_SECONDS
+      timeoutSeconds > MAX_EXEC_WAIT_SECONDS
     )
       throw new Error(
-        `timeoutSeconds must be a positive integer up to ${MAX_EXEC_RUNTIME_SECONDS} for exec`
+        `timeoutSeconds must be a positive integer up to ${MAX_EXEC_WAIT_SECONDS} for exec wait`
       )
     const record = this.recordFor(id)
     if (record.mode !== 'exec') throw new Error(`Session '${id}' is not an exec session.`)
-    const waited = await this.wait(id, { kind: 'exit' }, timeoutSeconds)
+    const waited = await this.wait(
+      id,
+      { kind: 'exit' },
+      Math.min(timeoutSeconds, MAX_EXEC_RUNTIME_SECONDS)
+    )
     if (waited.reason === 'deadline' && activeStatus(record)) {
       await this.stop(id)
       const stopped = await this.wait(id, { kind: 'exit' }, EXEC_TERMINAL_WAIT_SECONDS)

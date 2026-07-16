@@ -46,7 +46,7 @@ export function createBashAuthorizer(client: PluginClient, directory: string): B
     const permissions = await permissionConfig(client)
     const action = evaluate(permissions, agent, 'bash', command)
     if (!action || action === 'deny')
-      return deny(client, `Bash command denied: "${command}" has no explicit allow rule.`)
+      return deny(client, 'Bash command denied: no explicit allow rule.')
     return {
       action,
       workdir: await authorizeWorkdir(client, permissions, directory, workdir, agent),

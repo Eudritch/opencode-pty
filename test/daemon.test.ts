@@ -494,6 +494,36 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
     expect(((await expiredLease.json()) as { error: { code: string } }).error.code).toBe(
       'authorization'
     )
+    const fallback = await request()
+    const fallbackClaim = (await (await approvalRpc('approvalClaim', { id: fallback })).json()) as {
+      result: { claimToken: string }
+    }
+    const fallbackLedger = await storage.readApprovals()
+    const fallbackRequest = fallbackLedger.requests.find((entry) => entry.id === fallback)
+    if (!fallbackRequest) throw new Error('Expected fallback approval.')
+    fallbackRequest.claimExpiresAt = new Date(0).toISOString()
+    await storage.writeApprovals(fallbackLedger)
+    expect(
+      (
+        (await (await approvalRpc('approvalNativeApprove', { id: fallback })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('approved_once')
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalConsume', {
+            id: fallback,
+            command: 'bun test',
+            reason: 'test approval',
+            capability: 'tool',
+            workdir: root,
+          })
+        ).json()) as { result: { status: string } }
+      ).result.status
+    ).toBe('consumed')
+    expect(fallbackClaim.result.claimToken).toMatch(/^[a-f0-9]{32}$/)
     const cancelled = await request()
     expect(
       (
@@ -919,6 +949,22 @@ test('bash policy matches opaque raw input and preserves external workdir checks
     'no explicit allow'
   )
   expect(await authorizer({ bash: 'ask' })('git status')).toMatchObject({ action: 'ask' })
+  await expect(
+    createBashAuthorizer(
+      {
+        config: {
+          get: async () => ({
+            data: {
+              permission: { bash: 'allow' },
+              agent: { restricted: { permission: { bash: 'deny' } } },
+            },
+          }),
+        },
+        tui: { showToast: async () => {} },
+      } as never,
+      root
+    )('git status', undefined, 'restricted')
+  ).rejects.toThrow('no explicit allow')
   await expect(authorizer({ bash: 'allow' })('git status', external)).rejects.toThrow(
     'external_directory allow'
   )
@@ -932,6 +978,8 @@ test('bash wrapper keeps host metadata private and consumes native approval once
   expect(bashArgv('echo ok', 'linux', {}, () => true)).toEqual(['/bin/sh', ['-lc', 'echo ok']])
   expect(bashTimeout(1999)).toBe(1)
   expect(() => bashTimeout(999)).toThrow('at least 1000')
+  expect(() => bashTimeout(3_600_000)).not.toThrow()
+  expect(() => bashTimeout(3_601_000)).toThrow('3600 second limit')
   const calls: string[] = []
   const daemon = {
     createApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1024,8 +1072,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
   expect(rejected).toEqual(['cancel'])
 })
 
-test('bash leaves a nonterminal exec result pending', async () => {
-  const metadata: string[] = []
+test('bash rejects nonterminal exec results rather than claiming completion', async () => {
   const bash = createBash(async () => ({ action: 'allow', workdir: process.cwd() }), {
     execStart: async () => ({ id: 'exec', status: 'running', mode: 'exec', pid: 1 }),
     execWait: async () => ({
@@ -1041,21 +1088,45 @@ test('bash leaves a nonterminal exec result pending', async () => {
     stop: async () => ({ terminationConfirmed: false }),
   } as never)
 
-  const output = await bash.execute({ command: 'echo partial' }, {
-    sessionID: 'test-session',
-    directory: process.cwd(),
-    agent: 'test',
-    abort: new AbortController().signal,
-    ask: async () => {},
-    metadata: (input: { metadata?: { output?: string } }) => {
-      if (input.metadata?.output) metadata.push(input.metadata.output)
-    },
-  } as never)
+  await expect(
+    bash.execute({ command: 'echo partial' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      ask: async () => {},
+      metadata: () => {},
+    } as never)
+  ).rejects.toThrow('without terminal evidence')
+})
 
-  expect(metadata).toContain('[opencode-pty · foreground · pending]')
-  expect(metadata).not.toContain('[opencode-pty · foreground · completed]')
-  expect(output).toContain('status="pending"')
-  expect(output).toContain('terminal="false"')
+test('bash cancels durable approval when native ctx.ask is unavailable', async () => {
+  const calls: string[] = []
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    createApproval: async () => ({ id: 'approval', status: 'pending' }),
+    cancelApproval: async () => {
+      calls.push('cancel')
+      return { id: 'approval', status: 'cancelled' }
+    },
+    execStart: async () => {
+      calls.push('start')
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async () => {
+      throw new Error('must not wait')
+    },
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  await expect(
+    bash.execute({ command: 'echo no' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      metadata: () => {},
+    } as never)
+  ).rejects.toThrow('approval is unavailable')
+  expect(calls).toEqual(['cancel'])
 })
 
 test('bash abort cancels pending approval before dispatch', async () => {
@@ -2058,7 +2129,7 @@ test('native exec wait rejects a record still active after stop', async () => {
   )
 })
 
-test('native exec caps near-maximum timeout waits at the documented maximum', async () => {
+test('native exec allows the bounded terminal grace after maximum runtime', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-max-timeout-'))
   roots.push(root)
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
@@ -2073,14 +2144,17 @@ test('native exec caps near-maximum timeout waits at the documented maximum', as
     return {}
   }
 
-  for (const timeoutSeconds of [3596, 3600]) {
+  for (const [timeoutSeconds, expectedWait] of [
+    [3596, 3601],
+    [3600, 3605],
+  ]) {
     await supervisor.nativeExec({
       command: 'test',
       parentSessionId: 'parent',
       timeoutSeconds,
       workdir: root,
     })
-    expect(timeout).toBe(3600)
+    expect(timeout).toBe(expectedWait)
   }
 })
 

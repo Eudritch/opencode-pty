@@ -3,6 +3,7 @@ export const DAEMON_PROTOCOL_VERSION = 8
 export const OUTPUT_JOURNAL_VERSION = 2
 
 export const MAX_EXEC_RUNTIME_SECONDS = 3600
+export const MAX_EXEC_WAIT_SECONDS = MAX_EXEC_RUNTIME_SECONDS + 5
 
 export type ExitReason =
   | { kind: 'code'; code: number }
