@@ -1242,6 +1242,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
   const rejected: string[] = []
   const rejectingBash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     ...daemon,
+    waitForApproval: async () => ({ id: 'approval', status: 'native_fallback' }),
     cancelApproval: async () => {
       rejected.push('cancel')
       return { id: 'approval', status: 'cancelled' }
