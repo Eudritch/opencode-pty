@@ -1024,6 +1024,40 @@ test('bash wrapper keeps host metadata private and consumes native approval once
   expect(rejected).toEqual(['cancel'])
 })
 
+test('bash leaves a nonterminal exec result pending', async () => {
+  const metadata: string[] = []
+  const bash = createBash(async () => ({ action: 'allow', workdir: process.cwd() }), {
+    execStart: async () => ({ id: 'exec', status: 'running', mode: 'exec', pid: 1 }),
+    execWait: async () => ({
+      session: { id: 'exec', status: 'running', mode: 'exec', pid: 1 },
+      stdout: 'partial',
+      stderr: '',
+      timedOut: false,
+      outputLimited: false,
+      terminationConfirmed: false,
+      startedAt: '',
+      exitedAt: '',
+    }),
+    stop: async () => ({ terminationConfirmed: false }),
+  } as never)
+
+  const output = await bash.execute({ command: 'echo partial' }, {
+    sessionID: 'test-session',
+    directory: process.cwd(),
+    agent: 'test',
+    abort: new AbortController().signal,
+    ask: async () => {},
+    metadata: (input: { metadata?: { output?: string } }) => {
+      if (input.metadata?.output) metadata.push(input.metadata.output)
+    },
+  } as never)
+
+  expect(metadata).toContain('[opencode-pty · foreground · pending]')
+  expect(metadata).not.toContain('[opencode-pty · foreground · completed]')
+  expect(output).toContain('status="pending"')
+  expect(output).toContain('terminal="false"')
+})
+
 test('bash abort cancels pending approval before dispatch', async () => {
   const calls: string[] = []
   const controller = new AbortController()
@@ -1965,6 +1999,89 @@ test('daemon waits for output, exit, and deadline without plugin polling', async
   await supervisor.stop(running.id)
   await Bun.sleep(25)
   await supervisor.flush()
+})
+
+test('native exec wait stops a running record after its deadline and requires terminal evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-wait-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  const session = record(root, 'exec_wait_deadline')
+  session.mode = 'exec'
+  const state = supervisor as unknown as {
+    records: Map<string, SessionRecord>
+    wait: (id: string, condition: unknown, timeoutSeconds: number) => Promise<{ reason: string }>
+    stop: (id: string) => Promise<unknown>
+  }
+  state.records.set(session.id, session)
+  const waits: number[] = []
+  let stops = 0
+  state.wait = async (_id, _condition, timeoutSeconds) => {
+    waits.push(timeoutSeconds)
+    if (waits.length === 1) return { reason: 'deadline' }
+    session.status = 'exited'
+    session.terminationConfirmed = true
+    session.directChildExited = true
+    session.containment = { ...workerSnapshot().containment, status: 'not_applicable' }
+    return { reason: 'exit' }
+  }
+  state.stop = async () => {
+    stops += 1
+    session.status = 'stopping'
+    return {}
+  }
+
+  await expect(supervisor.nativeExecWait(session.id, 1)).resolves.toMatchObject({
+    session: { status: 'exited' },
+    terminationConfirmed: true,
+  })
+  expect(waits).toEqual([1, 5])
+  expect(stops).toBe(1)
+})
+
+test('native exec wait rejects a record still active after stop', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-wait-active-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  const session = record(root, 'exec_wait_active')
+  session.mode = 'exec'
+  const state = supervisor as unknown as {
+    records: Map<string, SessionRecord>
+    wait: () => Promise<{ reason: string }>
+    stop: () => Promise<unknown>
+  }
+  state.records.set(session.id, session)
+  state.wait = async () => ({ reason: 'deadline' })
+  state.stop = async () => ({})
+
+  await expect(supervisor.nativeExecWait(session.id, 1)).rejects.toThrow(
+    'stop completed without terminal evidence'
+  )
+})
+
+test('native exec caps near-maximum timeout waits at the documented maximum', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-max-timeout-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  const state = supervisor as unknown as {
+    nativeExecStart: () => Promise<{ id: string }>
+    nativeExecWait: (id: string, timeoutSeconds: number) => Promise<unknown>
+  }
+  let timeout: number | undefined
+  state.nativeExecStart = async () => ({ id: 'exec_max' })
+  state.nativeExecWait = async (_id, timeoutSeconds) => {
+    timeout = timeoutSeconds
+    return {}
+  }
+
+  for (const timeoutSeconds of [3596, 3600]) {
+    await supervisor.nativeExec({
+      command: 'test',
+      parentSessionId: 'parent',
+      timeoutSeconds,
+      workdir: root,
+    })
+    expect(timeout).toBe(3600)
+  }
 })
 
 test('sendWait ignores output before input acceptance and waits for later output', async () => {

@@ -1,6 +1,10 @@
 import { tool, type ToolContext } from '@opencode-ai/plugin'
 import { existsSync } from 'node:fs'
-import type { ApprovalRequest, ExecResult } from '../../../daemon/types.ts'
+import {
+  MAX_EXEC_RUNTIME_SECONDS,
+  type ApprovalRequest,
+  type ExecResult,
+} from '../../../daemon/types.ts'
 import { ownerContext, type OwnerContext } from '../daemon-client.ts'
 import { manager } from '../manager.ts'
 import type { BashAuthorizer } from '../permissions.ts'
@@ -65,7 +69,8 @@ export function bashTimeout(timeout = DEFAULT_TIMEOUT_MS): number {
   if (!Number.isSafeInteger(timeout) || timeout < 1000)
     throw new Error('Bash timeout must be a whole number of milliseconds of at least 1000.')
   const seconds = Math.floor(timeout / 1000)
-  if (seconds > 3600) throw new Error('Bash timeout exceeds the 3600 second limit.')
+  if (seconds > MAX_EXEC_RUNTIME_SECONDS)
+    throw new Error(`Bash timeout exceeds the ${MAX_EXEC_RUNTIME_SECONDS} second limit.`)
   return seconds
 }
 
@@ -143,15 +148,22 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
           },
           owner
         )
-        const result = await abortableExec(ctx, daemon, session.id, owner, timeoutSeconds + 5)
+        const result = await abortableExec(
+          ctx,
+          daemon,
+          session.id,
+          owner,
+          Math.min(timeoutSeconds + 5, MAX_EXEC_RUNTIME_SECONDS)
+        )
+        const terminal = terminalExecResult(result)
         ctx.metadata({
           title: 'Bash',
           metadata: {
-            output: '[opencode-pty · foreground · completed]',
+            output: `[opencode-pty · foreground · ${terminal ? 'completed' : 'pending'}]`,
           },
         })
         return [
-          `<bash origin="opencode-pty" mode="foreground" status="${escapeXml(result.session.status)}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" termination_confirmed="${result.terminationConfirmed}">`,
+          `<bash origin="opencode-pty" mode="foreground" status="${terminal ? escapeXml(result.session.status) : 'pending'}" exit_code="${escapeXml(result.exitCode ?? 'unknown')}" timed_out="${result.timedOut}" termination_confirmed="${result.terminationConfirmed}" terminal="${terminal}">`,
           `<stdout>${escapeXml(result.stdout)}</stdout>`,
           `<stderr>${escapeXml(result.stderr)}</stderr>`,
           '</bash>',
@@ -200,10 +212,22 @@ async function abortableExec(
     return await daemon.execWait(id, timeoutSeconds, owner, ctx.abort)
   } catch (error) {
     if (!ctx.abort.aborted) throw error
-    const stop = await daemon.stop(id, owner).catch(() => ({ terminationConfirmed: false }))
-    const terminal = await daemon.execWait(id, 5, owner).catch(() => undefined)
+    await daemon.stop(id, owner).catch(() => undefined)
+    const terminal = await daemon
+      .execWait(id, 5, owner)
+      .then((result) => (terminalExecResult(result) ? result : undefined))
+      .catch(() => undefined)
     throw new Error(
-      `Bash execution aborted; termination_confirmed=${terminal?.terminationConfirmed ?? stop.terminationConfirmed}.`
+      `Bash execution aborted; termination_confirmed=${terminal?.terminationConfirmed ?? false}.`
     )
   }
+}
+
+function terminalExecResult(result: ExecResult): boolean {
+  return (
+    result.terminationConfirmed &&
+    (result.session.status === 'exited' ||
+      result.session.status === 'timed_out' ||
+      result.session.status === 'output_limited')
+  )
 }

@@ -9,6 +9,7 @@ import {
   type RpcFailure,
   type RpcRequest,
   type RpcResponse,
+  MAX_EXEC_RUNTIME_SECONDS,
 } from './types.ts'
 import type { DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
@@ -26,7 +27,6 @@ const MAX_PAGE_SIZE = 10_000
 const MAX_INPUT_BYTES = 64 * 1024
 const MAX_INPUT_BYTES_PER_MINUTE = 256 * 1024
 const DEFAULT_MAX_SESSIONS_PER_OWNER = 32
-const MAX_EXEC_RUNTIME_SECONDS = 3600
 const MAX_APPROVAL_EXPIRY_SECONDS = 3600
 const MAX_SESSION_GRANT_SECONDS = 24 * 60 * 60
 const CLAIM_LEASE_MS = 30_000

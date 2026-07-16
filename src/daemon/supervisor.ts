@@ -7,6 +7,7 @@ import {
   type EnvironmentProfile,
   type ExecResult,
   type ExitReason,
+  MAX_EXEC_RUNTIME_SECONDS,
   OUTPUT_JOURNAL_VERSION,
   type SessionRecord,
   type StopResult,
@@ -23,6 +24,7 @@ const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
 const RECOVERY_CONCURRENCY = 4
+const EXEC_TERMINAL_WAIT_SECONDS = 5
 const SAFE_ENVIRONMENT_KEYS = new Set([
   'PATH',
   'HOME',
@@ -724,15 +726,27 @@ export class SessionSupervisor {
 
   async nativeExec(options: ExecOptions): Promise<ExecResult> {
     const session = await this.nativeExecStart(options)
-    return this.nativeExecWait(session.id, (options.timeoutSeconds ?? 0) + 5)
+    return this.nativeExecWait(
+      session.id,
+      Math.min((options.timeoutSeconds ?? 0) + EXEC_TERMINAL_WAIT_SECONDS, MAX_EXEC_RUNTIME_SECONDS)
+    )
   }
 
   async nativeExecStart(
     options: ExecOptions
   ): Promise<{ id: string; status: SessionRecord['status']; mode: 'exec'; pid: number }> {
     await this.flush()
-    if (!options.command || !options.timeoutSeconds)
-      throw new Error('timeoutSeconds is required for exec')
+    if (!options.command) throw new Error('command is required')
+    const timeoutSeconds = options.timeoutSeconds
+    if (
+      timeoutSeconds === undefined ||
+      !Number.isInteger(timeoutSeconds) ||
+      timeoutSeconds <= 0 ||
+      timeoutSeconds > MAX_EXEC_RUNTIME_SECONDS
+    )
+      throw new Error(
+        `timeoutSeconds must be a positive integer up to ${MAX_EXEC_RUNTIME_SECONDS} for exec`
+      )
     const args = options.args ?? []
     const now = new Date().toISOString()
     const id = `exec_${crypto.randomUUID()}`
@@ -756,7 +770,7 @@ export class SessionSupervisor {
       updatedAt: now,
       parentSessionId: options.parentSessionId,
       parentAgent: options.parentAgent,
-      timeoutSeconds: options.timeoutSeconds,
+      timeoutSeconds,
       timedOut: false,
       terminationRequested: false,
       terminationConfirmed: false,
@@ -782,7 +796,7 @@ export class SessionSupervisor {
         env: environment,
         redactionSecrets,
         sessionDirectory: join(this.storage.rootDirectory, 'sessions', id),
-        timeoutSeconds: options.timeoutSeconds,
+        timeoutSeconds,
         maxOutputBytes: Math.min(
           options.maxOutputBytes ?? this.maxOutputBytes,
           this.maxOutputBytes
@@ -816,12 +830,26 @@ export class SessionSupervisor {
   }
 
   async nativeExecWait(id: string, timeoutSeconds: number): Promise<ExecResult> {
-    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds <= 0)
-      throw new Error('timeoutSeconds must be a positive integer in seconds for exec')
+    if (
+      !Number.isInteger(timeoutSeconds) ||
+      timeoutSeconds <= 0 ||
+      timeoutSeconds > MAX_EXEC_RUNTIME_SECONDS
+    )
+      throw new Error(
+        `timeoutSeconds must be a positive integer up to ${MAX_EXEC_RUNTIME_SECONDS} for exec`
+      )
     const record = this.recordFor(id)
     if (record.mode !== 'exec') throw new Error(`Session '${id}' is not an exec session.`)
-    await this.wait(id, { kind: 'exit' }, timeoutSeconds)
+    const waited = await this.wait(id, { kind: 'exit' }, timeoutSeconds)
+    if (waited.reason === 'deadline' && activeStatus(record)) {
+      await this.stop(id)
+      const stopped = await this.wait(id, { kind: 'exit' }, EXEC_TERMINAL_WAIT_SECONDS)
+      if (stopped.reason === 'deadline')
+        throw new ProcessError('Exec stop completed without terminal evidence.')
+    }
     const current = this.recordFor(id)
+    if (!this.isTerminal(current) || current.status === 'lost' || current.status === 'spawn_failed')
+      throw new ProcessError('Exec wait completed without terminal evidence.')
     const output = current.execOutput
     return {
       session: { id: current.id, status: current.status, mode: 'exec', pid: current.pid },
@@ -1427,8 +1455,14 @@ export class SessionSupervisor {
   }
 
   private validateWait(condition: WaitCondition, timeoutSeconds: number): void {
-    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 3600) {
-      throw new Error('wait timeoutSeconds must be a positive integer up to 3600.')
+    if (
+      !Number.isInteger(timeoutSeconds) ||
+      timeoutSeconds <= 0 ||
+      timeoutSeconds > MAX_EXEC_RUNTIME_SECONDS
+    ) {
+      throw new Error(
+        `wait timeoutSeconds must be a positive integer up to ${MAX_EXEC_RUNTIME_SECONDS}.`
+      )
     }
     if (condition.kind !== 'output') return
     if (Boolean(condition.literal) === Boolean(condition.regex)) {
@@ -1620,7 +1654,7 @@ export class SessionSupervisor {
   }
 
   private isTerminal(record: SessionRecord): boolean {
-    return terminalDirectChild(record)
+    return !activeStatus(record) && terminalDirectChild(record)
   }
 
   private toInfo(record: SessionRecord): PTYSessionInfo {
