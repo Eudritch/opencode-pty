@@ -46,6 +46,7 @@ export interface PTYSessionInfo {
   outputSequence?: number
   firstRetainedSequence?: number
   outputTruncated?: boolean
+  diagnostics?: string[]
   lastWaitResult?: WaitResult
   execOutput?: ExecOutput
   environment?: {

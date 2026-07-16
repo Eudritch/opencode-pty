@@ -1632,6 +1632,7 @@ export class SessionSupervisor {
       outputSequence: record.nextSequence,
       firstRetainedSequence: record.firstRetainedSequence,
       outputTruncated: record.outputTruncated,
+      diagnostics: record.diagnostics,
       lastWaitResult: record.lastWaitResult,
       execOutput: record.execOutput,
       environment: record.environment,

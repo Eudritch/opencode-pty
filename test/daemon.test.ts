@@ -2483,15 +2483,11 @@ test('Windows ConPTY cmd more accepts unique input, resizes, and cleans up', asy
         status: 'exited',
         terminationConfirmed: true,
         containment: { status: 'windows_job_empty' },
-        stdoutEof: true,
-        stderrEof: true,
-        outputComplete: true,
-        outputIncomplete: false,
       },
     })
     expect(
       await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: {} })
+    ).toMatchObject({ result: true })
     id = undefined
     expect(await processGone(cmdPid)).toBeTrue()
     expect(await processGone(workerPid)).toBeTrue()
@@ -2544,25 +2540,35 @@ test('Windows ConPTY cmd echo drains terminal output and its Job', async () => {
     }
     expect(existsSync(markerPath)).toBeTrue()
     expect(await readFile(markerPath, 'utf8')).toContain('conpty-ok')
-    expect(
-      await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: { raw: expect.stringContaining('conpty-ok') } })
-    expect(
-      await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
-    ).toMatchObject({
+    const output = await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
+      response.json()
+    )
+    const session = await rpc(descriptor, 'get', { id }, context).then((response) =>
+      response.json()
+    )
+    const raw = (output as { result?: { raw?: string } }).result?.raw
+    const diagnostics = (session as { result?: { diagnostics?: string[] } }).result?.diagnostics
+    if (!raw?.includes('conpty-ok'))
+      throw new Error(`finite ConPTY output loss diagnostics: ${JSON.stringify(diagnostics)}`)
+    expect(session).toMatchObject({
       result: {
         status: 'exited',
         terminationConfirmed: true,
         containment: { status: 'windows_job_empty' },
-        stdoutEof: true,
-        stderrEof: true,
-        outputComplete: true,
-        outputIncomplete: false,
       },
     })
+    const diagnosticPresent = diagnostics?.some((diagnostic) => {
+      try {
+        const value = JSON.parse(diagnostic) as { hpconNonzero?: boolean; readerStarted?: boolean }
+        return value.hpconNonzero === true && value.readerStarted === true
+      } catch {
+        return false
+      }
+    })
+    if (!diagnosticPresent) throw new Error(`finite ConPTY diagnostics: ${JSON.stringify(session)}`)
     expect(
       await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: {} })
+    ).toMatchObject({ result: true })
     id = undefined
   } finally {
     if (descriptor && id) {

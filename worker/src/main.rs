@@ -276,8 +276,54 @@ struct State {
     terminal_reader_exit_completion: Option<usize>,
     #[cfg(windows)]
     terminal_reader_post_exit_completion: bool,
+    #[cfg(windows)]
+    windows_pty_diagnostic: Option<WindowsPtyDiagnostic>,
     diagnostics: Vec<String>,
     termination: Option<TerminationResult>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsPtyDiagnostic {
+    hpcon_nonzero: bool,
+    reader_started: bool,
+    reader_reads: usize,
+    reader_bytes: usize,
+    reader_last_bytes: Option<usize>,
+    reader_last_status: String,
+    reader_outcome: String,
+    write_calls: usize,
+    write_bytes: usize,
+    write_last_status: String,
+    direct_child_exit_observed: bool,
+    job_empty_observed: bool,
+    terminal_release_invoked: bool,
+    release_reader_active: Option<bool>,
+    release_output_bytes: Option<usize>,
+}
+
+#[cfg(windows)]
+impl WindowsPtyDiagnostic {
+    fn new(hpcon_nonzero: bool) -> Self {
+        Self {
+            hpcon_nonzero,
+            reader_started: false,
+            reader_reads: 0,
+            reader_bytes: 0,
+            reader_last_bytes: None,
+            reader_last_status: "pending".into(),
+            reader_outcome: "pending".into(),
+            write_calls: 0,
+            write_bytes: 0,
+            write_last_status: "none".into(),
+            direct_child_exit_observed: false,
+            job_empty_observed: false,
+            terminal_release_invoked: false,
+            release_reader_active: None,
+            release_output_bytes: None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -466,10 +512,6 @@ impl Drop for WindowsPty {
 
 #[cfg(windows)]
 impl WindowsPty {
-    fn close_input(&mut self) {
-        self.input.take();
-    }
-
     fn take_terminal(&mut self) -> Option<HPCON> {
         self.console.take()
     }
@@ -904,6 +946,10 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         startup.StartupInfo.hStdInput = child_stdin.as_ref().expect("exec stdin").raw();
         startup.StartupInfo.hStdOutput = child_stdout.as_ref().expect("exec stdout").raw();
         startup.StartupInfo.hStdError = child_stderr.as_ref().expect("exec stderr").raw();
+    } else {
+        // STARTF_USESTDHANDLES with NULL slots prevents inherited worker pipes from becoming
+        // stdio; console attachment replaces NULL with this ConPTY's console handles.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     }
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = CREATE_SUSPENDED
@@ -1745,18 +1791,13 @@ fn record_exit(worker: &Arc<Worker>, exit: WindowsExit) {
     state.exit_reason.get_or_insert_with(|| "code".into());
     state.exited_at = Some(now());
     state.root_exited = true;
+    if let Some(diagnostic) = &mut state.windows_pty_diagnostic {
+        diagnostic.direct_child_exit_observed = true;
+    }
     state.reader_drain_deadline = Some(SystemTime::now() + READER_DRAIN_TIMEOUT);
     state.terminal_reader_exit_completion = Some(state.terminal_reader_completions);
     drop(state);
-    close_windows_input(worker);
     let _ = refresh_termination_confirmed(worker);
-}
-
-#[cfg(windows)]
-fn close_windows_input(worker: &Arc<Worker>) {
-    if let Some(pty) = worker.child.lock().expect("child lock").pty.as_mut() {
-        pty.close_input();
-    }
 }
 
 #[cfg(windows)]
@@ -1794,6 +1835,13 @@ fn release_windows_terminal(worker: &Arc<Worker>) {
         }
     }
     let mut state = worker.state.lock().expect("state lock");
+    let reader_active = state.terminal_reader_active;
+    let output_bytes = state.next_sequence;
+    if let Some(diagnostic) = &mut state.windows_pty_diagnostic {
+        diagnostic.terminal_release_invoked = true;
+        diagnostic.release_reader_active = Some(reader_active);
+        diagnostic.release_output_bytes = Some(output_bytes);
+    }
     state.reader_cancel_deadline = Some(SystemTime::now() + READER_CANCEL_TIMEOUT);
 }
 
@@ -2216,7 +2264,12 @@ fn mark_reader_failure(state: &mut State, stdout: bool, error: String, secrets: 
 }
 
 fn push_diagnostic(state: &mut State, message: String, secrets: &[String]) {
-    if state.diagnostics.len() < 4 {
+    let limit = if cfg!(windows) && state.windows_pty_diagnostic.is_some() {
+        3
+    } else {
+        4
+    };
+    if state.diagnostics.len() < limit {
         state
             .diagnostics
             .push(redact(message.chars().take(512).collect(), secrets));
@@ -2380,6 +2433,10 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                     );
                     mark_reader_eof(&worker, true);
                     let mut state = worker.state.lock().expect("state lock");
+                    if let Some(diagnostic) = &mut state.windows_pty_diagnostic {
+                        diagnostic.reader_last_status = "eof".into();
+                        diagnostic.reader_outcome = "eof".into();
+                    }
                     mark_terminal_reader_event(&mut state);
                     state.terminal_reader_active = false;
                     state.terminal_reader_done = true;
@@ -2398,15 +2455,21 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                     }
                     let mut state = worker.state.lock().expect("state lock");
+                    if let Some(diagnostic) = &mut state.windows_pty_diagnostic {
+                        let code = error.raw_os_error().unwrap_or_default();
+                        diagnostic.reader_last_status = format!("error:{code}");
+                        diagnostic.reader_outcome = if code == 109 {
+                            "eof".into()
+                        } else {
+                            "error".into()
+                        };
+                    }
                     mark_terminal_reader_event(&mut state);
                     state.terminal_reader_active = false;
                     state.terminal_reader_done = true;
                     return;
                 }
                 Ok(size) => {
-                    let mut state = worker.state.lock().expect("state lock");
-                    mark_terminal_reader_event(&mut state);
-                    drop(state);
                     append_output(
                         &worker,
                         true,
@@ -2417,6 +2480,14 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                             false,
                         ),
                     );
+                    let mut state = worker.state.lock().expect("state lock");
+                    if let Some(diagnostic) = &mut state.windows_pty_diagnostic {
+                        diagnostic.reader_reads += 1;
+                        diagnostic.reader_bytes += size;
+                        diagnostic.reader_last_bytes = Some(size);
+                        diagnostic.reader_last_status = "ok".into();
+                    }
+                    mark_terminal_reader_event(&mut state);
                 }
             }
         }
@@ -2546,7 +2617,13 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
         .cloned()
         .collect::<Vec<_>>()
         .join("; ");
-    let diagnostics = state.diagnostics.clone();
+    let mut diagnostics = state.diagnostics.clone();
+    #[cfg(windows)]
+    if let Some(mut diagnostic) = state.windows_pty_diagnostic.clone() {
+        diagnostic.job_empty_observed |= containment.status == "windows_job_empty";
+        diagnostics
+            .push(serde_json::to_string(&diagnostic).expect("Windows PTY diagnostic serializes"));
+    }
     let terminal = state.termination_confirmed
         && (output_complete || state.output_incomplete)
         && (worker.mode != "pty" || !cfg!(windows) || terminal_reader_finished(&state));
@@ -3125,6 +3202,14 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                 let bytes = data.as_bytes();
                 let mut offset = 0;
                 while offset < bytes.len() {
+                    if let Some(diagnostic) = &mut worker
+                        .state
+                        .lock()
+                        .expect("state lock")
+                        .windows_pty_diagnostic
+                    {
+                        diagnostic.write_calls += 1;
+                    }
                     let mut written = 0;
                     if unsafe {
                         WriteFile(
@@ -3136,16 +3221,44 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
                         )
                     } == 0
                     {
+                        let code = std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or_default();
+                        if let Some(diagnostic) = &mut worker
+                            .state
+                            .lock()
+                            .expect("state lock")
+                            .windows_pty_diagnostic
+                        {
+                            diagnostic.write_last_status = format!("error:{code}");
+                        }
                         return Err(WorkerError {
                             code: "process",
                             message: std::io::Error::last_os_error().to_string(),
                         });
                     }
                     if written == 0 {
+                        if let Some(diagnostic) = &mut worker
+                            .state
+                            .lock()
+                            .expect("state lock")
+                            .windows_pty_diagnostic
+                        {
+                            diagnostic.write_last_status = "zero_bytes".into();
+                        }
                         return Err(WorkerError {
                             code: "process",
                             message: "PTY input write accepted no bytes".into(),
                         });
+                    }
+                    if let Some(diagnostic) = &mut worker
+                        .state
+                        .lock()
+                        .expect("state lock")
+                        .windows_pty_diagnostic
+                    {
+                        diagnostic.write_bytes += written as usize;
+                        diagnostic.write_last_status = "ok".into();
                     }
                     offset += written as usize;
                 }
@@ -3633,6 +3746,16 @@ fn main() -> Result<(), String> {
         };
         (Some(stdout), Some(stderr))
     };
+    #[cfg(windows)]
+    let windows_pty_diagnostic = (bootstrap.mode == "pty").then(|| {
+        WindowsPtyDiagnostic::new(
+            child
+                .pty
+                .as_ref()
+                .and_then(|pty| pty.console)
+                .is_some_and(|console| console != 0),
+        )
+    });
     let worker = Arc::new(Worker {
         child: Mutex::new(child),
         #[cfg(unix)]
@@ -3647,6 +3770,8 @@ fn main() -> Result<(), String> {
         ),
         state: Mutex::new(State {
             started_at: now(),
+            #[cfg(windows)]
+            windows_pty_diagnostic,
             ..State::default()
         }),
         secrets: bootstrap
@@ -3707,6 +3832,14 @@ fn main() -> Result<(), String> {
                 .lock()
                 .expect("state lock")
                 .terminal_reader_active = true;
+            worker
+                .state
+                .lock()
+                .expect("state lock")
+                .windows_pty_diagnostic
+                .as_mut()
+                .expect("Windows PTY diagnostic")
+                .reader_started = true;
             terminal_reader_windows(worker.clone(), output);
             mark_reader_eof(&worker, false);
         }
