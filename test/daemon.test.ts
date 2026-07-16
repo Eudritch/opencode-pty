@@ -3953,21 +3953,23 @@ test('daemon launcher resolves Bun instead of a non-Bun plugin host', () => {
   expect(() => resolveDaemonLauncher(() => null)).toThrow('Bun executable')
 })
 
-test('daemon launcher detaches from short-lived plugin hosts', () => {
+test('daemon launcher detaches without a Windows console window', () => {
   const options = daemonLaunchOptions(() => 'bun.exe', 'daemon-entry.js', 'launch-options')
   expect(options).toMatchObject({
     cmd: ['bun.exe', 'daemon-entry.js', 'launch-options'],
     detached: true,
+    windowsHide: true,
     stdin: 'ignore',
     stdout: 'ignore',
     stderr: 'pipe',
   })
 })
 
-test('Windows worker launcher isolates native workers from the plugin console group', () => {
+test('Windows worker launcher isolates native workers without a console window', () => {
   expect(workerLaunchOptions(['worker.exe'])).toMatchObject({
     cmd: ['worker.exe'],
     detached: process.platform === 'win32',
+    windowsHide: true,
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'inherit',

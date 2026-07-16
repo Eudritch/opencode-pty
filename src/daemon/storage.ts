@@ -98,7 +98,12 @@ export async function processIdentityProbe(
 ): Promise<string | null> {
   if (Date.now() >= deadline) return null
   try {
-    const child = Bun.spawn({ cmd: command, stdout: 'pipe', stderr: 'ignore' })
+    const child = Bun.spawn({
+      cmd: command,
+      stdout: 'pipe',
+      stderr: 'ignore',
+      windowsHide: true,
+    })
     const output = new Response(child.stdout).text()
     let timeout: ReturnType<typeof setTimeout> | undefined
     try {
@@ -1312,6 +1317,7 @@ foreach ($item in $items) { Test-PrivateDacl $item }`,
       ],
       stdout: 'pipe',
       stderr: 'pipe',
+      windowsHide: true,
       env: {
         ...process.env,
         PTY_DAEMON_ACL_PATH: path,
@@ -1350,6 +1356,7 @@ foreach ($item in $items) { Test-PrivateDacl $item }`,
         ],
         stdout: 'pipe',
         stderr: 'ignore',
+        windowsHide: true,
       })
       const output = new Response(process.stdout).text()
       if (

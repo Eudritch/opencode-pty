@@ -48,7 +48,7 @@ use windows_sys::Win32::{
         },
         Pipes::CreatePipe,
         Threading::{
-            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
             GetCurrentThread, GetExitCodeProcess, InitializeProcThreadAttributeList,
             LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -824,6 +824,18 @@ fn windows_job() -> Result<WinHandle, String> {
 }
 
 #[cfg(windows)]
+fn windows_creation_flags(has_attributes: bool) -> u32 {
+    CREATE_NO_WINDOW
+        | CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT
+        | if has_attributes {
+            EXTENDED_STARTUPINFO_PRESENT
+        } else {
+            0
+        }
+}
+
+#[cfg(windows)]
 fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     let job = windows_job()?;
     let application_path =
@@ -952,13 +964,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     }
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let flags = CREATE_SUSPENDED
-        | CREATE_UNICODE_ENVIRONMENT
-        | if attribute_list.is_some() {
-            EXTENDED_STARTUPINFO_PRESENT
-        } else {
-            0
-        };
+    let flags = windows_creation_flags(attribute_list.is_some());
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -2680,6 +2686,19 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_creation_hides_exec_and_conpty_processes() {
+        assert_eq!(
+            windows_creation_flags(false),
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+        );
+        assert_ne!(
+            windows_creation_flags(true) & EXTENDED_STARTUPINFO_PRESENT,
+            0
+        );
+    }
 
     #[cfg(unix)]
     struct FailingReader;

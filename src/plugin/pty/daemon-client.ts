@@ -44,6 +44,7 @@ export function daemonLaunchOptions(
   return {
     cmd: daemonLaunchCommand(which, entryPath, launchOptions),
     detached: true,
+    windowsHide: true,
     stdin: 'ignore' as const,
     stdout: 'ignore' as const,
     stderr: 'pipe' as const,

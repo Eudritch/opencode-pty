@@ -126,6 +126,7 @@ export function workerLaunchOptions(command: string[]) {
   return {
     cmd: command,
     detached: process.platform === 'win32',
+    windowsHide: true,
     stdin: 'pipe' as const,
     stdout: 'pipe' as const,
     stderr: 'inherit' as const,
@@ -173,6 +174,7 @@ async function processIdentity(pid: number): Promise<string | null> {
     ],
     stdout: 'pipe',
     stderr: 'ignore',
+    windowsHide: true,
   })
   const output = (await new Response(probe.stdout).text()).trim()
   await probe.exited

@@ -591,6 +591,7 @@ export class SessionSupervisor {
         env: environment,
         stdout: 'pipe',
         stderr: 'pipe',
+        windowsHide: true,
       })
     } catch (error) {
       record.status = 'spawn_failed'

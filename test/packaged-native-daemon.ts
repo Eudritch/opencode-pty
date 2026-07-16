@@ -73,6 +73,7 @@ async function runCommand(command: string[], name: string, timeoutMs = 120_000, 
     ...(cwd ? { cwd } : {}),
     stdout: 'pipe',
     stderr: 'pipe',
+    windowsHide: true,
   })
   const stdout = new Response(child.stdout).text()
   const stderr = new Response(child.stderr).text()
