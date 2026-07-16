@@ -22,8 +22,8 @@ const QUARANTINE_DIRECTORY = 'quarantine'
 const APPROVALS_FILE = 'approvals.json'
 const OUTPUT_SEGMENT_BYTES = 64 * 1024
 const WINDOWS_PROBE_TIMEOUT_MS = 5000
-const WINDOWS_RENAME_RETRIES = 3
-const WINDOWS_RENAME_RETRY_MS = 10
+const WINDOWS_RENAME_RETRIES = 100
+const WINDOWS_RENAME_RETRY_MS = 25
 
 class InvalidSessionError extends Error {}
 class InvalidJournalError extends InvalidSessionError {}

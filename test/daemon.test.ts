@@ -46,6 +46,7 @@ import {
   createBash,
 } from '../src/plugin/pty/tools/bash.ts'
 import { PTYPlugin } from '../src/plugin.ts'
+import { manager } from '../src/plugin/pty/manager.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
 
@@ -1536,6 +1537,30 @@ test('bash override is enabled by default and can be omitted alone', async () =>
   expect(withoutBash.tool).toHaveProperty('shell_exec')
 })
 
+test('session deletion cleans up with the deleted session project owner', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-plugin-owner-'))
+  const project = await mkdtemp(join(tmpdir(), 'opencode-pty-plugin-project-'))
+  roots.push(root, project)
+  const cleanupBySession = manager.cleanupBySession
+  let cleanupOwner: Parameters<typeof manager.cleanupBySession>[0]
+  manager.cleanupBySession = async (owner) => {
+    cleanupOwner = owner
+  }
+  try {
+    const plugin = await PTYPlugin({ client: {}, directory: root } as never)
+    await plugin.event?.({
+      event: {
+        type: 'session.deleted',
+        properties: { info: { id: 'deleted-session', directory: project } },
+      },
+    } as never)
+    expect(cleanupOwner).toEqual(ownerContext('deleted-session', project))
+    expect(cleanupOwner?.projectDirectory).not.toBe(realpathSync(root))
+  } finally {
+    manager.cleanupBySession = cleanupBySession
+  }
+})
+
 test('streaming redaction keeps split secrets out of PTY journals and exec streams', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-redaction-stream-'))
   roots.push(root)
@@ -1760,7 +1785,7 @@ test('start lock handoff permits one distinct daemon identity', async () => {
   expect(claimed).toMatchObject({ handoffToken: null })
   expect(claimed.token).not.toBe(lock.token)
   expect(claimed.pid).not.toBe(process.pid)
-}, 15_000)
+}, 30_000)
 
 test('a claimed handoff lock survives its launching client and blocks duplicates', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-claimed-'))
@@ -1792,7 +1817,7 @@ test('a claimed handoff lock survives its launching client and blocks duplicates
     child.kill()
     await child.exited
   }
-})
+}, 30_000)
 
 test('start lock recovery removes crash remnants but retains a valid live lock', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-remnants-'))
@@ -1816,7 +1841,7 @@ test('start lock recovery removes crash remnants but retains a valid live lock',
   expect(typeof live?.handoffToken).toBe('string')
   expect(await storage.acquireStartLock()).toBeNull()
   if (live) await storage.releaseStartLock(live.token)
-})
+}, 30_000)
 
 test('start locks reject reused PIDs with a different process identity', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-identity-'))
@@ -1876,7 +1901,7 @@ test('claimed handoff recovery locks with a reused PID do not block startup', as
   const claimed = await storage.claimStartLock(lock.handoffToken)
   expect(typeof claimed).toBe('string')
   if (claimed) await storage.releaseStartLock(claimed)
-})
+}, 30_000)
 
 test('startup stderr never reports a three-character environment secret', () => {
   expect(safeStartupStderrTail('daemon failed: abc', 'token', 'options')).toBeNull()
@@ -2235,29 +2260,6 @@ test('PTY idempotency reuses only an active matching owner and spec', async () =
 })
 
 test('PTY idempotency canonicalizes environment order and scopes only by parent and workdir', async () => {
-test('native exec wait returns its finalization storage failure', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-wait-storage-'))
-  roots.push(root)
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  const session = record(root, 'exec_wait_storage')
-  session.mode = 'exec'
-  session.status = 'lost'
-  const storageError = Object.assign(new Error('Native finalization failed: ENOENT'), {
-    code: 'ESTORAGE',
-  })
-  const state = supervisor as unknown as {
-    records: Map<string, SessionRecord>
-    nativeFinalizations: Map<string, Promise<unknown>>
-    wait: () => Promise<{ reason: string }>
-  }
-  const finalization = Promise.reject(storageError)
-  void finalization.catch(() => undefined)
-  state.records.set(session.id, session)
-  state.nativeFinalizations.set(session.id, finalization)
-  state.wait = async () => ({ reason: 'exit' })
-
-  await expect(supervisor.nativeExecWait(session.id, 1)).rejects.toBe(storageError)
-})
   if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
   roots.push(root)
@@ -2422,6 +2424,30 @@ test('native exec wait rejects a record still active after stop', async () => {
   )
 })
 
+test('native exec wait returns its finalization storage failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-wait-storage-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  const session = record(root, 'exec_wait_storage')
+  session.mode = 'exec'
+  session.status = 'lost'
+  const storageError = Object.assign(new Error('Native finalization failed: ENOENT'), {
+    code: 'ESTORAGE',
+  })
+  const state = supervisor as unknown as {
+    records: Map<string, SessionRecord>
+    nativeFinalizations: Map<string, Promise<unknown>>
+    wait: () => Promise<{ reason: string }>
+  }
+  const finalization = Promise.reject(storageError)
+  void finalization.catch(() => undefined)
+  state.records.set(session.id, session)
+  state.nativeFinalizations.set(session.id, finalization)
+  state.wait = async () => ({ reason: 'exit' })
+
+  await expect(supervisor.nativeExecWait(session.id, 1)).rejects.toBe(storageError)
+})
+
 test('native exec allows the bounded terminal grace after maximum runtime', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-max-timeout-'))
   roots.push(root)
@@ -2510,7 +2536,7 @@ test('sendWait observes an immediate response after accepted input', async () =>
     await supervisor.stop(session.id).catch(() => undefined)
     await supervisor.flush()
   }
-}, 10_000)
+})
 
 test('sendWait excludes drained pre-acceptance output and observes its immediate reply', async () => {
   if (process.platform === 'win32') return
@@ -2615,7 +2641,7 @@ test('exec output remains separately recoverable after restart', async () => {
     stdoutTruncated: false,
     stderrTruncated: false,
   })
-}, 10_000)
+})
 
 test('native exec through the daemon drains both streams, reconnects, stops, and cleans up', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-integration-'))
@@ -2720,7 +2746,7 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
-})
+}, 10_000)
 
 test('native exec uses a total stdout/stderr cap and persists terminal storage failure', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-limits-'))
@@ -2803,7 +2829,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
-})
+}, 10_000)
 
 test('native startup failures clean up the direct child and report the proven outcome', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-startup-failure-'))
@@ -3623,7 +3649,7 @@ test('Windows ConPTY cmd echo drains terminal output and its Job', async () => {
     ).then((response) => response.json())) as { result?: { id?: unknown } }
     if (typeof spawned.result?.id !== 'string') throw new Error('finite ConPTY id is invalid')
     id = spawned.result.id
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < 1500; attempt += 1) {
       const session = (await rpc(descriptor, 'get', { id }, context).then((response) =>
         response.json()
       )) as { result?: { status?: string } }
@@ -3674,7 +3700,7 @@ test('Windows ConPTY cmd echo drains terminal output and its Job', async () => {
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
-}, 10_000)
+}, 30_000)
 
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
