@@ -19,50 +19,84 @@ export type SpawnAuthorizer = (
   agent?: string
 ) => Promise<string>
 
+export type BashAuthorizer = (
+  command: string,
+  workdir?: string,
+  agent?: string
+) => Promise<{ action: PermissionAction; workdir: string }>
+
 // ponytail: SDK 1.3.13 has no permission evaluator/request API, so this local adapter fails closed.
 export function createSpawnAuthorizer(client: PluginClient, directory: string): SpawnAuthorizer {
-  const config = async (): Promise<Config> => {
-    try {
-      const response = await client.config.get()
-      if (response.error || !response.data) throw new Error('unavailable')
-      return parseConfig(response.data)
-    } catch {
-      throw new Error('PTY spawn denied: permission configuration is unavailable.')
-    }
-  }
-  const deny = async (message: string): Promise<never> => {
-    try {
-      await client.tui.showToast({ body: { message, variant: 'error' } })
-    } catch {
-      // A failed notification must not weaken the policy decision.
-    }
-    throw new Error(message)
-  }
   return async (command, args, workdir, agent) => {
-    const permissions = await config()
+    const permissions = await permissionConfig(client)
     const action = evaluate(permissions, agent, 'bash', [command, ...args].join(' '))
     if (action !== 'allow') {
       return deny(
+        client,
         `PTY spawn denied: Command "${[command, ...args].join(' ')}" has no explicit allow rule.`
       )
     }
-    let resolvedPaths: [string, string]
-    try {
-      resolvedPaths = await Promise.all([realpath(workdir ?? directory), realpath(directory)])
-    } catch {
-      return deny('PTY spawn denied: unable to verify the working directory.')
-    }
-    const [resolvedWorkdir, resolvedProject] = resolvedPaths
-    const pathToWorkdir = relative(resolvedProject, resolvedWorkdir)
-    const outside =
-      pathToWorkdir === '..' || pathToWorkdir.startsWith(`..${sep}`) || isAbsolute(pathToWorkdir)
-    if (!outside) return resolvedWorkdir
-    if (evaluate(permissions, agent, 'external_directory', resolvedWorkdir) === 'allow')
-      return resolvedWorkdir
-    return deny(
-      `PTY spawn denied: Working directory "${workdir}" is outside project directory "${directory}" without explicit external_directory allow.`
-    )
+    return authorizeWorkdir(client, permissions, directory, workdir, agent)
   }
+}
+
+// Shell input stays opaque: policy matching sees the unmodified original string.
+export function createBashAuthorizer(client: PluginClient, directory: string): BashAuthorizer {
+  return async (command, workdir, agent) => {
+    const permissions = await permissionConfig(client)
+    const action = evaluate(permissions, agent, 'bash', command)
+    if (!action || action === 'deny')
+      return deny(client, `Bash command denied: "${command}" has no explicit allow rule.`)
+    return {
+      action,
+      workdir: await authorizeWorkdir(client, permissions, directory, workdir, agent),
+    }
+  }
+}
+
+async function permissionConfig(client: PluginClient): Promise<Config> {
+  try {
+    const response = await client.config.get()
+    if (response.error || !response.data) throw new Error('unavailable')
+    return parseConfig(response.data)
+  } catch {
+    throw new Error('PTY spawn denied: permission configuration is unavailable.')
+  }
+}
+
+async function deny(client: PluginClient, message: string): Promise<never> {
+  try {
+    await client.tui.showToast({ body: { message, variant: 'error' } })
+  } catch {
+    // A failed notification must not weaken the policy decision.
+  }
+  throw new Error(message)
+}
+
+async function authorizeWorkdir(
+  client: PluginClient,
+  permissions: Config,
+  directory: string,
+  workdir: string | undefined,
+  agent: string | undefined
+): Promise<string> {
+  let resolvedPaths: [string, string]
+  try {
+    resolvedPaths = await Promise.all([realpath(workdir ?? directory), realpath(directory)])
+  } catch {
+    return deny(client, 'PTY spawn denied: unable to verify the working directory.')
+  }
+  const [resolvedWorkdir, resolvedProject] = resolvedPaths
+  const pathToWorkdir = relative(resolvedProject, resolvedWorkdir)
+  const outside =
+    pathToWorkdir === '..' || pathToWorkdir.startsWith(`..${sep}`) || isAbsolute(pathToWorkdir)
+  if (!outside) return resolvedWorkdir
+  if (evaluate(permissions, agent, 'external_directory', resolvedWorkdir) === 'allow')
+    return resolvedWorkdir
+  return deny(
+    client,
+    `PTY spawn denied: Working directory "${workdir}" is outside project directory "${directory}" without explicit external_directory allow.`
+  )
 }
 
 function parseConfig(value: unknown): Config {

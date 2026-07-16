@@ -15,12 +15,17 @@ An OpenCode plugin for durable interactive PTY sessions and finite argv executio
 | `pty_wait` | Wait daemon-side for output evidence or process exit. |
 | `pty_send_wait` | Send PTY input, then wait daemon-side. |
 | `pty_resize` | Resize a running native PTY. |
+| `bash` | Foreground Bash-compatible shell command, rendered as OpenCode Bash. |
 
 `pty_write` accepts terminal input, not a new command invocation. Permission checks therefore happen at `pty_spawn`, not per keystroke.
 
 `notifyOnExit` remains accepted for compatibility but is rejected: the durable daemon has no safe event channel back into a completed OpenCode session.
 
 `shell_exec` is `exec` mode, not a shell parser: `command` and `args` are passed as argv and a positive timeout is required. A Rust per-session worker owns every child, exposes an authenticated loopback RPC endpoint, and writes redacted output to the existing session chunk journal. The daemon resolves its platform-specific worker from the installed package, so no repository path is required. The daemon can reconnect to a reachable worker after restart and recover its output cursor and final state.
+
+`bash` intentionally duplicates OpenCode's native Bash tool ID so compatible hosts render it with their native Bash UI. It is registered by default with `{command, workdir?, timeout?, description?}`; set the plugin option `{ "bash": false }` to retain all other tools without this override. This compatibility override requires an OpenCode host that permits duplicate tool IDs (the supported SDK baseline is 1.3.13); disable it if a future host rejects duplicates. It runs only a finite foreground shell: Windows uses `%ComSpec% /d /s /c`, while POSIX uses `/bin/sh -lc`; use `pty_spawn` for durable background work. `timeout` is milliseconds, defaults to 120000, and rounds down to the daemon's whole-second timeout (sub-second values are rejected).
+
+The raw Bash command is opaque. Permission matching evaluates the complete original string under `bash`; it never authorizes the generated shell executable argv. Its path arguments cannot be statically scoped. An explicit `workdir` is canonicalized and still requires `external_directory` permission outside the project. `ask` creates a durable one-shot request, uses native `ctx.ask`, and consumes it only after that prompt succeeds; it never creates a session grant.
 
 `pty_spawn` is `pty` mode and remains interactive. Unix workers use a real controlling terminal with merged redacted UTF-8 terminal output; `pty_resize` changes its columns and rows. There is no screen emulator, raw byte API, or screen snapshot. A supplied `idempotencyKey` reuses only a matching active PTY scoped to the originating OpenCode session and canonical workdir; changing command, args, environment, timeout, or name is rejected. Titles and descriptions are presentation fields and do not affect reuse. `pty_wait` conditions are literal output, a limited-safe regex, or exit. They run in the daemon against output/exit events with a 3600-second maximum deadline, not plugin polling. `pty_send_wait` captures its output boundary immediately after PTY input is accepted, so earlier output cannot satisfy the wait while an immediate reply can. Output readiness is evidence only; no bare `ready` state is claimed.
 

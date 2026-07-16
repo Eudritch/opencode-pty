@@ -38,6 +38,9 @@ import {
 } from '../src/plugin/pty/daemon-client.ts'
 import { formatLine, formatSessionInfo } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
+import { createBashAuthorizer } from '../src/plugin/pty/permissions.ts'
+import { bashArgv, bashTimeout, createBash } from '../src/plugin/pty/tools/bash.ts'
+import { PTYPlugin } from '../src/plugin.ts'
 import { parseEscapeSequences } from '../src/plugin/pty/tools/write.ts'
 import { escapeXml } from '../src/plugin/pty/xml.ts'
 
@@ -792,6 +795,134 @@ test('spawn permission adapter fails closed, applies agent overrides, and isolat
       authorizer({ bash: 'deny' }, secondRoot)(process.execPath, [], secondRoot)
     ).rejects.toThrow('no explicit allow'),
   ])
+})
+
+test('bash policy matches opaque raw input and preserves external workdir checks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-policy-'))
+  const external = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-external-'))
+  roots.push(root, external)
+  const authorizer = (permission: unknown) =>
+    createBashAuthorizer(
+      {
+        config: { get: async () => ({ data: { permission } }) },
+        tui: { showToast: async () => {} },
+      } as never,
+      root
+    )
+  expect(
+    await authorizer({ bash: { 'git status && whoami': 'allow' } })('git status && whoami')
+  ).toMatchObject({
+    action: 'allow',
+    workdir: root,
+  })
+  await expect(authorizer({ bash: { '*': 'deny' } })('git status && whoami')).rejects.toThrow(
+    'no explicit allow'
+  )
+  expect(await authorizer({ bash: 'ask' })('git status')).toMatchObject({ action: 'ask' })
+  await expect(authorizer({ bash: 'allow' })('git status', external)).rejects.toThrow(
+    'external_directory allow'
+  )
+})
+
+test('bash wrapper selects platform argv, tracks metadata, and consumes native approval once', async () => {
+  expect(bashArgv('echo ok', 'win32', { ComSpec: 'cmd.exe' }, () => true)).toEqual([
+    'cmd.exe',
+    ['/d', '/s', '/c', 'echo ok'],
+  ])
+  expect(bashArgv('echo ok', 'linux', {}, () => true)).toEqual(['/bin/sh', ['-lc', 'echo ok']])
+  expect(bashTimeout(1999)).toBe(1)
+  expect(() => bashTimeout(999)).toThrow('at least 1000')
+  const calls: string[] = []
+  const daemon = {
+    createApproval: async () => ({ id: 'approval', status: 'pending' }),
+    approveNativeApproval: async () => {
+      calls.push('approve')
+      return { id: 'approval', status: 'approved_once' }
+    },
+    consumeApproval: async () => {
+      calls.push('consume')
+      return { id: 'approval', status: 'consumed' }
+    },
+    cancelApproval: async () => ({ id: 'approval', status: 'cancelled' }),
+    exec: async (options: { command: string; args: string[] }) => {
+      calls.push(`exec:${options.command}:${options.args.join(',')}`)
+      return {
+        session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+        stdout: 'ok\n',
+        stderr: '',
+        exitCode: 0,
+        timedOut: false,
+        outputLimited: false,
+        terminationConfirmed: true,
+        startedAt: '',
+        exitedAt: '',
+      }
+    },
+  }
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), daemon as never)
+  const metadata: string[] = []
+  const output = await bash.execute({ command: 'echo ok', description: 'test bash' }, {
+    sessionID: 'test-session',
+    directory: process.cwd(),
+    agent: 'test',
+    abort: new AbortController().signal,
+    ask: async () => {
+      calls.push('ask')
+    },
+    metadata: (input: { metadata?: { output?: string } }) =>
+      input.metadata?.output && metadata.push(input.metadata.output),
+  } as never)
+  expect(calls).toEqual([
+    'ask',
+    'approve',
+    'consume',
+    `exec:${process.platform === 'win32' ? process.env.ComSpec : '/bin/sh'}:${process.platform === 'win32' ? '/d,/s,/c,echo ok' : '-lc,echo ok'}`,
+  ])
+  expect(metadata).toEqual([
+    '[opencode-pty · foreground · awaiting approval]',
+    '[opencode-pty · foreground · running]',
+    '[opencode-pty · foreground · exited] ok ',
+  ])
+  expect(output).toContain(
+    '<bash origin="opencode-pty" mode="foreground" status="exited" exit_code="0"'
+  )
+  const rejected: string[] = []
+  const rejectingBash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    ...daemon,
+    cancelApproval: async () => {
+      rejected.push('cancel')
+      return { id: 'approval', status: 'cancelled' }
+    },
+    exec: async () => {
+      rejected.push('exec')
+      throw new Error('must not execute')
+    },
+  } as never)
+  await expect(
+    rejectingBash.execute({ command: 'echo no' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      ask: async () => {
+        throw new Error('rejected')
+      },
+      metadata: () => {},
+    } as never)
+  ).rejects.toThrow('rejected')
+  expect(rejected).toEqual(['cancel'])
+})
+
+test('bash override is enabled by default and can be omitted alone', async () => {
+  const input = {
+    client: { config: { get: async () => ({ data: { permission: { bash: 'allow' } } }) } },
+    directory: process.cwd(),
+  } as never
+  expect((await PTYPlugin(input)).tool).toHaveProperty('bash')
+  const withoutBash = await PTYPlugin(input, { bash: false })
+  expect(withoutBash.tool).not.toHaveProperty('bash')
+  expect(withoutBash.tool).toHaveProperty('pty_spawn')
+  expect(withoutBash.tool).toHaveProperty('shell_exec')
 })
 
 test('streaming redaction keeps split secrets out of PTY journals and exec streams', async () => {

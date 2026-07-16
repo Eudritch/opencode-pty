@@ -124,9 +124,17 @@ export class DaemonClient {
 
   async exec(
     options: SpawnOptions & { maxOutputBytes?: number },
-    owner?: OwnerContext
+    owner?: OwnerContext,
+    signal?: AbortSignal
   ): Promise<ExecResult> {
-    return this.call('exec', options, requestTimeout(options.timeoutSeconds ?? 0), owner)
+    return this.call(
+      'exec',
+      options,
+      requestTimeout(options.timeoutSeconds ?? 0),
+      owner,
+      false,
+      signal
+    )
   }
 
   async wait(
@@ -314,12 +322,17 @@ export class DaemonClient {
     return this.call('approvalCancel', { id }, RPC_TIMEOUT_MS, owner, true)
   }
 
+  async approveNativeApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest> {
+    return this.call('approvalNativeApprove', { id }, RPC_TIMEOUT_MS, owner, true)
+  }
+
   private async call<T>(
     operation: string,
     payload?: unknown,
     timeout = RPC_TIMEOUT_MS,
     owner?: OwnerContext,
-    approval = false
+    approval = false,
+    signal?: AbortSignal
   ): Promise<T> {
     const descriptor = await this.ensureDaemon()
     const response = await fetch(`${descriptor.endpoint}/rpc`, {
@@ -342,7 +355,9 @@ export class DaemonClient {
             : undefined,
         payload,
       }),
-      signal: AbortSignal.timeout(timeout),
+      signal: signal
+        ? AbortSignal.any([AbortSignal.timeout(timeout), signal])
+        : AbortSignal.timeout(timeout),
     })
     const result = (await response.json()) as RpcResponse<T>
     if (!result.ok) throw new Error(result.error.message)

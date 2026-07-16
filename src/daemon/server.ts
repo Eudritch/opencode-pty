@@ -315,6 +315,9 @@ export class DaemonServer implements Disposable {
       case 'approvalConsume':
         this.approvalOwner(request)
         return this.approvalConsume(request.payload, owner)
+      case 'approvalNativeApprove':
+        this.approvalOwner(request)
+        return this.approvalNativeApprove(request.payload, owner)
       case 'approvalListGrants':
         this.approvalOwner(request)
         return this.approvalListGrants(owner)
@@ -558,6 +561,19 @@ export class DaemonServer implements Disposable {
         return { ...request, status: 'approved_session' as const }
       }
       return { ...request, status: 'rejected' as const }
+    })
+  }
+
+  private async approvalNativeApprove(payload: unknown, owner: OwnerContext) {
+    const value = this.approvalPayload(payload, ['id'])
+    return this.withApprovals(async (ledger) => {
+      const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
+      this.refreshApproval(request)
+      if (request.status === 'pending' || request.status === 'native_fallback') {
+        request.status = 'approved_once'
+        request.updatedAt = new Date().toISOString()
+      }
+      return request
     })
   }
 
