@@ -158,6 +158,18 @@ async function owner(storage: DaemonStorage, parentSessionId: string, projectDir
   }
 }
 
+async function approvalCapability(
+  storage: DaemonStorage,
+  parentSessionId: string,
+  projectDirectory: string
+) {
+  return new Bun.CryptoHasher('sha256')
+    .update(
+      `approval\0${await storage.ownershipSecret()}\0${parentSessionId}\0${realpathSync(projectDirectory)}`
+    )
+    .digest('hex')
+}
+
 function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
   return {
     status: 'running',
@@ -340,6 +352,168 @@ test('daemon denies other owners and reports bounded diagnostics', async () => {
     expect(diagnostics.result.limits.maxSessionsPerOwner).toBe(32)
     expect(diagnostics.result.platform.nativeContainment).toBeTrue()
     await rpc('stop', { id })
+  } finally {
+    await server.stop()
+  }
+})
+
+test('daemon persists owner-bound approval decisions and cleanup', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-approval-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  const descriptor = await server.start()
+  const one = await owner(storage, 'one', root)
+  const two = await owner(storage, 'two', root)
+  const approvals = await approvalCapability(storage, 'one', root)
+  const approvalRpc = async (
+    operation: string,
+    payload: unknown,
+    context = one,
+    capability = approvals
+  ) =>
+    fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation,
+        owner: context,
+        approvalCapability: capability,
+        payload,
+      }),
+    })
+  const request = async (expirySeconds = 30) => {
+    const response = await approvalRpc('approvalCreate', {
+      digest: 'digest',
+      command: 'bun test',
+      reason: 'test approval',
+      capability: 'tool',
+      workdir: root,
+      expirySeconds,
+    })
+    return ((await response.json()) as { result: { id: string } }).result.id
+  }
+  try {
+    const missingApproval = await rpc(descriptor, 'approvalCreate', {}, one)
+    expect(((await missingApproval.json()) as { error: { code: string } }).error.code).toBe(
+      'authorization'
+    )
+    const id = await request()
+    expect(
+      (
+        (await (await approvalRpc('approvalClaim', { id })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('claimed')
+    expect(
+      (
+        (await (await approvalRpc('approvalDecide', { id, decision: 'approve_once' })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('approved_once')
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalConsume', {
+            id,
+            digest: 'digest',
+            capability: 'tool',
+            workdir: root,
+          })
+        ).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('consumed')
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalConsume', {
+            id,
+            digest: 'digest',
+            capability: 'tool',
+            workdir: root,
+          })
+        ).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('consumed')
+
+    const rejected = await request()
+    await approvalRpc('approvalClaim', { id: rejected })
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalDecide', { id: rejected, decision: 'reject' })
+        ).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('rejected')
+    const cancelled = await request()
+    expect(
+      (
+        (await (await approvalRpc('approvalCancel', { id: cancelled })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('cancelled')
+
+    const session = await request()
+    await approvalRpc('approvalClaim', { id: session })
+    await approvalRpc('approvalDecide', { id: session, decision: 'approve_session' })
+    const grants = (await (await approvalRpc('approvalListGrants', {})).json()) as {
+      result: Array<{ id: string }>
+    }
+    expect(grants.result).toHaveLength(1)
+    expect(
+      (
+        (await (await approvalRpc('approvalRevokeGrant', { id: grants.result[0]?.id })).json()) as {
+          result: boolean
+        }
+      ).result
+    ).toBeTrue()
+    expect(
+      (
+        (await (
+          await approvalRpc('approvalConsume', {
+            id: session,
+            digest: 'digest',
+            capability: 'tool',
+            workdir: root,
+          })
+        ).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('rejected')
+
+    const expired = await request(1)
+    await Bun.sleep(1_050)
+    expect(
+      (
+        (await (await approvalRpc('approvalClaim', { id: expired })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('expired')
+
+    const isolated = await approvalRpc(
+      'approvalClaim',
+      { id: cancelled },
+      two,
+      await approvalCapability(storage, 'two', root)
+    )
+    expect(((await isolated.json()) as { error: { code: string } }).error.code).toBe(
+      'authorization'
+    )
+    await approvalRpc('approvalCleanupByParentSession', { parentSessionId: 'one' })
+    expect((await storage.readApprovals()).requests).toHaveLength(0)
   } finally {
     await server.stop()
   }

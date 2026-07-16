@@ -2,6 +2,7 @@ import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 
 import { dirname, join, resolve } from 'node:path'
 import {
   type DaemonDescriptor,
+  type ApprovalLedger,
   type ExitReason,
   OUTPUT_JOURNAL_VERSION,
   type OutputChunk,
@@ -17,6 +18,7 @@ const OUTPUT_DIRECTORY = 'output'
 const START_LOCK_FILE = 'daemon-start.lock'
 const START_LOCK_RECOVERY_FILE = 'daemon-start-recovery.lock'
 const QUARANTINE_DIRECTORY = 'quarantine'
+const APPROVALS_FILE = 'approvals.json'
 const OUTPUT_SEGMENT_BYTES = 64 * 1024
 const WINDOWS_PROBE_TIMEOUT_MS = 5000
 const WINDOWS_RENAME_RETRIES = 3
@@ -219,6 +221,10 @@ export class DaemonStorage {
     return join(this.root, OWNERSHIP_SECRET_FILE)
   }
 
+  private get approvalsPath(): string {
+    return join(this.root, APPROVALS_FILE)
+  }
+
   private get startLockPath(): string {
     return join(this.root, START_LOCK_FILE)
   }
@@ -360,6 +366,61 @@ export class DaemonStorage {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       return this.ownershipSecret()
     }
+  }
+
+  async readApprovals(): Promise<ApprovalLedger> {
+    await this.initialize()
+    try {
+      const ledger = JSON.parse(await readFile(this.approvalsPath, 'utf8')) as ApprovalLedger
+      if (
+        !ledger ||
+        !Array.isArray(ledger.requests) ||
+        !Array.isArray(ledger.grants) ||
+        ![...ledger.requests, ...ledger.grants].every(
+          (entry) =>
+            entry &&
+            typeof entry === 'object' &&
+            [
+              'id',
+              'parentSessionId',
+              'projectDirectory',
+              'digest',
+              'capability',
+              'workdir',
+              'createdAt',
+            ].every((key) => validText((entry as unknown as Record<string, unknown>)[key]))
+        ) ||
+        !ledger.requests.every(
+          (entry) =>
+            validText(entry.reason) &&
+            validText(entry.command) &&
+            validText(entry.updatedAt) &&
+            validText(entry.expiresAt) &&
+            [
+              'pending',
+              'claimed',
+              'native_fallback',
+              'approved_once',
+              'approved_session',
+              'rejected',
+              'cancelled',
+              'expired',
+              'consumed',
+            ].includes(entry.status) &&
+            (entry.claimExpiresAt === undefined || validText(entry.claimExpiresAt))
+        )
+      ) {
+        throw new Error('Approval ledger is invalid.')
+      }
+      return ledger
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { requests: [], grants: [] }
+      throw error
+    }
+  }
+
+  async writeApprovals(ledger: ApprovalLedger): Promise<void> {
+    await this.writeAtomic(this.approvalsPath, JSON.stringify(ledger))
   }
 
   async acquireStartLock(deadline?: number): Promise<StartLockLease | null> {

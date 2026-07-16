@@ -1,4 +1,4 @@
-export const DAEMON_PROTOCOL_VERSION = 5
+export const DAEMON_PROTOCOL_VERSION = 6
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
@@ -74,6 +74,48 @@ export interface OwnerContext {
   parentSessionId: string
   projectDirectory: string
   capability: string
+}
+
+export type ApprovalStatus =
+  | 'pending'
+  | 'claimed'
+  | 'native_fallback'
+  | 'approved_once'
+  | 'approved_session'
+  | 'rejected'
+  | 'cancelled'
+  | 'expired'
+  | 'consumed'
+
+export interface ApprovalRequest {
+  id: string
+  parentSessionId: string
+  projectDirectory: string
+  digest: string
+  command: string
+  reason: string
+  capability: string
+  workdir: string
+  status: ApprovalStatus
+  createdAt: string
+  updatedAt: string
+  expiresAt: string
+  claimExpiresAt?: string
+}
+
+export interface ApprovalGrant {
+  id: string
+  parentSessionId: string
+  projectDirectory: string
+  digest: string
+  capability: string
+  workdir: string
+  createdAt: string
+}
+
+export interface ApprovalLedger {
+  requests: ApprovalRequest[]
+  grants: ApprovalGrant[]
 }
 
 export interface EnvironmentProfile {
@@ -210,6 +252,7 @@ export interface RpcRequest {
   version: number
   operation: string
   owner?: OwnerContext
+  approvalCapability?: string
   payload?: unknown
 }
 

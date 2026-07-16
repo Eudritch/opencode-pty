@@ -2,6 +2,8 @@ import type { ReadResult, SearchResult, SpawnOptions, PTYSessionInfo } from './t
 import {
   DAEMON_PROTOCOL_VERSION,
   type DaemonDescriptor,
+  type ApprovalGrant,
+  type ApprovalRequest,
   type ExecResult,
   type RpcResponse,
   type StopResult,
@@ -228,19 +230,93 @@ export class DaemonClient {
   }
 
   async cleanupBySession(owner?: OwnerContext): Promise<void> {
-    await this.call(
-      'cleanupByParentSession',
-      { parentSessionId: owner?.parentSessionId },
-      RPC_TIMEOUT_MS,
-      owner
+    await Promise.all([
+      this.call(
+        'cleanupByParentSession',
+        { parentSessionId: owner?.parentSessionId },
+        RPC_TIMEOUT_MS,
+        owner
+      ),
+      this.call(
+        'approvalCleanupByParentSession',
+        { parentSessionId: owner?.parentSessionId },
+        RPC_TIMEOUT_MS,
+        owner,
+        true
+      ),
+    ])
+  }
+
+  async createApproval(
+    request: Omit<
+      ApprovalRequest,
+      | 'id'
+      | 'parentSessionId'
+      | 'projectDirectory'
+      | 'status'
+      | 'createdAt'
+      | 'updatedAt'
+      | 'expiresAt'
+    > & {
+      expirySeconds: number
+    },
+    owner: OwnerContext
+  ): Promise<ApprovalRequest> {
+    return this.call('approvalCreate', request, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async claimApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest> {
+    return this.call('approvalClaim', { id }, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async decideApproval(
+    id: string,
+    decision: 'approve_once' | 'approve_session' | 'reject',
+    owner: OwnerContext
+  ): Promise<ApprovalRequest> {
+    return this.call('approvalDecide', { id, decision }, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async waitForApproval(
+    id: string,
+    timeoutSeconds: number,
+    owner: OwnerContext
+  ): Promise<ApprovalRequest> {
+    return this.call(
+      'approvalWait',
+      { id, timeoutSeconds },
+      requestTimeout(timeoutSeconds),
+      owner,
+      true
     )
+  }
+
+  async consumeApproval(
+    id: string,
+    details: Pick<ApprovalRequest, 'digest' | 'capability' | 'workdir'>,
+    owner: OwnerContext
+  ): Promise<ApprovalRequest> {
+    return this.call('approvalConsume', { id, ...details }, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async listApprovalGrants(owner: OwnerContext): Promise<ApprovalGrant[]> {
+    return this.call('approvalListGrants', {}, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async revokeApprovalGrant(id: string, owner: OwnerContext): Promise<boolean> {
+    return this.call('approvalRevokeGrant', { id }, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async cancelApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest> {
+    return this.call('approvalCancel', { id }, RPC_TIMEOUT_MS, owner, true)
   }
 
   private async call<T>(
     operation: string,
     payload?: unknown,
     timeout = RPC_TIMEOUT_MS,
-    owner?: OwnerContext
+    owner?: OwnerContext,
+    approval = false
   ): Promise<T> {
     const descriptor = await this.ensureDaemon()
     const response = await fetch(`${descriptor.endpoint}/rpc`, {
@@ -257,6 +333,10 @@ export class DaemonClient {
           ...owner,
           capability: this.capability(await this.storage.ownershipSecret(), owner),
         },
+        approvalCapability:
+          approval && owner
+            ? this.approvalCapability(await this.storage.ownershipSecret(), owner)
+            : undefined,
         payload,
       }),
       signal: AbortSignal.timeout(timeout),
@@ -424,6 +504,12 @@ export class DaemonClient {
   private capability(secret: string, owner: Omit<OwnerContext, 'capability'>): string {
     return new Bun.CryptoHasher('sha256')
       .update(`${secret}\0${owner.parentSessionId}\0${owner.projectDirectory}`)
+      .digest('hex')
+  }
+
+  private approvalCapability(secret: string, owner: Omit<OwnerContext, 'capability'>): string {
+    return new Bun.CryptoHasher('sha256')
+      .update(`approval\0${secret}\0${owner.parentSessionId}\0${owner.projectDirectory}`)
       .digest('hex')
   }
 }
