@@ -29,12 +29,25 @@ test('TUI owner derivation requires the active route session', () => {
 })
 
 test('TUI previews redact command and text secrets', () => {
-  const secrets = ['token-value', 'api-key-value', 'password-value', 'bearer-value', 'url-value']
+  const secrets = [
+    'token-value',
+    'api-key-value',
+    'header-api-key-value',
+    'basic-value',
+    'bearer-value',
+    'password-value',
+    'url-value',
+  ]
   const preview = commandPreview('API_TOKEN=token-value', [
     '--api-key=api-key-value',
+    '-H',
+    "'X-Api-Key: header-api-key-value'",
+    '-H',
+    '"Authorization: Basic basic-value"',
+    '-H',
+    'Authorization: Bearer bearer-value',
     '--password',
     'password-value',
-    'Authorization: Bearer bearer-value',
     'https://user:url-value@example.test/?api_key=api-key-value',
     '$env:SECRET = "token-value"',
     'setenv KEY token-value',
@@ -44,6 +57,20 @@ test('TUI previews redact command and text secrets', () => {
   expect(redactPreview('https://user:password-value@example.test')).toBe(
     'https://[REDACTED]@example.test'
   )
+})
+
+test('TUI previews redact quoted and unquoted header credentials', () => {
+  const previews = [
+    "curl -H 'X-Api-Key: header-api-key-value' example.test",
+    'curl -H "Authorization: Basic basic-value" example.test',
+    'curl -H Authorization:Bearer bearer-value example.test',
+  ]
+  const secrets = ['header-api-key-value', 'basic-value', 'bearer-value']
+  for (const preview of previews) {
+    const redacted = redactPreview(preview)
+    for (const secret of secrets) expect(redacted).not.toContain(secret)
+    expect(redacted).toContain('[REDACTED]')
+  }
 })
 
 test('TUI cards label PTY origin', () => {

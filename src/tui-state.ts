@@ -49,7 +49,10 @@ export function redactPreview(value: string): string {
   const secret = '(?:\'[^\']*\'|"[^"]*"|[^\\s]+)'
   return value
     .replace(
-      /\b(Authorization\s*:\s*Bearer\s+)[^\s]+/gi,
+      new RegExp(
+        `\\b((?:authorization|proxy-authorization|${sensitiveName})\\s*:\\s*(?:(?:bearer|basic)\\s*)?)(?:'[^']*'|"[^"]*"|[^\\s'"]+)`,
+        'gi'
+      ),
       (_, prefix) => `${prefix}${secretValue()}`
     )
     .replace(

@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DAEMON_PROTOCOL_VERSION } from '../src/daemon/types.ts'
 
 const root = process.cwd()
 const packageDirectory = await mkdtemp(join(tmpdir(), 'opencode-pty-package-'))
@@ -246,7 +247,13 @@ async function rpc(
   const response = await fetch(`${descriptor.endpoint}/rpc`, {
     method: 'POST',
     headers: { authorization: `Bearer ${descriptor.token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ id: crypto.randomUUID(), version: 5, operation, owner, payload }),
+    body: JSON.stringify({
+      id: crypto.randomUUID(),
+      version: DAEMON_PROTOCOL_VERSION,
+      operation,
+      owner,
+      payload,
+    }),
     signal: signal ?? AbortSignal.timeout(10_000),
   })
   return response.json() as Promise<{ ok: boolean; result?: unknown; error?: unknown }>

@@ -67,6 +67,8 @@ When a host installs package targets explicitly, load both target-exclusive entr
 
 The root entry preserves legacy server behavior. The TUI never takes over a Bash approval race; the server's native `ctx.ask` prompt remains authoritative. Set `{ "bash": false }` on the server entry to keep PTY tools without the Bash compatibility override.
 
+The TUI companion is pinned to the OpenCode plugin SDK 1.3.13 and OpenTUI 0.1.95 interfaces. Do not widen either OpenCode package range without upgrading and validating the TUI dependency set together.
+
 ## Configuration
 
 | Variable | Default | Purpose |
