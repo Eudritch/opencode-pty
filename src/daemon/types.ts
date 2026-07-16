@@ -1,4 +1,4 @@
-export const DAEMON_PROTOCOL_VERSION = 6
+export const DAEMON_PROTOCOL_VERSION = 7
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
@@ -93,7 +93,7 @@ export interface ApprovalRequest {
   projectDirectory: string
   digest: string
   command: string
-  reason: string
+  reason?: string
   capability: string
   workdir: string
   status: ApprovalStatus
@@ -111,6 +111,12 @@ export interface ApprovalGrant {
   capability: string
   workdir: string
   createdAt: string
+  expiresAt: string
+}
+
+export interface ApprovalClaim {
+  request: ApprovalRequest
+  claimToken: string
 }
 
 export interface ApprovalLedger {

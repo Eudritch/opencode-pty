@@ -3,6 +3,7 @@ import {
   type DaemonDescriptor,
   type DaemonDiagnostics,
   type ApprovalLedger,
+  type ApprovalClaim,
   type ApprovalRequest,
   type OwnerContext,
   type RpcFailure,
@@ -27,6 +28,7 @@ const MAX_INPUT_BYTES_PER_MINUTE = 256 * 1024
 const DEFAULT_MAX_SESSIONS_PER_OWNER = 32
 const MAX_EXEC_RUNTIME_SECONDS = 3600
 const MAX_APPROVAL_EXPIRY_SECONDS = 3600
+const MAX_SESSION_GRANT_SECONDS = 24 * 60 * 60
 const CLAIM_LEASE_MS = 30_000
 
 class ValidationError extends Error {}
@@ -36,6 +38,7 @@ export class DaemonServer implements Disposable {
   private readonly inputUsage = new Map<string, { startedAt: number; bytes: number }>()
   private readonly pendingSessions = new Map<string, number>()
   private approvalWrites: Promise<void> = Promise.resolve()
+  private readonly approvalClaimTokens = new Map<string, string>()
   private ownershipSecret = ''
   private processIdentity = ''
 
@@ -417,7 +420,6 @@ export class DaemonServer implements Disposable {
 
   private async approvalCreate(payload: unknown, owner: OwnerContext) {
     const value = this.approvalPayload(payload, [
-      'digest',
       'command',
       'reason',
       'capability',
@@ -427,17 +429,15 @@ export class DaemonServer implements Disposable {
     const expirySeconds = this.requiredPositiveInteger(value, 'expirySeconds')
     if (expirySeconds > MAX_APPROVAL_EXPIRY_SECONDS)
       throw new ValidationError('Approval expiry exceeds the limit.')
+    const intent = this.approvalIntent(value)
     return this.withApprovals(async (ledger) => {
       const now = new Date()
       const request: ApprovalRequest = {
         id: crypto.randomUUID(),
         parentSessionId: owner.parentSessionId,
         projectDirectory: owner.projectDirectory,
-        digest: this.requiredString(value, 'digest'),
-        command: this.requiredString(value, 'command'),
-        reason: this.requiredString(value, 'reason'),
-        capability: this.requiredString(value, 'capability'),
-        workdir: this.requiredString(value, 'workdir'),
+        digest: this.approvalDigest(intent),
+        ...intent,
         status: 'pending',
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
@@ -450,32 +450,34 @@ export class DaemonServer implements Disposable {
 
   private async approvalClaim(payload: unknown, owner: OwnerContext) {
     const value = this.approvalPayload(payload, ['id'])
-    return this.withApprovals(async (ledger) => {
+    const claimed = await this.withApprovals(async (ledger) => {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
+      let claimToken: string | undefined
       if (request.status === 'pending' || request.status === 'native_fallback') {
         request.status = 'claimed'
         request.claimExpiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString()
         request.updatedAt = new Date().toISOString()
-      } else if (
-        request.status === 'claimed' &&
-        Date.parse(request.claimExpiresAt ?? '') <= Date.now()
-      ) {
-        request.claimExpiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString()
-        request.updatedAt = new Date().toISOString()
+        claimToken = crypto.randomUUID().replaceAll('-', '')
       }
-      return request
+      return { request, claimToken }
     })
+    if (!claimed.claimToken) return claimed.request
+    this.approvalClaimTokens.set(claimed.request.id, claimed.claimToken)
+    return { request: claimed.request, claimToken: claimed.claimToken } satisfies ApprovalClaim
   }
 
   private async approvalDecide(payload: unknown, owner: OwnerContext) {
-    const value = this.approvalPayload(payload, ['id', 'decision'])
+    const value = this.approvalPayload(payload, ['id', 'decision', 'claimToken'])
     const decision = this.requiredString(value, 'decision')
     if (!['approve_once', 'approve_session', 'reject'].includes(decision))
       throw new ValidationError('Approval decision is invalid.')
-    return this.withApprovals(async (ledger) => {
+    const result = await this.withApprovals(async (ledger) => {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
+      if (this.approvalClaimTokens.get(request.id) !== this.requiredString(value, 'claimToken')) {
+        throw new Error('Approval claim token is not authorized.')
+      }
       if (request.status !== 'claimed') return request
       request.status =
         decision === 'approve_once'
@@ -494,10 +496,13 @@ export class DaemonServer implements Disposable {
           capability: request.capability,
           workdir: request.workdir,
           createdAt: request.updatedAt,
+          expiresAt: new Date(Date.now() + MAX_SESSION_GRANT_SECONDS * 1000).toISOString(),
         })
       }
       return request
     })
+    if (result.status !== 'claimed') this.approvalClaimTokens.delete(result.id)
+    return result
   }
 
   private async approvalWait(payload: unknown, owner: OwnerContext) {
@@ -518,23 +523,27 @@ export class DaemonServer implements Disposable {
   }
 
   private async approvalConsume(payload: unknown, owner: OwnerContext) {
-    const value = this.approvalPayload(payload, ['id', 'digest', 'capability', 'workdir'])
+    const value = this.approvalPayload(payload, [
+      'id',
+      'command',
+      'reason',
+      'capability',
+      'workdir',
+    ])
+    const intent = this.approvalIntent(value)
     return this.withApprovals(async (ledger) => {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
-      const matches = ['digest', 'capability', 'workdir'].every(
-        (key) =>
-          request[key as 'digest' | 'capability' | 'workdir'] === this.requiredString(value, key)
-      )
-      if (!matches) throw new Error('Approval is not authorized.')
-      if (['rejected', 'cancelled', 'expired'].includes(request.status))
-        return request
+      if (request.digest !== this.approvalDigest(intent))
+        throw new Error('Approval is not authorized.')
+      if (['rejected', 'cancelled', 'expired'].includes(request.status)) return request
       if (request.status === 'approved_once') {
         request.status = 'consumed'
         request.updatedAt = new Date().toISOString()
         return request
       }
-      if (request.status === 'consumed') return request
+      if (request.status === 'consumed')
+        throw new ValidationError('Approval has already been consumed.')
       if (
         ledger.grants.some(
           (grant) =>
@@ -542,7 +551,8 @@ export class DaemonServer implements Disposable {
             grant.projectDirectory === owner.projectDirectory &&
             grant.digest === request.digest &&
             grant.capability === request.capability &&
-            grant.workdir === request.workdir
+            grant.workdir === request.workdir &&
+            Date.parse(grant.expiresAt) > Date.now()
         )
       ) {
         return { ...request, status: 'approved_session' as const }
@@ -552,13 +562,14 @@ export class DaemonServer implements Disposable {
   }
 
   private async approvalListGrants(owner: OwnerContext) {
-    return this.withApprovals(async (ledger) =>
-      ledger.grants.filter(
+    return this.withApprovals(async (ledger) => {
+      ledger.grants = ledger.grants.filter((grant) => Date.parse(grant.expiresAt) > Date.now())
+      return ledger.grants.filter(
         (grant) =>
           grant.parentSessionId === owner.parentSessionId &&
           grant.projectDirectory === owner.projectDirectory
       )
-    )
+    })
   }
 
   private async approvalRevokeGrant(payload: unknown, owner: OwnerContext) {
@@ -585,6 +596,7 @@ export class DaemonServer implements Disposable {
       if (['pending', 'claimed', 'native_fallback'].includes(request.status)) {
         request.status = 'cancelled'
         request.claimExpiresAt = undefined
+        this.approvalClaimTokens.delete(request.id)
         request.updatedAt = new Date().toISOString()
       }
       return request
@@ -596,6 +608,13 @@ export class DaemonServer implements Disposable {
     if (this.requiredString(value, 'parentSessionId') !== owner.parentSessionId)
       throw new Error('Owner is not authorized.')
     await this.withApprovals(async (ledger) => {
+      for (const request of ledger.requests) {
+        if (
+          request.parentSessionId === owner.parentSessionId &&
+          request.projectDirectory === owner.projectDirectory
+        )
+          this.approvalClaimTokens.delete(request.id)
+      }
       ledger.requests = ledger.requests.filter(
         (request) =>
           request.parentSessionId !== owner.parentSessionId ||
@@ -635,6 +654,7 @@ export class DaemonServer implements Disposable {
     ) {
       request.status = 'expired'
       request.claimExpiresAt = undefined
+      this.approvalClaimTokens.delete(request.id)
       request.updatedAt = new Date().toISOString()
     } else if (
       request.status === 'claimed' &&
@@ -642,8 +662,55 @@ export class DaemonServer implements Disposable {
     ) {
       request.status = 'native_fallback'
       request.claimExpiresAt = undefined
+      this.approvalClaimTokens.delete(request.id)
       request.updatedAt = new Date().toISOString()
     }
+  }
+
+  private approvalIntent(
+    payload: Record<string, unknown>
+  ): Pick<ApprovalRequest, 'command' | 'reason' | 'capability' | 'workdir'> {
+    const command = this.approvalText(payload, 'command', MAX_COMMAND_LENGTH)
+    const capability = this.approvalText(payload, 'capability', 1024)
+    const workdir = this.canonicalApprovalWorkdir(
+      this.approvalText(payload, 'workdir', MAX_STRING_LENGTH)
+    )
+    const reason = this.approvalText(payload, 'reason', MAX_STRING_LENGTH, true)
+    return { command, capability, workdir, ...(reason === undefined ? {} : { reason }) }
+  }
+
+  private approvalText(payload: Record<string, unknown>, key: string, maximum: number): string
+  private approvalText(
+    payload: Record<string, unknown>,
+    key: string,
+    maximum: number,
+    optional: true
+  ): string | undefined
+  private approvalText(
+    payload: Record<string, unknown>,
+    key: string,
+    maximum: number,
+    optional = false
+  ): string | undefined {
+    if (optional && payload[key] === undefined) return undefined
+    const value = this.requiredString(payload, key).normalize('NFC')
+    if (value.length > maximum || value.includes('\0'))
+      throw new ValidationError(`RPC field '${key}' is invalid for approval intent.`)
+    return value
+  }
+
+  private canonicalApprovalWorkdir(workdir: string): string {
+    try {
+      return realpathSync(resolve(workdir))
+    } catch {
+      throw new ValidationError('Approval workdir must exist.')
+    }
+  }
+
+  private approvalDigest(
+    intent: Pick<ApprovalRequest, 'command' | 'reason' | 'capability' | 'workdir'>
+  ): string {
+    return new Bun.CryptoHasher('sha256').update(JSON.stringify(intent)).digest('hex')
   }
 
   private async withApprovals<T>(update: (ledger: ApprovalLedger) => Promise<T>): Promise<T> {

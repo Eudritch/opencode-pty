@@ -392,7 +392,7 @@ export class DaemonStorage {
         ) ||
         !ledger.requests.every(
           (entry) =>
-            validText(entry.reason) &&
+            (entry.reason === undefined || validText(entry.reason)) &&
             validText(entry.command) &&
             validText(entry.updatedAt) &&
             validText(entry.expiresAt) &&
@@ -407,8 +407,9 @@ export class DaemonStorage {
               'expired',
               'consumed',
             ].includes(entry.status) &&
-            (entry.claimExpiresAt === undefined || validText(entry.claimExpiresAt))
-        )
+            (entry.claimExpiresAt === undefined || validTimestamp(entry.claimExpiresAt))
+        ) ||
+        !ledger.grants.every((entry) => validTimestamp(entry.expiresAt))
       ) {
         throw new Error('Approval ledger is invalid.')
       }

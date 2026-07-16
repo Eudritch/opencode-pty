@@ -386,7 +386,6 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
     })
   const request = async (expirySeconds = 30) => {
     const response = await approvalRpc('approvalCreate', {
-      digest: 'digest',
       command: 'bun test',
       reason: 'test approval',
       capability: 'tool',
@@ -401,16 +400,35 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
       'authorization'
     )
     const id = await request()
+    const suppliedDigest = await approvalRpc('approvalCreate', {
+      digest: 'client-chosen',
+      command: 'bun test',
+      reason: 'test approval',
+      capability: 'tool',
+      workdir: root,
+      expirySeconds: 30,
+    })
+    expect(((await suppliedDigest.json()) as { error: { code: string } }).error.code).toBe(
+      'validation'
+    )
+    const claim = (await (await approvalRpc('approvalClaim', { id })).json()) as {
+      result: { request: { status: string }; claimToken: string }
+    }
+    expect(claim.result.request.status).toBe('claimed')
+    expect(claim.result.claimToken).toMatch(/^[a-f0-9]{32}$/)
+    const missingClaimToken = await approvalRpc('approvalDecide', { id, decision: 'approve_once' })
+    expect(((await missingClaimToken.json()) as { error: { code: string } }).error.code).toBe(
+      'validation'
+    )
     expect(
       (
-        (await (await approvalRpc('approvalClaim', { id })).json()) as {
-          result: { status: string }
-        }
-      ).result.status
-    ).toBe('claimed')
-    expect(
-      (
-        (await (await approvalRpc('approvalDecide', { id, decision: 'approve_once' })).json()) as {
+        (await (
+          await approvalRpc('approvalDecide', {
+            id,
+            decision: 'approve_once',
+            claimToken: claim.result.claimToken,
+          })
+        ).json()) as {
           result: { status: string }
         }
       ).result.status
@@ -420,7 +438,8 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
         (await (
           await approvalRpc('approvalConsume', {
             id,
-            digest: 'digest',
+            command: 'bun test',
+            reason: 'test approval',
             capability: 'tool',
             workdir: root,
           })
@@ -429,32 +448,49 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
         }
       ).result.status
     ).toBe('consumed')
-    expect(
-      (
-        (await (
-          await approvalRpc('approvalConsume', {
-            id,
-            digest: 'digest',
-            capability: 'tool',
-            workdir: root,
-          })
-        ).json()) as {
-          result: { status: string }
-        }
-      ).result.status
-    ).toBe('consumed')
+    const replay = await approvalRpc('approvalConsume', {
+      id,
+      command: 'bun test',
+      reason: 'test approval',
+      capability: 'tool',
+      workdir: root,
+    })
+    expect(((await replay.json()) as { error: { code: string } }).error.code).toBe('validation')
 
     const rejected = await request()
-    await approvalRpc('approvalClaim', { id: rejected })
+    const rejectedClaim = (await (await approvalRpc('approvalClaim', { id: rejected })).json()) as {
+      result: { claimToken: string }
+    }
     expect(
       (
         (await (
-          await approvalRpc('approvalDecide', { id: rejected, decision: 'reject' })
+          await approvalRpc('approvalDecide', {
+            id: rejected,
+            decision: 'reject',
+            claimToken: rejectedClaim.result.claimToken,
+          })
         ).json()) as {
           result: { status: string }
         }
       ).result.status
     ).toBe('rejected')
+    const leased = await request()
+    const leaseClaim = (await (await approvalRpc('approvalClaim', { id: leased })).json()) as {
+      result: { claimToken: string }
+    }
+    const ledger = await storage.readApprovals()
+    const leasedRequest = ledger.requests.find((entry) => entry.id === leased)
+    if (!leasedRequest) throw new Error('Expected leased approval.')
+    leasedRequest.claimExpiresAt = new Date(0).toISOString()
+    await storage.writeApprovals(ledger)
+    const expiredLease = await approvalRpc('approvalDecide', {
+      id: leased,
+      decision: 'approve_once',
+      claimToken: leaseClaim.result.claimToken,
+    })
+    expect(((await expiredLease.json()) as { error: { code: string } }).error.code).toBe(
+      'authorization'
+    )
     const cancelled = await request()
     expect(
       (
@@ -465,25 +501,36 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
     ).toBe('cancelled')
 
     const session = await request()
-    await approvalRpc('approvalClaim', { id: session })
-    await approvalRpc('approvalDecide', { id: session, decision: 'approve_session' })
+    const sessionClaim = (await (await approvalRpc('approvalClaim', { id: session })).json()) as {
+      result: { claimToken: string }
+    }
+    await approvalRpc('approvalDecide', {
+      id: session,
+      decision: 'approve_session',
+      claimToken: sessionClaim.result.claimToken,
+    })
     const grants = (await (await approvalRpc('approvalListGrants', {})).json()) as {
-      result: Array<{ id: string }>
+      result: Array<{ id: string; expiresAt: string }>
     }
     expect(grants.result).toHaveLength(1)
+    expect(Date.parse(grants.result[0]?.expiresAt ?? '')).toBeLessThanOrEqual(
+      Date.now() + 24 * 60 * 60 * 1000
+    )
+    const persisted = await storage.readApprovals()
+    const grant = persisted.grants[0]
+    if (!grant) throw new Error('Expected approval grant.')
+    grant.expiresAt = new Date(0).toISOString()
+    await storage.writeApprovals(persisted)
     expect(
-      (
-        (await (await approvalRpc('approvalRevokeGrant', { id: grants.result[0]?.id })).json()) as {
-          result: boolean
-        }
-      ).result
-    ).toBeTrue()
+      ((await (await approvalRpc('approvalListGrants', {})).json()) as { result: unknown[] }).result
+    ).toHaveLength(0)
     expect(
       (
         (await (
           await approvalRpc('approvalConsume', {
             id: session,
-            digest: 'digest',
+            command: 'bun test',
+            reason: 'test approval',
             capability: 'tool',
             workdir: root,
           })

@@ -3,6 +3,7 @@ import {
   DAEMON_PROTOCOL_VERSION,
   type DaemonDescriptor,
   type ApprovalGrant,
+  type ApprovalClaim,
   type ApprovalRequest,
   type ExecResult,
   type RpcResponse,
@@ -257,6 +258,7 @@ export class DaemonClient {
       | 'createdAt'
       | 'updatedAt'
       | 'expiresAt'
+      | 'digest'
     > & {
       expirySeconds: number
     },
@@ -265,16 +267,17 @@ export class DaemonClient {
     return this.call('approvalCreate', request, RPC_TIMEOUT_MS, owner, true)
   }
 
-  async claimApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest> {
+  async claimApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest | ApprovalClaim> {
     return this.call('approvalClaim', { id }, RPC_TIMEOUT_MS, owner, true)
   }
 
   async decideApproval(
     id: string,
     decision: 'approve_once' | 'approve_session' | 'reject',
+    claimToken: string,
     owner: OwnerContext
   ): Promise<ApprovalRequest> {
-    return this.call('approvalDecide', { id, decision }, RPC_TIMEOUT_MS, owner, true)
+    return this.call('approvalDecide', { id, decision, claimToken }, RPC_TIMEOUT_MS, owner, true)
   }
 
   async waitForApproval(
@@ -293,7 +296,7 @@ export class DaemonClient {
 
   async consumeApproval(
     id: string,
-    details: Pick<ApprovalRequest, 'digest' | 'capability' | 'workdir'>,
+    details: Pick<ApprovalRequest, 'command' | 'reason' | 'capability' | 'workdir'>,
     owner: OwnerContext
   ): Promise<ApprovalRequest> {
     return this.call('approvalConsume', { id, ...details }, RPC_TIMEOUT_MS, owner, true)
