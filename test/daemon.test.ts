@@ -1182,7 +1182,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
       calls.push('ask')
       expect(request.patterns).toEqual(['echo ok'])
       expect(request.metadata).toEqual({
-        output: '[opencode-pty · background · awaiting approval]',
+        output: '[opencode-pty · foreground · awaiting approval]',
       })
     },
     metadata: (input: { title?: string; metadata?: { output?: string; description?: string } }) => {
@@ -1198,12 +1198,12 @@ test('bash wrapper keeps host metadata private and consumes native approval once
     `exec:${process.platform === 'win32' ? process.env.ComSpec : '/bin/sh'}:${process.platform === 'win32' ? '/d,/s,/c,echo ok' : '-lc,echo ok'}`,
   ])
   expect(metadata).toEqual([
-    '[opencode-pty · background · awaiting approval]',
-    '[opencode-pty · background · running]',
-    '[opencode-pty · background · completed]',
+    '[opencode-pty · foreground · awaiting approval]',
+    '[opencode-pty · foreground · running]',
+    '[opencode-pty · foreground · completed]',
   ])
   expect(output).toContain(
-    '<bash origin="opencode-pty" mode="background" status="exited" exit_code="0"'
+    '<bash origin="opencode-pty" mode="foreground" status="exited" exit_code="0"'
   )
   const rejected: string[] = []
   const rejectingBash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
