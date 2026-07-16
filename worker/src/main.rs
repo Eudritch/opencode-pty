@@ -2630,8 +2630,13 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
     let containment_unavailable = containment.status == "posix_containment_unknown"
         || containment.status == "windows_job_unknown";
     let macos_direct_exit = cfg!(all(unix, not(target_os = "linux"))) && state.root_exited;
-    let containment_unresolved =
-        state.root_exited && !containment_drained(&containment) && !macos_direct_exit;
+    // Job accounting can briefly lag the direct-child exit notification on Windows.
+    let containment_unresolved = state.root_exited
+        && !containment_drained(&containment)
+        && !macos_direct_exit
+        && state
+            .reader_drain_deadline
+            .is_some_and(|deadline| SystemTime::now() >= deadline);
     let status = if (terminal || containment_unresolved)
         && (state.storage_failure.is_some()
             || state.output_incomplete
