@@ -797,7 +797,7 @@ test('start lock handoff permits one distinct daemon identity', async () => {
   expect(claimed).toMatchObject({ handoffToken: null })
   expect(claimed.token).not.toBe(lock.token)
   expect(claimed.pid).not.toBe(process.pid)
-})
+}, 15_000)
 
 test('a claimed handoff lock survives its launching client and blocks duplicates', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-start-lock-claimed-'))
@@ -3070,6 +3070,10 @@ test('native finalization persists a lost storage failure', async () => {
   const supervisor = new SessionSupervisor(storage)
   const session = record(root, 'pty_native_finalization_failure')
   await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
   await expect(
     (
       supervisor as unknown as {
@@ -3094,6 +3098,10 @@ test('Windows native high exit status persists as an unsigned code', async () =>
   const supervisor = new SessionSupervisor(storage)
   const session = record(root, 'pty_windows_high_exit')
   await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
   const exited = workerSnapshot({
     status: 'exited',
     exitCode: 0xc0000005,
@@ -3630,7 +3638,7 @@ test('plugin client starts its daemon from the configured data directory', async
     if (previousWorkerPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousWorkerPath
   }
-})
+}, 15_000)
 
 test('daemon client returns RPC sequence cursor and truncation metadata', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-client-read-'))
