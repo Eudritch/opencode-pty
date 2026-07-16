@@ -1,11 +1,31 @@
 import { expect, test } from 'bun:test'
 import {
   commandPreview,
+  approvalSummary,
+  canClaimApproval,
+  grantSummary,
+  isApprovalClaim,
   ownerForRoute,
   ownerMatchesRoute,
   redactPreview,
   sessionCard,
+  scopeForRoute,
+  scopeMatchesRoute,
 } from '../src/tui-state.ts'
+
+const approval = (status: 'pending' | 'native_fallback' = 'pending') => ({
+  id: 'approval-1',
+  parentSessionId: 'session-1',
+  projectDirectory: process.cwd(),
+  digest: 'digest',
+  command: 'API_TOKEN=token-value run',
+  capability: 'bash',
+  workdir: process.cwd(),
+  status,
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+})
 
 test('TUI owner derivation requires the active route session', () => {
   const route = { name: 'session', params: { sessionID: 'session-1' } }
@@ -26,6 +46,40 @@ test('TUI owner derivation requires the active route session', () => {
         owner
       )
   ).toBe(false)
+})
+
+test('TUI scopes discard a stale route or project result', () => {
+  const route = { name: 'session', params: { sessionID: 'session-1' } }
+  const scope = scopeForRoute(route, process.cwd())
+  if (!scope) throw new Error('Expected route scope.')
+  expect(scopeMatchesRoute(route, process.cwd(), scope)).toBe(true)
+  expect(
+    scopeMatchesRoute({ name: 'session', params: { sessionID: 'session-2' } }, process.cwd(), scope)
+  ).toBe(false)
+  expect(scopeMatchesRoute(route, `${process.cwd()}-other`, scope)).toBe(false)
+})
+
+test('TUI only claims pending approvals and keeps tokens out of display transforms', () => {
+  expect(canClaimApproval(approval())).toBe(true)
+  expect(canClaimApproval(approval('native_fallback'))).toBe(false)
+  expect(isApprovalClaim(approval())).toBe(false)
+  expect(isApprovalClaim({ request: approval(), claimToken: 'secret-token' })).toBe(false)
+  expect(
+    isApprovalClaim({ request: { ...approval(), status: 'claimed' }, claimToken: 'secret-token' })
+  ).toBe(true)
+  expect(approvalSummary(approval())).not.toContain('token-value')
+  expect(
+    grantSummary({
+      id: 'grant-1',
+      parentSessionId: 'session-1',
+      projectDirectory: process.cwd(),
+      digest: 'digest',
+      capability: 'secret-token',
+      workdir: 'https://user:password-value@example.test',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date().toISOString(),
+    })
+  ).toBe('https://[REDACTED]@example.test')
 })
 
 test('TUI previews redact command and text secrets', () => {
@@ -64,8 +118,17 @@ test('TUI previews redact quoted and unquoted header credentials', () => {
     "curl -H 'X-Api-Key: header-api-key-value' example.test",
     'curl -H "Authorization: Basic basic-value" example.test',
     'curl -H Authorization:Bearer bearer-value example.test',
+    "curl -H 'Cookie: session_id=cookie-value; theme=dark' example.test",
+    "curl -H 'Set-Cookie: session=cookie-value; HttpOnly' example.test",
+    'curl -H X-Session-Token:session-value example.test',
   ]
-  const secrets = ['header-api-key-value', 'basic-value', 'bearer-value']
+  const secrets = [
+    'header-api-key-value',
+    'basic-value',
+    'bearer-value',
+    'cookie-value',
+    'session-value',
+  ]
   for (const preview of previews) {
     const redacted = redactPreview(preview)
     for (const secret of secrets) expect(redacted).not.toContain(secret)

@@ -54,6 +54,7 @@
     "build:dev": "bun clean && bun build:plugin",
     "build:prod": "bun clean && bun build:plugin",
     "package:smoke": "bun test/packaged-native-daemon.ts",
+    "tui:verify": "bun -e \"import('@opentui/solid/bun-plugin').then(({default:plugin}) => Bun.build({entrypoints:['tui.ts'],outdir:process.env.TEMP,target:'bun',plugins:[plugin]})).then(result => { if (!result.success) throw new Error('TUI build failed') })\"",
     "native:prepare": "bun scripts/prepare-native-artifact.ts",
     "native:manifest": "bun scripts/write-native-manifest.ts",
     "native:verify": "bun scripts/verify-native-artifacts.ts",

@@ -7,6 +7,31 @@ export interface TuiSession {
   directory: string
 }
 
+export interface TuiScope {
+  sessionID: string
+  directory: string
+}
+
+export function scopeForRoute(
+  route: { name: string; params?: Record<string, unknown> },
+  directory: string
+): TuiScope | undefined {
+  const sessionID = route.name === 'session' ? route.params?.sessionID : undefined
+  if (typeof sessionID !== 'string' || !directory) return undefined
+  return { sessionID, directory }
+}
+
+export function scopeMatchesRoute(
+  route: { name: string; params?: Record<string, unknown> },
+  directory: string,
+  scope: TuiScope
+): boolean {
+  const current = scopeForRoute(route, directory)
+  return Boolean(
+    current && current.sessionID === scope.sessionID && current.directory === scope.directory
+  )
+}
+
 export function ownerForRoute(
   route: { name: string; params?: Record<string, unknown> },
   session: TuiSession | undefined,
@@ -36,6 +61,27 @@ export function ownerMatchesRoute(
   return ownerContext(sessionID, activeDirectory).projectDirectory === owner.projectDirectory
 }
 
+export function isApprovalClaim(value: unknown): value is {
+  request: ApprovalRequest
+  claimToken: string
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const claim = value as Record<string, unknown>
+  return (
+    typeof claim.claimToken === 'string' &&
+    Boolean(claim.claimToken) &&
+    Boolean(claim.request) &&
+    typeof claim.request === 'object' &&
+    (claim.request as ApprovalRequest).status === 'claimed' &&
+    typeof (claim.request as ApprovalRequest).id === 'string'
+  )
+}
+
+export function canClaimApproval(request: ApprovalRequest): boolean {
+  // ponytail: native fallback has returned control to OpenCode; do not race it.
+  return request.status === 'pending'
+}
+
 function secretValue(): string {
   return '[REDACTED]'
 }
@@ -45,9 +91,11 @@ export function commandPreview(command: string, args: string[]): string {
 }
 
 export function redactPreview(value: string): string {
-  const sensitiveName = '(?:[a-z0-9_-]*(?:token|secret|password|pass|api[-_]?key|key))'
+  const sensitiveName =
+    '(?:[a-z0-9_-]*(?:token|secret|password|pass|api[-_]?key|key|session(?:[-_]?id)?))'
   const secret = '(?:\'[^\']*\'|"[^"]*"|[^\\s]+)'
   return value
+    .replace(/\b((?:set-)?cookie\s*:\s*)[^\r\n]*/gi, (_, prefix) => `${prefix}${secretValue()}`)
     .replace(
       new RegExp(
         `\\b((?:authorization|proxy-authorization|${sensitiveName})\\s*:\\s*(?:(?:bearer|basic)\\s*)?)(?:'[^']*'|"[^"]*"|[^\\s'"]+)`,

@@ -55,7 +55,7 @@ On Linux native exec and PTY children run in a fresh POSIX session/process group
 
 ## TUI Companion
 
-The default `opencode-pty` entry remains the server plugin. The optional TUI companion adds a compact `sidebar_content` panel for PTYs owned by the active OpenCode session and a `PTY approvals` command for reviewing pending requests and revoking session-scoped grants. It fetches the routed session through the supported OpenCode client API, then requires its canonical directory to match `api.state.path.directory`; it shows nothing and performs no approval action when that check fails. It does not use a directory fallback. It is a companion only: it does not replace OpenCode's transcript renderer or the inline native Bash card.
+The default `opencode-pty` entry remains the server plugin. The optional TUI companion adds a compact `sidebar_content` panel for PTYs owned by the active OpenCode session and a `PTY approvals` command for reviewing and claiming pending requests, deciding them once/session/reject, and revoking session-scoped grants. It fetches the routed session through the supported OpenCode client API, then requires its canonical directory to match `api.state.path.directory`; it shows nothing and performs no approval action when that check fails. It does not use a directory fallback. Polling is bound to that exact route/directory identity and stale responses are discarded. Claim tokens stay in memory and are never rendered. Native-fallback requests remain disabled in the companion. It is a companion only: it does not replace OpenCode's transcript renderer or the inline native Bash card.
 
 When a host installs package targets explicitly, load both target-exclusive entries:
 
