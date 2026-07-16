@@ -337,6 +337,7 @@ try {
     )
     if (!pty.ok) throw new Error(`Windows packaged ConPTY did not start: ${JSON.stringify(pty)}`)
     const id = (pty.result as { id: string }).id
+    active = { descriptor: started.descriptor, owner, id }
     const marker = 'echo:conpty-check'
     const written = await rpc(
       started.descriptor,
@@ -358,7 +359,22 @@ try {
     const output = (read.result as { raw?: string } | undefined)?.raw ?? ''
     if (!read.ok || !output.includes(marker))
       throw new Error(`Windows packaged ConPTY did not echo input: ${JSON.stringify(output)}`)
-    await rpc(started.descriptor, 'stop', { id }, owner)
+    const stopped = await rpc(started.descriptor, 'stop', { id }, owner)
+    const result = stopped.result as {
+      requested?: boolean
+      terminationConfirmed?: boolean
+      directChildExited?: boolean
+      containment?: { status?: string }
+    }
+    if (
+      !stopped.ok ||
+      result.requested !== true ||
+      result.terminationConfirmed !== true ||
+      result.directChildExited !== true ||
+      result.containment?.status !== 'windows_job_empty'
+    )
+      throw new Error(`Windows packaged ConPTY did not stop cleanly: ${JSON.stringify(stopped)}`)
+    active = undefined
   }
   executeAbort = new AbortController()
   executing = rpc(
@@ -487,6 +503,7 @@ try {
     (!output.ok || (output.result as { stdout?: string } | null)?.stdout !== 'packed-native\n')
   )
     throw new Error('Windows packaged native worker did not directly execute the requested argv.')
+  active = undefined
   await assertWorkerStopped(worker)
   await stat(join(stateDirectory, 'sessions', id.id, 'worker.json')).then(
     () => Promise.reject(new Error('Native worker descriptor survived shutdown.')),
@@ -508,11 +525,31 @@ try {
         restarted = true
       }
     }
-    if (daemon?.exitCode === null)
-      await (restarted
-        ? stopAfterRestart(active.descriptor, active.id, active.owner)
-        : rpc(active.descriptor, 'stop', { id: active.id }, active.owner)
-      ).catch(() => undefined)
+    if (daemon?.exitCode === null) {
+      try {
+        const stopped = await (restarted
+          ? stopAfterRestart(active.descriptor, active.id, active.owner)
+          : rpc(active.descriptor, 'stop', { id: active.id }, active.owner))
+        const result = stopped.result as {
+          requested?: boolean
+          terminationConfirmed?: boolean
+          directChildExited?: boolean
+          containment?: { status?: string }
+        }
+        const cleanupError =
+          !stopped.ok ||
+          result.requested !== true ||
+          result.terminationConfirmed !== true ||
+          result.directChildExited !== true ||
+          (process.platform === 'win32' && result.containment?.status !== 'windows_job_empty')
+            ? new Error(`Packaged native cleanup was not confirmed: ${JSON.stringify(stopped)}`)
+            : undefined
+        if (cleanupError) cleanupFailure ??= cleanupError
+        else active = undefined
+      } catch (error) {
+        cleanupFailure ??= error
+      }
+    } else cleanupFailure ??= new Error('Packaged native cleanup daemon was unavailable.')
   }
   try {
     if (worker) {
@@ -520,7 +557,7 @@ try {
       await assertWorkerStopped(worker)
     }
   } catch (error) {
-    cleanupFailure = error
+    cleanupFailure ??= error
   } finally {
     if (daemon?.exitCode === null) daemon.kill('SIGKILL')
     if (daemon) await waitForExit(daemon, 'Packaged daemon cleanup').catch(() => undefined)
