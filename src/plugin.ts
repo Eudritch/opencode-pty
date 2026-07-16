@@ -35,7 +35,9 @@ export const PTYPlugin = async (
     },
     event: async ({ event }) => {
       if (event.type === 'session.deleted') {
-        await manager.cleanupBySession(ownerContext(event.properties.info.id, directory))
+        await manager.cleanupBySession(
+          ownerContext(event.properties.info.id, event.properties.info.directory)
+        )
       }
     },
   }
