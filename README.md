@@ -53,6 +53,20 @@ On Linux native exec and PTY children run in a fresh POSIX session/process group
 }
 ```
 
+## TUI Companion
+
+The default `opencode-pty` entry remains the server plugin. The optional TUI companion adds a compact `sidebar_content` panel for PTYs owned by the active OpenCode session and a `PTY approvals` command for reviewing pending requests and revoking session-scoped grants. It is a companion only: it does not replace OpenCode's transcript renderer or the inline native Bash card.
+
+When a host installs package targets explicitly, load both target-exclusive entries:
+
+```json
+{
+  "plugin": ["opencode-pty/server", "opencode-pty/tui"]
+}
+```
+
+The root entry preserves legacy server behavior. The TUI never takes over a Bash approval race; the server's native `ctx.ask` prompt remains authoritative. Set `{ "bash": false }` on the server entry to keep PTY tools without the Bash compatibility override.
+
 ## Configuration
 
 | Variable | Default | Purpose |

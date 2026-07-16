@@ -24,6 +24,7 @@ export interface PTYSessionInfo {
   command: string
   args: string[]
   mode: ExecutionMode
+  lifecycle: SessionLifecycle
   name?: string
   idempotencyKey?: string
   workdir: string

@@ -333,6 +333,9 @@ export class DaemonServer implements Disposable {
       case 'approvalListGrants':
         this.approvalOwner(request)
         return this.approvalListGrants(owner)
+      case 'approvalListRequests':
+        this.approvalOwner(request)
+        return this.approvalListRequests(owner)
       case 'approvalRevokeGrant':
         this.approvalOwner(request)
         return this.approvalRevokeGrant(request.payload, owner)
@@ -596,6 +599,17 @@ export class DaemonServer implements Disposable {
         (grant) =>
           grant.parentSessionId === owner.parentSessionId &&
           grant.projectDirectory === owner.projectDirectory
+      )
+    })
+  }
+
+  private async approvalListRequests(owner: OwnerContext) {
+    return this.withApprovals(async (ledger) => {
+      for (const request of ledger.requests) this.refreshApproval(request)
+      return ledger.requests.filter(
+        (request) =>
+          request.parentSessionId === owner.parentSessionId &&
+          request.projectDirectory === owner.projectDirectory
       )
     })
   }

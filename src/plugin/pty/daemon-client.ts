@@ -337,6 +337,10 @@ export class DaemonClient {
     return this.call('approvalListGrants', {}, RPC_TIMEOUT_MS, owner, true)
   }
 
+  async listApprovalRequests(owner: OwnerContext): Promise<ApprovalRequest[]> {
+    return this.call('approvalListRequests', {}, RPC_TIMEOUT_MS, owner, true)
+  }
+
   async revokeApprovalGrant(id: string, owner: OwnerContext): Promise<boolean> {
     return this.call('approvalRevokeGrant', { id }, RPC_TIMEOUT_MS, owner, true)
   }

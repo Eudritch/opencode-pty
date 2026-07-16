@@ -1631,6 +1631,7 @@ export class SessionSupervisor {
       command: record.command,
       args: record.args,
       mode: record.mode,
+      lifecycle: record.lifecycle,
       name: record.name,
       idempotencyKey: record.idempotencyKey,
       workdir: record.workdir,
