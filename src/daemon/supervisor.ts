@@ -852,7 +852,10 @@ export class SessionSupervisor {
       if (stopped.reason === 'deadline')
         throw new ProcessError('Exec stop completed without terminal evidence.')
     }
-    const current = this.recordFor(id)
+    let current = this.recordFor(id)
+    if (waited.reason === 'exit' || current.status === 'lost')
+      await this.nativeFinalizations.get(id)
+    current = this.recordFor(id)
     if (!this.isTerminal(current) || current.status === 'lost' || current.status === 'spawn_failed')
       throw new ProcessError('Exec wait completed without terminal evidence.')
     const output = current.execOutput
@@ -953,10 +956,7 @@ export class SessionSupervisor {
         if (this.nativeFinalizations.get(record.id) === finalization)
           this.nativeFinalizations.delete(record.id)
       },
-      () => {
-        if (this.nativeFinalizations.get(record.id) === finalization)
-          this.nativeFinalizations.delete(record.id)
-      }
+      () => undefined
     )
     return finalization
   }

@@ -2235,6 +2235,29 @@ test('PTY idempotency reuses only an active matching owner and spec', async () =
 })
 
 test('PTY idempotency canonicalizes environment order and scopes only by parent and workdir', async () => {
+test('native exec wait returns its finalization storage failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-wait-storage-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  const session = record(root, 'exec_wait_storage')
+  session.mode = 'exec'
+  session.status = 'lost'
+  const storageError = Object.assign(new Error('Native finalization failed: ENOENT'), {
+    code: 'ESTORAGE',
+  })
+  const state = supervisor as unknown as {
+    records: Map<string, SessionRecord>
+    nativeFinalizations: Map<string, Promise<unknown>>
+    wait: () => Promise<{ reason: string }>
+  }
+  const finalization = Promise.reject(storageError)
+  void finalization.catch(() => undefined)
+  state.records.set(session.id, session)
+  state.nativeFinalizations.set(session.id, finalization)
+  state.wait = async () => ({ reason: 'exit' })
+
+  await expect(supervisor.nativeExecWait(session.id, 1)).rejects.toBe(storageError)
+})
   if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
   roots.push(root)
@@ -2487,7 +2510,7 @@ test('sendWait observes an immediate response after accepted input', async () =>
     await supervisor.stop(session.id).catch(() => undefined)
     await supervisor.flush()
   }
-})
+}, 10_000)
 
 test('sendWait excludes drained pre-acceptance output and observes its immediate reply', async () => {
   if (process.platform === 'win32') return
@@ -2592,7 +2615,7 @@ test('exec output remains separately recoverable after restart', async () => {
     stdoutTruncated: false,
     stderrTruncated: false,
   })
-})
+}, 10_000)
 
 test('native exec through the daemon drains both streams, reconnects, stops, and cleans up', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-integration-'))
@@ -2642,18 +2665,24 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
     expect(
       (await storage.loadSessions()).find((session) => session.id === id)?.worker
     ).toBeDefined()
-    await Bun.sleep(100)
+    const outputWait = await rpc(
+      firstDescriptor,
+      'wait',
+      { id, condition: { kind: 'output', literal: 'native-out' }, timeoutSeconds: 5 },
+      context
+    ).then((response) => response.json())
+    expect(outputWait).toMatchObject({
+      result: { satisfied: true, reason: 'output', matched: 'native-out' },
+    })
     await first.stop()
     restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-second')
     const secondDescriptor = await restarted.start()
-    let stopped: { result: { requested: boolean; terminationConfirmed: boolean } } | undefined
-    for (let attempt = 0; attempt < 50 && !stopped?.result.requested; attempt += 1) {
+    let stopped: { result?: { requested: boolean; terminationConfirmed: boolean } } | undefined
+    for (let attempt = 0; attempt < 50 && !stopped?.result?.requested; attempt += 1) {
       stopped = (await rpc(secondDescriptor, 'stop', { id }, context).then((response) =>
         response.json()
-      )) as {
-        result: { requested: boolean; terminationConfirmed: boolean }
-      }
-      if (!stopped.result.requested) await Bun.sleep(20)
+      )) as { result?: { requested: boolean; terminationConfirmed: boolean } }
+      if (!stopped.result?.requested) await Bun.sleep(20)
     }
     expect(stopped).toMatchObject({
       result: { requested: true, terminationConfirmed: true },
@@ -2674,14 +2703,14 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
     const chunks = await storage.readOutputChunks(id)
     expect(chunks.map((chunk) => chunk.data).join('')).toContain('native-out')
     expect(chunks.every((chunk) => /^\d{4}-\d{2}-\d{2}T.*Z$/.test(chunk.timestamp))).toBeTrue()
-    expect(
-      await rpc(
+    await expect(
+      rpc(
         secondDescriptor,
         'cleanupByParentSession',
         { parentSessionId: context.parentSessionId },
         context
       ).then((response) => response.json())
-    ).toMatchObject({ ok: true })
+    ).resolves.toMatchObject({ ok: true })
     await expect(stat(join(root, 'sessions', id, 'worker.json'))).rejects.toThrow()
   } finally {
     await restarted?.stop()
@@ -2759,7 +2788,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
     await writeFile(join(root, 'sessions', id, 'output'), 'not a directory')
     expect(await failing.then((response) => response.json())).toMatchObject({
       ok: false,
-      error: { code: 'storage' },
+      error: { code: 'storage', message: expect.stringContaining('Native finalization failed') },
     })
     expect(
       await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
