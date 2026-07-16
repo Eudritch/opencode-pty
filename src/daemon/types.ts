@@ -1,4 +1,4 @@
-export const DAEMON_PROTOCOL_VERSION = 7
+export const DAEMON_PROTOCOL_VERSION = 8
 
 export const OUTPUT_JOURNAL_VERSION = 2
 

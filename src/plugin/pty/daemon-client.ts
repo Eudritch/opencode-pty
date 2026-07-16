@@ -137,6 +137,29 @@ export class DaemonClient {
     )
   }
 
+  async execStart(
+    options: SpawnOptions & { maxOutputBytes?: number },
+    owner?: OwnerContext
+  ): Promise<ExecResult['session']> {
+    return this.call('execStart', options, RPC_TIMEOUT_MS, owner)
+  }
+
+  async execWait(
+    id: string,
+    timeoutSeconds: number,
+    owner?: OwnerContext,
+    signal?: AbortSignal
+  ): Promise<ExecResult> {
+    return this.call(
+      'execWait',
+      { id, timeoutSeconds },
+      requestTimeout(timeoutSeconds),
+      owner,
+      false,
+      signal
+    )
+  }
+
   async wait(
     id: string,
     condition: WaitCondition,

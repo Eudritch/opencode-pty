@@ -22,9 +22,6 @@ const MAX_OUTPUT_BYTES = 64 * 1024 * 64
 const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
-const NATIVE_READER_DRAIN_MS = 2000
-const NATIVE_WAIT_MARGIN_MS =
-  NATIVE_READER_DRAIN_MS + TERMINATION_GRACE_MS + TERMINATION_HARD_KILL_MS
 const RECOVERY_CONCURRENCY = 4
 const SAFE_ENVIRONMENT_KEYS = new Set([
   'PATH',
@@ -726,6 +723,13 @@ export class SessionSupervisor {
   }
 
   async nativeExec(options: ExecOptions): Promise<ExecResult> {
+    const session = await this.nativeExecStart(options)
+    return this.nativeExecWait(session.id, (options.timeoutSeconds ?? 0) + 5)
+  }
+
+  async nativeExecStart(
+    options: ExecOptions
+  ): Promise<{ id: string; status: SessionRecord['status']; mode: 'exec'; pid: number }> {
     await this.flush()
     if (!options.command || !options.timeoutSeconds)
       throw new Error('timeoutSeconds is required for exec')
@@ -807,15 +811,32 @@ export class SessionSupervisor {
     record.updatedAt = new Date().toISOString()
     this.nativeWorkers.set(id, started.client)
     await this.storage.writeSession(record)
-    let result: WorkerSnapshot
-    try {
-      result = await started.client.wait(options.timeoutSeconds * 1000 + NATIVE_WAIT_MARGIN_MS)
-    } catch (error) {
-      await this.rollbackNative(record, started.client, error)
-      throw error
+    void this.monitorNative(record, started.client)
+    return { id, status: record.status, mode: 'exec', pid: record.pid }
+  }
+
+  async nativeExecWait(id: string, timeoutSeconds: number): Promise<ExecResult> {
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds <= 0)
+      throw new Error('timeoutSeconds must be a positive integer in seconds for exec')
+    const record = this.recordFor(id)
+    if (record.mode !== 'exec') throw new Error(`Session '${id}' is not an exec session.`)
+    await this.wait(id, { kind: 'exit' }, timeoutSeconds)
+    const current = this.recordFor(id)
+    const output = current.execOutput
+    return {
+      session: { id: current.id, status: current.status, mode: 'exec', pid: current.pid },
+      stdout: output?.stdout ?? '',
+      stderr: output?.stderr ?? '',
+      exitCode: current.exitCode,
+      exitSignal: current.exitSignal,
+      timedOut: current.timedOut,
+      outputLimited: current.outputTruncated,
+      terminationConfirmed: current.terminationConfirmed,
+      containment: current.containment,
+      termination: current.termination,
+      startedAt: current.startedAt ?? current.createdAt,
+      exitedAt: current.exitedAt ?? current.updatedAt,
     }
-    if (!this.nativeTerminal(result)) void this.monitorNative(record, started.client)
-    return (await this.finalizeNative(record, started.client, result)) as ExecResult
   }
 
   private async monitorNative(record: SessionRecord, worker: WorkerClient): Promise<void> {

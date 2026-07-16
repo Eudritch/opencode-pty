@@ -215,6 +215,18 @@ export class DaemonServer implements Disposable {
         return this.spawn(this.spawnPayload(request.payload), owner)
       case 'exec':
         return this.exec(this.execPayload(request.payload), owner)
+      case 'execStart':
+        return this.execStart(this.execPayload(request.payload), owner)
+      case 'execWait': {
+        const payload = this.objectPayload(request.payload)
+        this.onlyFields(payload, ['id', 'timeoutSeconds'])
+        const id = this.requiredString(payload, 'id')
+        this.authorize(id, owner)
+        return this.supervisor.nativeExecWait(
+          id,
+          this.requiredPositiveInteger(payload, 'timeoutSeconds')
+        )
+      }
       case 'write': {
         const payload = this.objectPayload(request.payload)
         this.onlyFields(payload, ['id', 'data'])
@@ -769,6 +781,23 @@ export class DaemonServer implements Disposable {
     }
     return this.withSessionSlot(owner, () =>
       this.supervisor.nativeExec({
+        ...options,
+        parentSessionId: owner.parentSessionId,
+        ownerProjectDirectory: owner.projectDirectory,
+        ownerCapabilityHash: owner.capability,
+      })
+    )
+  }
+
+  private async execStart(
+    options: Parameters<SessionSupervisor['nativeExecStart']>[0],
+    owner: OwnerContext
+  ): Promise<unknown> {
+    if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
+      throw new Error('Exec runtime limit exceeded.')
+    }
+    return this.withSessionSlot(owner, () =>
+      this.supervisor.nativeExecStart({
         ...options,
         parentSessionId: owner.parentSessionId,
         ownerProjectDirectory: owner.projectDirectory,

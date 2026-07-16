@@ -924,7 +924,7 @@ test('bash policy matches opaque raw input and preserves external workdir checks
   )
 })
 
-test('bash wrapper selects platform argv, tracks metadata, and consumes native approval once', async () => {
+test('bash wrapper keeps host metadata private and consumes native approval once', async () => {
   expect(bashArgv('echo ok', 'win32', { ComSpec: 'cmd.exe' }, () => true)).toEqual([
     'cmd.exe',
     ['/d', '/s', '/c', 'echo ok'],
@@ -944,8 +944,11 @@ test('bash wrapper selects platform argv, tracks metadata, and consumes native a
       return { id: 'approval', status: 'consumed' }
     },
     cancelApproval: async () => ({ id: 'approval', status: 'cancelled' }),
-    exec: async (options: { command: string; args: string[] }) => {
+    execStart: async (options: { command: string; args: string[] }) => {
       calls.push(`exec:${options.command}:${options.args.join(',')}`)
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async () => {
       return {
         session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
         stdout: 'ok\n',
@@ -958,6 +961,7 @@ test('bash wrapper selects platform argv, tracks metadata, and consumes native a
         exitedAt: '',
       }
     },
+    stop: async () => ({ terminationConfirmed: true }),
   }
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), daemon as never)
   const metadata: string[] = []
@@ -966,11 +970,18 @@ test('bash wrapper selects platform argv, tracks metadata, and consumes native a
     directory: process.cwd(),
     agent: 'test',
     abort: new AbortController().signal,
-    ask: async () => {
+    ask: async (request: { patterns: string[]; metadata: unknown }) => {
       calls.push('ask')
+      expect(request.patterns).toEqual(['echo ok'])
+      expect(request.metadata).toEqual({
+        output: '[opencode-pty · foreground · awaiting approval]',
+      })
     },
-    metadata: (input: { metadata?: { output?: string } }) =>
-      input.metadata?.output && metadata.push(input.metadata.output),
+    metadata: (input: { title?: string; metadata?: { output?: string; description?: string } }) => {
+      expect(input.title).toBe('Bash')
+      expect(input.metadata?.description).toBeUndefined()
+      if (input.metadata?.output) metadata.push(input.metadata.output)
+    },
   } as never)
   expect(calls).toEqual([
     'ask',
@@ -981,7 +992,7 @@ test('bash wrapper selects platform argv, tracks metadata, and consumes native a
   expect(metadata).toEqual([
     '[opencode-pty · foreground · awaiting approval]',
     '[opencode-pty · foreground · running]',
-    '[opencode-pty · foreground · exited] ok ',
+    '[opencode-pty · foreground · completed]',
   ])
   expect(output).toContain(
     '<bash origin="opencode-pty" mode="foreground" status="exited" exit_code="0"'
@@ -993,7 +1004,7 @@ test('bash wrapper selects platform argv, tracks metadata, and consumes native a
       rejected.push('cancel')
       return { id: 'approval', status: 'cancelled' }
     },
-    exec: async () => {
+    execStart: async () => {
       rejected.push('exec')
       throw new Error('must not execute')
     },
@@ -1012,6 +1023,131 @@ test('bash wrapper selects platform argv, tracks metadata, and consumes native a
   ).rejects.toThrow('rejected')
   expect(rejected).toEqual(['cancel'])
 })
+
+test('bash abort cancels pending approval before dispatch', async () => {
+  const calls: string[] = []
+  const controller = new AbortController()
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    createApproval: async () => ({ id: 'approval', status: 'pending' }),
+    approveNativeApproval: async () => ({ id: 'approval', status: 'approved_once' }),
+    consumeApproval: async () => ({ id: 'approval', status: 'consumed' }),
+    cancelApproval: async () => {
+      calls.push('cancel')
+      return { id: 'approval', status: 'cancelled' }
+    },
+    execStart: async () => {
+      calls.push('start')
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async () => {
+      throw new Error('must not wait')
+    },
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  await expect(
+    bash.execute({ command: 'echo no' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: controller.signal,
+      ask: async () => {
+        controller.abort()
+      },
+      metadata: () => {},
+    } as never)
+  ).rejects.toThrow('cancelled')
+  expect(calls).toEqual(['cancel'])
+})
+
+test('bash abort stops dispatched exec and waits for terminal evidence', async () => {
+  const calls: string[] = []
+  const controller = new AbortController()
+  const bash = createBash(async () => ({ action: 'allow', workdir: process.cwd() }), {
+    execStart: async () => {
+      calls.push('start')
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async (
+      _id: string,
+      timeoutSeconds: number,
+      _owner: unknown,
+      signal?: AbortSignal
+    ) => {
+      calls.push(`wait:${timeoutSeconds}`)
+      if (signal) {
+        controller.abort()
+        throw new DOMException('aborted', 'AbortError')
+      }
+      return {
+        session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+        stdout: '',
+        stderr: '',
+        timedOut: false,
+        outputLimited: false,
+        terminationConfirmed: true,
+        startedAt: '',
+        exitedAt: '',
+      }
+    },
+    stop: async () => {
+      calls.push('stop')
+      return { terminationConfirmed: true }
+    },
+  } as never)
+  await expect(
+    bash.execute({ command: 'echo no' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: controller.signal,
+      ask: async () => {},
+      metadata: () => {},
+    } as never)
+  ).rejects.toThrow('termination_confirmed=true')
+  expect(calls).toEqual(['start', 'wait:125', 'stop', 'wait:5'])
+})
+
+test('bash execStart stop reaches a terminal daemon record', async () => {
+  if (!existsSync(nativeWorkerPath)) return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-abort-'))
+  roots.push(root)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'bash-abort')
+  try {
+    const descriptor = await server.start()
+    const context = await owner(storage, 'bash-abort', root)
+    const started = (await rpc(
+      descriptor,
+      'execStart',
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        timeoutSeconds: 10,
+        workdir: root,
+      },
+      context
+    ).then((response) => response.json())) as { result: { id: string } }
+    const stopped = await rpc(descriptor, 'stop', { id: started.result.id }, context).then(
+      (response) => response.json()
+    )
+    expect(stopped).toMatchObject({ result: { requested: true, terminationConfirmed: true } })
+    const terminal = await rpc(
+      descriptor,
+      'execWait',
+      { id: started.result.id, timeoutSeconds: 5 },
+      context
+    ).then((response) => response.json())
+    expect(terminal).toMatchObject({
+      result: { session: { status: 'exited' }, terminationConfirmed: true },
+    })
+  } finally {
+    await server.stop()
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 10_000)
 
 test('bash override is enabled by default and can be omitted alone', async () => {
   const input = {

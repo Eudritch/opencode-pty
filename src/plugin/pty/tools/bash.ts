@@ -27,7 +27,7 @@ interface BashDaemon {
     owner: OwnerContext
   ): Promise<ApprovalRequest>
   cancelApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest>
-  exec(
+  execStart(
     options: {
       command: string
       args: string[]
@@ -38,9 +38,15 @@ interface BashDaemon {
       parentAgent: string
       timeoutSeconds: number
     },
+    owner: OwnerContext
+  ): Promise<ExecResult['session']>
+  execWait(
+    id: string,
+    timeoutSeconds: number,
     owner: OwnerContext,
-    signal: AbortSignal
+    signal?: AbortSignal
   ): Promise<ExecResult>
+  stop(id: string, owner: OwnerContext): Promise<{ terminationConfirmed: boolean }>
 }
 
 export function bashArgv(
@@ -75,12 +81,10 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
     },
     async execute(args, ctx) {
       if (!args.command) throw new Error('Bash command is required.')
-      const title = args.description ?? 'Bash'
       ctx.metadata({
-        title,
+        title: 'Bash',
         metadata: {
           output: '[opencode-pty · foreground · awaiting approval]',
-          description: args.description,
         },
       })
       const policy = await authorize(args.command, args.workdir, ctx.agent)
@@ -90,7 +94,6 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
           ? await daemon.createApproval(
               {
                 command: args.command,
-                reason: args.description,
                 capability: 'bash',
                 workdir: policy.workdir,
                 expirySeconds: APPROVAL_EXPIRY_SECONDS,
@@ -100,13 +103,12 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
           : undefined
       try {
         if (approval) {
-          await abortableAsk(ctx, args.command, policy.workdir)
+          await abortableAsk(ctx, args.command)
           await daemon.approveNativeApproval(approval.id, owner)
           const consumed = await daemon.consumeApproval(
             approval.id,
             {
               command: args.command,
-              reason: args.description,
               capability: 'bash',
               workdir: policy.workdir,
             },
@@ -119,35 +121,33 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
         if (approval) await daemon.cancelApproval(approval.id, owner).catch(() => undefined)
         throw error
       }
+      if (ctx.abort.aborted) throw new Error('Bash execution cancelled before start.')
       const [command, shellArgs] = bashArgv(args.command)
       const timeoutSeconds = bashTimeout(args.timeout)
       ctx.metadata({
-        title,
+        title: 'Bash',
         metadata: {
           output: '[opencode-pty · foreground · running]',
-          description: args.description,
         },
       })
       try {
-        const result = await daemon.exec(
+        const session = await daemon.execStart(
           {
             command,
             args: shellArgs,
             workdir: policy.workdir,
-            title,
-            description: args.description,
+            title: 'Bash',
             parentSessionId: ctx.sessionID,
             parentAgent: ctx.agent,
             timeoutSeconds,
           },
-          owner,
-          ctx.abort
+          owner
         )
+        const result = await abortableExec(ctx, daemon, session.id, owner, timeoutSeconds + 5)
         ctx.metadata({
-          title,
+          title: 'Bash',
           metadata: {
-            output: `[opencode-pty · foreground · ${result.session.status}] ${preview(result.stdout || result.stderr)}`,
-            description: args.description,
+            output: '[opencode-pty · foreground · completed]',
           },
         })
         return [
@@ -158,10 +158,9 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
         ].join('\n')
       } catch (error) {
         ctx.metadata({
-          title,
+          title: 'Bash',
           metadata: {
             output: '[opencode-pty · foreground · request failed]',
-            description: args.description,
           },
         })
         throw error
@@ -170,14 +169,14 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
   })
 }
 
-async function abortableAsk(ctx: ToolContext, command: string, workdir: string): Promise<void> {
+async function abortableAsk(ctx: ToolContext, command: string): Promise<void> {
   if (ctx.abort.aborted) throw new Error('Bash approval cancelled before prompting.')
   await Promise.race([
     ctx.ask({
       permission: 'bash',
       patterns: [command],
       always: [],
-      metadata: { command, workdir },
+      metadata: { output: '[opencode-pty · foreground · awaiting approval]' },
     }),
     new Promise<never>((_, reject) => {
       ctx.abort.addEventListener(
@@ -190,6 +189,21 @@ async function abortableAsk(ctx: ToolContext, command: string, workdir: string):
   if (ctx.abort.aborted) throw new Error('Bash approval cancelled before execution.')
 }
 
-function preview(output: string): string {
-  return output.replaceAll(/\s+/g, ' ').slice(0, 240)
+async function abortableExec(
+  ctx: ToolContext,
+  daemon: BashDaemon,
+  id: string,
+  owner: OwnerContext,
+  timeoutSeconds: number
+): Promise<ExecResult> {
+  try {
+    return await daemon.execWait(id, timeoutSeconds, owner, ctx.abort)
+  } catch (error) {
+    if (!ctx.abort.aborted) throw error
+    const stop = await daemon.stop(id, owner).catch(() => ({ terminationConfirmed: false }))
+    const terminal = await daemon.execWait(id, 5, owner).catch(() => undefined)
+    throw new Error(
+      `Bash execution aborted; termination_confirmed=${terminal?.terminationConfirmed ?? stop.terminationConfirmed}.`
+    )
+  }
 }
