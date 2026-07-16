@@ -32,7 +32,11 @@ export function daemonLaunchCommand(
   return [resolveDaemonLauncher(which), entryPath, launchOptions]
 }
 
-export function daemonLaunchOptions(which: (command: string) => string | null, entryPath: string, launchOptions: string) {
+export function daemonLaunchOptions(
+  which: (command: string) => string | null,
+  entryPath: string,
+  launchOptions: string
+) {
   return {
     cmd: daemonLaunchCommand(which, entryPath, launchOptions),
     detached: true,
