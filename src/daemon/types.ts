@@ -106,6 +106,8 @@ export interface ApprovalRequest {
   claimExpiresAt?: string
 }
 
+export type ApprovalPreparation = ApprovalRequest | { status: 'approved_session' }
+
 export interface ApprovalGrant {
   id: string
   parentSessionId: string

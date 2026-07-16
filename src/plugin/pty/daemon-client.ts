@@ -5,6 +5,7 @@ import {
   type ApprovalGrant,
   type ApprovalClaim,
   type ApprovalRequest,
+  type ApprovalPreparation,
   type ExecResult,
   type RpcResponse,
   type StopResult,
@@ -296,6 +297,23 @@ export class DaemonClient {
     owner: OwnerContext
   ): Promise<ApprovalRequest> {
     return this.call('approvalCreate', request, RPC_TIMEOUT_MS, owner, true)
+  }
+
+  async prepareApproval(
+    request: Omit<
+      ApprovalRequest,
+      | 'id'
+      | 'parentSessionId'
+      | 'projectDirectory'
+      | 'status'
+      | 'createdAt'
+      | 'updatedAt'
+      | 'expiresAt'
+      | 'digest'
+    > & { expirySeconds: number },
+    owner: OwnerContext
+  ): Promise<ApprovalPreparation> {
+    return this.call('approvalPrepare', request, RPC_TIMEOUT_MS, owner, true)
   }
 
   async claimApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest | ApprovalClaim> {

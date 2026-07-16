@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import {
   MAX_EXEC_RUNTIME_SECONDS,
   MAX_EXEC_WAIT_SECONDS,
+  type ApprovalPreparation,
   type ApprovalRequest,
   type ExecResult,
 } from '../../../daemon/types.ts'
@@ -12,10 +13,10 @@ import type { BashAuthorizer } from '../permissions.ts'
 import { escapeXml } from '../xml.ts'
 
 const DEFAULT_TIMEOUT_MS = 120_000
-const APPROVAL_EXPIRY_SECONDS = 300
+const APPROVAL_EXPIRY_SECONDS = MAX_EXEC_RUNTIME_SECONDS
 
 interface BashDaemon {
-  createApproval(
+  prepareApproval(
     request: {
       command: string
       reason?: string
@@ -24,7 +25,7 @@ interface BashDaemon {
       expirySeconds: number
     },
     owner: OwnerContext
-  ): Promise<ApprovalRequest>
+  ): Promise<ApprovalPreparation>
   approveNativeApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest>
   consumeApproval(
     id: string,
@@ -97,7 +98,7 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
       const owner = ownerContext(ctx.sessionID, ctx.directory)
       const approval =
         policy.action === 'ask'
-          ? await daemon.createApproval(
+          ? await daemon.prepareApproval(
               {
                 command: args.command,
                 capability: 'bash',
@@ -108,7 +109,7 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
             )
           : undefined
       try {
-        if (approval) {
+        if (approval && approval.status !== 'approved_session') {
           await abortableAsk(ctx, args.command)
           await daemon.approveNativeApproval(approval.id, owner)
           const consumed = await daemon.consumeApproval(
@@ -124,7 +125,8 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
             throw new Error('Bash command approval was not granted.')
         }
       } catch (error) {
-        if (approval) await daemon.cancelApproval(approval.id, owner).catch(() => undefined)
+        if (approval && approval.status !== 'approved_session')
+          await daemon.cancelApproval(approval.id, owner).catch(() => undefined)
         throw error
       }
       if (ctx.abort.aborted) throw new Error('Bash execution cancelled before start.')

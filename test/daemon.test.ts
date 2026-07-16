@@ -599,6 +599,40 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
   }
 })
 
+test('approval preparation binds intent and retains a long native approval window', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-approval-prepare-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'prepare-token')
+  const context = await owner(storage, 'prepare', root)
+  const capability = await approvalCapability(storage, 'prepare', root)
+  try {
+    const descriptor = await server.start()
+    const response = await fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer prepare-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation: 'approvalPrepare',
+        owner: context,
+        approvalCapability: capability,
+        payload: {
+          command: 'bun test',
+          capability: 'bash',
+          workdir: root,
+          expirySeconds: 3600,
+        },
+      }),
+    })
+    const prepared = (await response.json()) as { result: { status: string; expiresAt?: string } }
+    expect(prepared.result.status).toBe('pending')
+    expect(Date.parse(prepared.result.expiresAt ?? '')).toBeGreaterThan(Date.now() + 3_500_000)
+  } finally {
+    await server.stop()
+  }
+})
+
 test('approval ledger discards legacy session grants without expiry', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-legacy-approval-'))
   roots.push(root)
@@ -982,7 +1016,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
   expect(() => bashTimeout(3_601_000)).toThrow('3600 second limit')
   const calls: string[] = []
   const daemon = {
-    createApproval: async () => ({ id: 'approval', status: 'pending' }),
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
     approveNativeApproval: async () => {
       calls.push('approve')
       return { id: 'approval', status: 'approved_once' }
@@ -1103,7 +1137,7 @@ test('bash rejects nonterminal exec results rather than claiming completion', as
 test('bash cancels durable approval when native ctx.ask is unavailable', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
-    createApproval: async () => ({ id: 'approval', status: 'pending' }),
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
     cancelApproval: async () => {
       calls.push('cancel')
       return { id: 'approval', status: 'cancelled' }
@@ -1129,11 +1163,82 @@ test('bash cancels durable approval when native ctx.ask is unavailable', async (
   expect(calls).toEqual(['cancel'])
 })
 
+test('bash reuses a matching session grant without native approval', async () => {
+  const calls: string[] = []
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    prepareApproval: async () => ({ status: 'approved_session' }),
+    execStart: async () => {
+      calls.push('start')
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async () => ({
+      session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      outputLimited: false,
+      terminationConfirmed: true,
+      startedAt: '',
+      exitedAt: '',
+    }),
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  await expect(
+    bash.execute({ command: 'echo granted' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      ask: async () => {
+        calls.push('ask')
+      },
+      metadata: () => {},
+    } as never)
+  ).resolves.toContain('status="exited"')
+  expect(calls).toEqual(['start'])
+})
+
+test('bash asks when no matching session grant is available', async () => {
+  const calls: string[] = []
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    approveNativeApproval: async () => {
+      calls.push('approve')
+      return { id: 'approval', status: 'approved_once' }
+    },
+    consumeApproval: async () => ({ id: 'approval', status: 'consumed' }),
+    cancelApproval: async () => ({ id: 'approval', status: 'cancelled' }),
+    execStart: async () => ({ id: 'exec', status: 'running', mode: 'exec', pid: 1 }),
+    execWait: async () => ({
+      session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      outputLimited: false,
+      terminationConfirmed: true,
+      startedAt: '',
+      exitedAt: '',
+    }),
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  await bash.execute({ command: 'echo expired' }, {
+    sessionID: 'test-session',
+    directory: process.cwd(),
+    agent: 'test',
+    abort: new AbortController().signal,
+    ask: async () => {
+      calls.push('ask')
+    },
+    metadata: () => {},
+  } as never)
+  expect(calls).toEqual(['ask', 'approve'])
+})
+
 test('bash abort cancels pending approval before dispatch', async () => {
   const calls: string[] = []
   const controller = new AbortController()
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
-    createApproval: async () => ({ id: 'approval', status: 'pending' }),
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
     approveNativeApproval: async () => ({ id: 'approval', status: 'approved_once' }),
     consumeApproval: async () => ({ id: 'approval', status: 'consumed' }),
     cancelApproval: async () => {

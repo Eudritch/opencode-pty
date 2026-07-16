@@ -3,6 +3,7 @@ import {
   type DaemonDescriptor,
   type DaemonDiagnostics,
   type ApprovalLedger,
+  type ApprovalPreparation,
   type ApprovalClaim,
   type ApprovalRequest,
   type OwnerContext,
@@ -315,6 +316,9 @@ export class DaemonServer implements Disposable {
       case 'approvalCreate':
         this.approvalOwner(request)
         return this.approvalCreate(request.payload, owner)
+      case 'approvalPrepare':
+        this.approvalOwner(request)
+        return this.approvalPrepare(request.payload, owner)
       case 'approvalClaim':
         this.approvalOwner(request)
         return this.approvalClaim(request.payload, owner)
@@ -455,6 +459,52 @@ export class DaemonServer implements Disposable {
         parentSessionId: owner.parentSessionId,
         projectDirectory: owner.projectDirectory,
         digest: this.approvalDigest(intent),
+        ...intent,
+        status: 'pending',
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + expirySeconds * 1000).toISOString(),
+      }
+      ledger.requests.push(request)
+      return request
+    })
+  }
+
+  private async approvalPrepare(
+    payload: unknown,
+    owner: OwnerContext
+  ): Promise<ApprovalPreparation> {
+    const value = this.approvalPayload(payload, [
+      'command',
+      'reason',
+      'capability',
+      'workdir',
+      'expirySeconds',
+    ])
+    const expirySeconds = this.requiredPositiveInteger(value, 'expirySeconds')
+    if (expirySeconds > MAX_APPROVAL_EXPIRY_SECONDS)
+      throw new ValidationError('Approval expiry exceeds the limit.')
+    const intent = this.approvalIntent(value)
+    return this.withApprovals(async (ledger) => {
+      const now = new Date()
+      const digest = this.approvalDigest(intent)
+      ledger.grants = ledger.grants.filter((grant) => Date.parse(grant.expiresAt) > now.getTime())
+      if (
+        ledger.grants.some(
+          (grant) =>
+            grant.parentSessionId === owner.parentSessionId &&
+            grant.projectDirectory === owner.projectDirectory &&
+            grant.digest === digest &&
+            grant.capability === intent.capability &&
+            grant.workdir === intent.workdir
+        )
+      )
+        return { status: 'approved_session' }
+      const request: ApprovalRequest = {
+        id: crypto.randomUUID(),
+        parentSessionId: owner.parentSessionId,
+        projectDirectory: owner.projectDirectory,
+        digest,
         ...intent,
         status: 'pending',
         createdAt: now.toISOString(),
