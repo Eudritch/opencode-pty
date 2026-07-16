@@ -258,8 +258,11 @@ let cleanupFailure: unknown
 try {
   if (!supportedPlatforms.has(platform)) throw new Error(`No native package for ${platform}.`)
   await requireCommand(['cargo', 'build', '--locked', '--release', '--workspace'], 'cargo build')
-  await requireCommand(['bun', 'native:prepare', platform], 'prepare native package')
-  const nativeDirectory = join(root, 'native-artifacts', platform)
+  const nativeDirectory = join(packageDirectory, 'native-artifacts', platform)
+  await requireCommand(
+    ['bun', 'native:prepare', platform, nativeDirectory],
+    'prepare native package'
+  )
   await requireCommand(
     ['npm', 'pack', '--pack-destination', packageDirectory],
     'npm pack worker',

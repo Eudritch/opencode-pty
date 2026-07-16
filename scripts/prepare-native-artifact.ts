@@ -14,7 +14,7 @@ if (!target || !(target in NATIVE_WORKER_TARGETS))
 
 const platform = NATIVE_WORKER_TARGETS[target]
 const rootPackage = JSON.parse(await readFile('package.json', 'utf8')) as { version: string }
-const output = join('native-artifacts', target)
+const output = process.argv[3] ?? join('native-artifacts', target)
 const binary = join('target', 'release', nativeWorkerBinaryName(platform.os))
 await stat(binary)
 await mkdir(join(output, 'bin'), { recursive: true })
