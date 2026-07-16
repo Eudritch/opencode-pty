@@ -2871,6 +2871,10 @@ test('native monitor snapshots exclude journal output and persist terminal outpu
   const supervisor = new SessionSupervisor(storage)
   const session = record(root, 'pty_native_finalization_race')
   await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
   const running = workerSnapshot()
   const terminal = workerSnapshot({
     status: 'exited',
