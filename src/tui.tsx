@@ -1,21 +1,18 @@
 import type { TuiPlugin, TuiPluginApi } from '@opencode-ai/plugin/tui'
-import { createSignal, onCleanup } from 'solid-js'
+import { createEffect, createSignal, onCleanup } from 'solid-js'
 import type { ApprovalGrant, ApprovalRequest } from './daemon/types.ts'
 import { manager } from './plugin/pty/manager.ts'
 import type { PTYSessionInfo } from './plugin/pty/types.ts'
 import {
   approvalSummary,
   grantSummary,
+  ownerMatchesRoute,
   ownerForRoute,
+  redactPreview,
   sessionCard,
-  type TuiSession,
 } from './tui-state.ts'
 
 const POLL_MS = 5_000
-
-type TuiStateWithSession = TuiPluginApi['state'] & {
-  session: TuiPluginApi['state']['session'] & { get: (sessionID: string) => TuiSession | undefined }
-}
 
 interface PanelState {
   sessions: PTYSessionInfo[]
@@ -24,16 +21,28 @@ interface PanelState {
   error?: string
 }
 
-function currentOwner(api: TuiPluginApi) {
-  const state = api.state as TuiStateWithSession
+function routeSessionID(api: TuiPluginApi): string | undefined {
   const route = api.route.current
   const sessionID = route.name === 'session' ? route.params?.sessionID : undefined
-  if (typeof sessionID !== 'string') return undefined
-  return ownerForRoute(route, state.session.get(sessionID))
+  return typeof sessionID === 'string' ? sessionID : undefined
+}
+
+function isCurrentOwner(api: TuiPluginApi, owner: ReturnType<typeof ownerForRoute>): boolean {
+  return Boolean(owner && ownerMatchesRoute(api.route.current, api.state.path.directory, owner))
+}
+
+async function currentOwner(api: TuiPluginApi, expectedSessionID?: string) {
+  const route = api.route.current
+  const sessionID = routeSessionID(api)
+  if (typeof sessionID !== 'string' || (expectedSessionID && sessionID !== expectedSessionID))
+    return undefined
+  const result = await api.client.session.get({ sessionID })
+  const owner = ownerForRoute(route, result.data, api.state.path.directory)
+  return isCurrentOwner(api, owner) ? owner : undefined
 }
 
 async function reviewApprovals(api: TuiPluginApi): Promise<void> {
-  const owner = currentOwner(api)
+  const owner = await currentOwner(api)
   if (!owner) {
     api.ui.toast({ variant: 'warning', message: 'Open a session before reviewing PTY approvals.' })
     return
@@ -43,6 +52,7 @@ async function reviewApprovals(api: TuiPluginApi): Promise<void> {
       manager.listApprovalRequests(owner),
       manager.listApprovalGrants(owner),
     ])
+    if (!isCurrentOwner(api, owner)) return
     const { DialogConfirm, DialogSelect } = api.ui
     api.ui.dialog.replace(() => (
       <DialogSelect
@@ -52,7 +62,9 @@ async function reviewApprovals(api: TuiPluginApi): Promise<void> {
           ...requests.map((request) => ({
             title: approvalSummary(request),
             value: request.id,
-            description: request.reason ?? 'Native approval prompt remains authoritative.',
+            description: request.reason
+              ? redactPreview(request.reason)
+              : 'Native approval prompt remains authoritative.',
             disabled: true,
           })),
           ...grants.map((grant) => ({
@@ -66,8 +78,12 @@ async function reviewApprovals(api: TuiPluginApi): Promise<void> {
                   message={grantSummary(grant)}
                   onConfirm={() => {
                     void (async () => {
-                      const actionOwner = currentOwner(api)
-                      if (!actionOwner)
+                      const actionOwner = await currentOwner(api)
+                      if (
+                        !actionOwner ||
+                        actionOwner.parentSessionId !== owner.parentSessionId ||
+                        actionOwner.projectDirectory !== owner.projectDirectory
+                      )
                         throw new Error('Open the owning session before revoking its grant.')
                       await manager.revokeApprovalGrant(grant.id, actionOwner)
                       await reviewApprovals(api)
@@ -88,22 +104,59 @@ async function reviewApprovals(api: TuiPluginApi): Promise<void> {
 
 function PtyPanel(props: { api: TuiPluginApi; sessionID: string }) {
   const [state, setState] = createSignal<PanelState>({ sessions: [], requests: [], grants: [] })
+  let displayedOwner: ReturnType<typeof ownerForRoute>
   let stopped = false
-  const refresh = async () => {
-    const owner = currentOwner(props.api)
-    if (stopped || !owner || owner.parentSessionId !== props.sessionID) return
+  const clear = () => {
+    displayedOwner = undefined
+    setState({ sessions: [], requests: [], grants: [] })
+  }
+  const refresh = async (expectedSessionID = props.sessionID) => {
+    if (stopped) return
     try {
+      if (
+        routeSessionID(props.api) !== expectedSessionID ||
+        props.sessionID !== expectedSessionID
+      ) {
+        clear()
+        return
+      }
+      if (displayedOwner && !isCurrentOwner(props.api, displayedOwner)) clear()
+      const owner = await currentOwner(props.api, expectedSessionID)
+      if (!owner) {
+        clear()
+        return
+      }
       const [sessions, requests, grants] = await Promise.all([
         manager.list(owner),
         manager.listApprovalRequests(owner),
         manager.listApprovalGrants(owner),
       ])
-      if (!stopped) setState({ sessions, requests, grants })
+      if (stopped || props.sessionID !== expectedSessionID || !isCurrentOwner(props.api, owner)) {
+        return
+      }
+      displayedOwner = owner
+      setState({ sessions, requests, grants })
     } catch (error) {
-      if (!stopped) setState({ sessions: [], requests: [], grants: [], error: errorMessage(error) })
+      if (
+        !stopped &&
+        props.sessionID === expectedSessionID &&
+        displayedOwner &&
+        isCurrentOwner(props.api, displayedOwner)
+      ) {
+        setState({ sessions: [], requests: [], grants: [], error: errorMessage(error) })
+      }
     }
   }
-  void refresh()
+  createEffect(() => {
+    const sessionID = props.sessionID
+    props.api.state.path.directory
+    if (
+      routeSessionID(props.api) !== sessionID ||
+      (displayedOwner && !isCurrentOwner(props.api, displayedOwner))
+    )
+      clear()
+    void refresh(sessionID)
+  })
   const timer = setInterval(() => void refresh(), POLL_MS)
   onCleanup(() => {
     stopped = true
