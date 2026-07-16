@@ -1597,14 +1597,28 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
     await first.stop()
     restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-second')
     const secondDescriptor = await restarted.start()
-    const stopped = await rpc(secondDescriptor, 'stop', { id }, context)
-    expect((await stopped.json()) as { result: { terminationConfirmed: boolean } }).toMatchObject({
-      result: { terminationConfirmed: true },
+    let stopped: { result: { requested: boolean; terminationConfirmed: boolean } } | undefined
+    for (let attempt = 0; attempt < 50 && !stopped?.result.requested; attempt += 1) {
+      stopped = (await rpc(secondDescriptor, 'stop', { id }, context).then((response) =>
+        response.json()
+      )) as {
+        result: { requested: boolean; terminationConfirmed: boolean }
+      }
+      if (!stopped.result.requested) await Bun.sleep(20)
+    }
+    expect(stopped).toMatchObject({
+      result: { requested: true, terminationConfirmed: true },
     })
     const details = await rpc(secondDescriptor, 'get', { id }, context)
     expect(
       (await details.json()) as { result: { status: string; terminationConfirmed: boolean } }
-    ).toMatchObject({ result: { status: 'exited', terminationConfirmed: true } })
+    ).toMatchObject({
+      result: {
+        status: 'exited',
+        terminationConfirmed: true,
+        ...(process.platform === 'win32' ? { containment: { status: 'windows_job_empty' } } : {}),
+      },
+    })
     await expect(executing.then((response) => response.json())).resolves.toMatchObject({
       result: { stdout: 'native-out', stderr: 'native-err', terminationConfirmed: true },
     })
