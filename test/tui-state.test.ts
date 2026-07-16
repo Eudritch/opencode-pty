@@ -25,6 +25,8 @@ const approval = (status: 'pending' | 'native_fallback' = 'pending') => ({
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  uiEligible: status === 'pending',
+  uiExpiresAt: new Date(Date.now() + 5_000).toISOString(),
 })
 
 test('TUI owner derivation requires the active route session', () => {
@@ -59,9 +61,10 @@ test('TUI scopes discard a stale route or project result', () => {
   expect(scopeMatchesRoute(route, `${process.cwd()}-other`, scope)).toBe(false)
 })
 
-test('TUI never claims native approval states', () => {
-  expect(canClaimApproval(approval())).toBe(false)
+test('TUI only claims UI-eligible pending approvals', () => {
+  expect(canClaimApproval(approval())).toBe(true)
   expect(canClaimApproval(approval('native_fallback'))).toBe(false)
+  expect(canClaimApproval({ ...approval(), uiExpiresAt: new Date(0).toISOString() })).toBe(false)
   expect(approvalSummary(approval())).not.toContain('token-value')
   expect(
     grantSummary({

@@ -62,9 +62,27 @@ export function ownerMatchesRoute(
 }
 
 export function canClaimApproval(request: ApprovalRequest): boolean {
-  // ponytail: no server request type currently declares a TUI lease, so native ctx.ask wins.
-  void request
-  return false
+  return (
+    request.status === 'pending' &&
+    request.uiEligible === true &&
+    Date.parse(request.uiExpiresAt ?? '') > Date.now()
+  )
+}
+
+export function isApprovalClaim(value: unknown): value is {
+  request: ApprovalRequest
+  claimToken: string
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const claim = value as Record<string, unknown>
+  return (
+    typeof claim.claimToken === 'string' &&
+    Boolean(claim.claimToken) &&
+    Boolean(claim.request) &&
+    typeof claim.request === 'object' &&
+    (claim.request as ApprovalRequest).status === 'claimed' &&
+    typeof (claim.request as ApprovalRequest).id === 'string'
+  )
 }
 
 function secretValue(): string {

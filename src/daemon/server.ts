@@ -30,7 +30,9 @@ const MAX_INPUT_BYTES_PER_MINUTE = 256 * 1024
 const DEFAULT_MAX_SESSIONS_PER_OWNER = 32
 const MAX_APPROVAL_EXPIRY_SECONDS = 3600
 const MAX_SESSION_GRANT_SECONDS = 24 * 60 * 60
-const CLAIM_LEASE_MS = 30_000
+const CLAIM_LEASE_MS = 5_000
+const MIN_UI_LEASE_SECONDS = 2
+const MAX_UI_LEASE_SECONDS = 5
 
 class ValidationError extends Error {}
 
@@ -40,6 +42,7 @@ export class DaemonServer implements Disposable {
   private readonly pendingSessions = new Map<string, number>()
   private approvalWrites: Promise<void> = Promise.resolve()
   private readonly approvalClaimTokens = new Map<string, string>()
+  private readonly approvalWaiters = new Set<() => void>()
   private ownershipSecret = ''
   private processIdentity = ''
 
@@ -447,11 +450,13 @@ export class DaemonServer implements Disposable {
       'capability',
       'workdir',
       'expirySeconds',
+      'uiLeaseSeconds',
     ])
     const expirySeconds = this.requiredPositiveInteger(value, 'expirySeconds')
     if (expirySeconds > MAX_APPROVAL_EXPIRY_SECONDS)
       throw new ValidationError('Approval expiry exceeds the limit.')
     const intent = this.approvalIntent(value)
+    const uiLeaseSeconds = this.approvalUiLease(value)
     return this.withApprovals(async (ledger) => {
       const now = new Date()
       const request: ApprovalRequest = {
@@ -464,6 +469,12 @@ export class DaemonServer implements Disposable {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + expirySeconds * 1000).toISOString(),
+        ...(uiLeaseSeconds === undefined
+          ? {}
+          : {
+              uiEligible: true,
+              uiExpiresAt: new Date(now.getTime() + uiLeaseSeconds * 1000).toISOString(),
+            }),
       }
       ledger.requests.push(request)
       return request
@@ -480,11 +491,13 @@ export class DaemonServer implements Disposable {
       'capability',
       'workdir',
       'expirySeconds',
+      'uiLeaseSeconds',
     ])
     const expirySeconds = this.requiredPositiveInteger(value, 'expirySeconds')
     if (expirySeconds > MAX_APPROVAL_EXPIRY_SECONDS)
       throw new ValidationError('Approval expiry exceeds the limit.')
     const intent = this.approvalIntent(value)
+    const uiLeaseSeconds = this.approvalUiLease(value)
     return this.withApprovals(async (ledger) => {
       const now = new Date()
       const digest = this.approvalDigest(intent)
@@ -510,6 +523,12 @@ export class DaemonServer implements Disposable {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + expirySeconds * 1000).toISOString(),
+        ...(uiLeaseSeconds === undefined
+          ? {}
+          : {
+              uiEligible: true,
+              uiExpiresAt: new Date(now.getTime() + uiLeaseSeconds * 1000).toISOString(),
+            }),
       }
       ledger.requests.push(request)
       return request
@@ -522,7 +541,11 @@ export class DaemonServer implements Disposable {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
       let claimToken: string | undefined
-      if (request.status === 'pending' || request.status === 'native_fallback') {
+      if (
+        request.status === 'pending' &&
+        request.uiEligible === true &&
+        Date.parse(request.uiExpiresAt ?? '') > Date.now()
+      ) {
         request.status = 'claimed'
         request.claimExpiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString()
         request.updatedAt = new Date().toISOString()
@@ -581,12 +604,18 @@ export class DaemonServer implements Disposable {
       throw new ValidationError('Approval wait exceeds the limit.')
     for (;;) {
       const request = await this.approvalStatus(id, owner)
-      if (
-        !['pending', 'claimed', 'native_fallback'].includes(request.status) ||
-        Date.now() >= deadline
+      if (!['pending', 'claimed'].includes(request.status) || Date.now() >= deadline) return request
+      const expiresAt = Math.min(
+        deadline,
+        Date.parse(request.expiresAt),
+        request.status === 'pending' && request.uiEligible
+          ? Date.parse(request.uiExpiresAt ?? '')
+          : Number.POSITIVE_INFINITY,
+        request.status === 'claimed'
+          ? Date.parse(request.claimExpiresAt ?? '')
+          : Number.POSITIVE_INFINITY
       )
-        return request
-      await Bun.sleep(Math.min(25, deadline - Date.now()))
+      await this.waitForApprovalChange(expiresAt - Date.now())
     }
   }
 
@@ -634,7 +663,10 @@ export class DaemonServer implements Disposable {
     return this.withApprovals(async (ledger) => {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
-      if (request.status === 'pending' || request.status === 'native_fallback') {
+      if (
+        request.status === 'native_fallback' ||
+        (request.status === 'pending' && !request.uiEligible)
+      ) {
         request.status = 'approved_once'
         request.updatedAt = new Date().toISOString()
       }
@@ -749,10 +781,21 @@ export class DaemonServer implements Disposable {
       this.approvalClaimTokens.delete(request.id)
       request.updatedAt = new Date().toISOString()
     } else if (
+      request.status === 'pending' &&
+      request.uiEligible === true &&
+      Date.parse(request.uiExpiresAt ?? '') <= Date.now()
+    ) {
+      request.status = 'native_fallback'
+      request.uiEligible = false
+      request.uiExpiresAt = undefined
+      request.updatedAt = new Date().toISOString()
+    } else if (
       request.status === 'claimed' &&
       Date.parse(request.claimExpiresAt ?? '') <= Date.now()
     ) {
       request.status = 'native_fallback'
+      request.uiEligible = false
+      request.uiExpiresAt = undefined
       request.claimExpiresAt = undefined
       this.approvalClaimTokens.delete(request.id)
       request.updatedAt = new Date().toISOString()
@@ -769,6 +812,14 @@ export class DaemonServer implements Disposable {
     )
     const reason = this.approvalText(payload, 'reason', MAX_STRING_LENGTH, true)
     return { command, capability, workdir, ...(reason === undefined ? {} : { reason }) }
+  }
+
+  private approvalUiLease(payload: Record<string, unknown>): number | undefined {
+    const seconds = this.optionalNonnegativeInteger(payload, 'uiLeaseSeconds')
+    if (seconds === undefined) return undefined
+    if (seconds < MIN_UI_LEASE_SECONDS || seconds > MAX_UI_LEASE_SECONDS)
+      throw new ValidationError('Approval UI lease must be between 2 and 5 seconds.')
+    return seconds
   }
 
   private approvalText(payload: Record<string, unknown>, key: string, maximum: number): string
@@ -814,12 +865,29 @@ export class DaemonServer implements Disposable {
     await previous
     try {
       const ledger = await this.storage.readApprovals()
+      const before = JSON.stringify(ledger)
       const result = await update(ledger)
       await this.storage.writeApprovals(ledger)
+      if (JSON.stringify(ledger) !== before) {
+        for (const notify of this.approvalWaiters) notify()
+      }
       return result
     } finally {
       release()
     }
+  }
+
+  private waitForApprovalChange(timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer)
+        this.approvalWaiters.delete(notify)
+        resolve()
+      }
+      const timer = setTimeout(finish, Math.max(0, timeoutMs))
+      const notify = finish
+      this.approvalWaiters.add(notify)
+    })
   }
 
   private async spawn(

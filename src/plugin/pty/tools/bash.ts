@@ -14,6 +14,7 @@ import { escapeXml } from '../xml.ts'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const APPROVAL_EXPIRY_SECONDS = MAX_EXEC_RUNTIME_SECONDS
+const APPROVAL_UI_LEASE_SECONDS = 5
 
 interface BashDaemon {
   prepareApproval(
@@ -23,10 +24,12 @@ interface BashDaemon {
       capability: string
       workdir: string
       expirySeconds: number
+      uiLeaseSeconds?: number
     },
     owner: OwnerContext
   ): Promise<ApprovalPreparation>
   approveNativeApproval(id: string, owner: OwnerContext): Promise<ApprovalRequest>
+  waitForApproval(id: string, timeoutSeconds: number, owner: OwnerContext): Promise<ApprovalRequest>
   consumeApproval(
     id: string,
     details: Pick<ApprovalRequest, 'command' | 'reason' | 'capability' | 'workdir'>,
@@ -109,14 +112,18 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
                 capability,
                 workdir: policy.workdir,
                 expirySeconds: APPROVAL_EXPIRY_SECONDS,
+                uiLeaseSeconds: APPROVAL_UI_LEASE_SECONDS,
               },
               owner
             )
           : undefined
       try {
         if (approval && approval.status !== 'approved_session') {
-          await abortableAsk(ctx, args.command)
-          await daemon.approveNativeApproval(approval.id, owner)
+          const waiting = await abortableApprovalWait(ctx, daemon, approval.id, owner)
+          if (waiting.status === 'native_fallback') {
+            await abortableAsk(ctx, args.command)
+            await daemon.approveNativeApproval(approval.id, owner)
+          }
           const consumed = await daemon.consumeApproval(
             approval.id,
             {
@@ -126,7 +133,7 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
             },
             owner
           )
-          if (consumed.status !== 'consumed')
+          if (!['consumed', 'approved_session'].includes(consumed.status))
             throw new Error('Bash command approval was not granted.')
         }
       } catch (error) {
@@ -188,6 +195,28 @@ export function createBash(authorize: BashAuthorizer, daemon: BashDaemon = manag
       }
     },
   })
+}
+
+async function abortableApprovalWait(
+  ctx: ToolContext,
+  daemon: BashDaemon,
+  id: string,
+  owner: OwnerContext
+): Promise<ApprovalRequest> {
+  if (ctx.abort.aborted) throw new Error('Bash approval cancelled before prompting.')
+  let abort!: () => void
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(new Error('Bash approval cancelled before prompting.'))
+    ctx.abort.addEventListener('abort', abort, { once: true })
+  })
+  try {
+    return await Promise.race([
+      daemon.waitForApproval(id, APPROVAL_EXPIRY_SECONDS, owner),
+      cancelled,
+    ])
+  } finally {
+    ctx.abort.removeEventListener('abort', abort)
+  }
 }
 
 async function abortableAsk(ctx: ToolContext, command: string): Promise<void> {

@@ -291,6 +291,9 @@ export class DaemonClient {
       | 'updatedAt'
       | 'expiresAt'
       | 'digest'
+      | 'uiEligible'
+      | 'uiExpiresAt'
+      | 'claimExpiresAt'
     > & {
       expirySeconds: number
     },
@@ -310,6 +313,9 @@ export class DaemonClient {
       | 'updatedAt'
       | 'expiresAt'
       | 'digest'
+      | 'uiEligible'
+      | 'uiExpiresAt'
+      | 'claimExpiresAt'
     > & { expirySeconds: number },
     owner: OwnerContext
   ): Promise<ApprovalPreparation> {

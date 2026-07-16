@@ -103,6 +103,8 @@ export interface ApprovalRequest {
   createdAt: string
   updatedAt: string
   expiresAt: string
+  uiEligible?: boolean
+  uiExpiresAt?: string
   claimExpiresAt?: string
 }
 

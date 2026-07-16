@@ -408,6 +408,8 @@ export class DaemonStorage {
               'expired',
               'consumed',
             ].includes(entry.status) &&
+            (entry.uiEligible === undefined || typeof entry.uiEligible === 'boolean') &&
+            (entry.uiExpiresAt === undefined || validTimestamp(entry.uiExpiresAt)) &&
             (entry.claimExpiresAt === undefined || validTimestamp(entry.claimExpiresAt))
         )
       ) {
@@ -577,8 +579,7 @@ export class DaemonStorage {
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code
           if (code === 'EEXIST') return false
-          if (code !== 'EACCES' || attempt >= WINDOWS_RENAME_RETRIES)
-            throw error
+          if (code !== 'EACCES' || attempt >= WINDOWS_RENAME_RETRIES) throw error
           await Bun.sleep(WINDOWS_RENAME_RETRY_MS)
         }
       }

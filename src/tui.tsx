@@ -7,6 +7,7 @@ import {
   approvalDetails,
   approvalSummary,
   grantSummary,
+  isApprovalClaim,
   ownerMatchesRoute,
   ownerForRoute,
   sessionCard,
@@ -63,9 +64,9 @@ async function reviewApprovals(api: TuiPluginApi): Promise<void> {
     api.ui.dialog.replace(() => (
       <DialogSelect
         title="PTY approvals"
-        placeholder="Review native approvals or revoke a session grant"
+        placeholder="Claim an available approval or revoke a session grant"
         options={[
-          ...requests.map(approvalOption),
+          ...requests.map((request) => approvalOption(api, owner, scope, request)),
           ...grants.map((grant) => ({
             title: `Revoke: ${grantSummary(grant)}`,
             value: grant.id,
@@ -118,13 +119,84 @@ async function revokeGrant(
   }
 }
 
-function approvalOption(request: ApprovalRequest) {
+function approvalOption(
+  api: TuiPluginApi,
+  owner: NonNullable<ReturnType<typeof ownerForRoute>>,
+  scope: TuiScope,
+  request: ApprovalRequest
+) {
   const claimable = canClaimApproval(request)
   return {
-    title: approvalSummary(request),
+    title: claimable ? `Claim: ${approvalSummary(request)}` : approvalSummary(request),
     value: request.id,
-    description: `${approvalDetails(request)}\n\nNative OpenCode approval remains authoritative.`,
+    description: `${approvalDetails(request)}\n\n${claimable ? 'Available briefly before native fallback.' : 'Native OpenCode approval remains authoritative.'}`,
     disabled: !claimable,
+    onSelect: claimable ? () => void claimApproval(api, owner, scope, request.id) : undefined,
+  }
+}
+
+async function claimApproval(
+  api: TuiPluginApi,
+  owner: NonNullable<ReturnType<typeof ownerForRoute>>,
+  scope: TuiScope,
+  id: string
+): Promise<void> {
+  try {
+    const actionOwner = await currentOwner(api, scope)
+    if (!actionOwner || !sameOwner(actionOwner, owner)) return api.ui.dialog.clear()
+    const result = await manager.claimApproval(id, actionOwner)
+    if (!dialogIsCurrent(api, scope, actionOwner)) return
+    if (!isApprovalClaim(result) || result.request.id !== id) {
+      api.ui.dialog.clear()
+      return api.ui.toast({ variant: 'warning', message: 'Approval is no longer available.' })
+    }
+    const { DialogSelect } = api.ui
+    let deciding = false
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title="Decide PTY approval"
+        placeholder="Choose a safe approval decision"
+        options={(['approve_once', 'approve_session', 'reject'] as const).map((decision) => ({
+          title:
+            decision === 'approve_once'
+              ? 'Approve once'
+              : decision === 'approve_session'
+                ? 'Approve session'
+                : 'Reject',
+          value: decision,
+          onSelect: () => {
+            if (deciding) return
+            deciding = true
+            void decideApproval(api, owner, scope, id, result.claimToken, decision).finally(() => {
+              deciding = false
+            })
+          },
+        }))}
+      />
+    ))
+  } catch (error) {
+    api.ui.dialog.clear()
+    api.ui.toast({ variant: 'error', message: errorMessage(error) })
+  }
+}
+
+async function decideApproval(
+  api: TuiPluginApi,
+  owner: NonNullable<ReturnType<typeof ownerForRoute>>,
+  scope: TuiScope,
+  id: string,
+  claimToken: string,
+  decision: 'approve_once' | 'approve_session' | 'reject'
+): Promise<void> {
+  try {
+    const actionOwner = await currentOwner(api, scope)
+    if (!actionOwner || !sameOwner(actionOwner, owner)) return api.ui.dialog.clear()
+    await manager.decideApproval(id, decision, claimToken, actionOwner)
+    if (!dialogIsCurrent(api, scope, actionOwner)) return
+    await reviewApprovals(api)
+  } catch (error) {
+    api.ui.dialog.clear()
+    api.ui.toast({ variant: 'error', message: errorMessage(error) })
   }
 }
 
@@ -241,7 +313,7 @@ export const tui: TuiPlugin = async (api) => {
     {
       title: 'PTY approvals',
       value: 'opencode-pty.approvals',
-      description: 'Review native PTY approvals and revoke session grants',
+      description: 'Claim available PTY approvals and revoke session grants',
       category: 'PTY',
       onSelect: () => void reviewApprovals(api),
     },

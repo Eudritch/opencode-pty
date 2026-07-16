@@ -400,6 +400,7 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
       capability: 'tool',
       workdir: root,
       expirySeconds,
+      uiLeaseSeconds: 5,
     })
     return ((await response.json()) as { result: { id: string } }).result.id
   }
@@ -562,6 +563,19 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
     expect(((await expiredLease.json()) as { error: { code: string } }).error.code).toBe(
       'authorization'
     )
+    const noClaim = await request()
+    const noClaimLedger = await storage.readApprovals()
+    const noClaimRequest = noClaimLedger.requests.find((entry) => entry.id === noClaim)
+    if (!noClaimRequest) throw new Error('Expected available approval.')
+    noClaimRequest.uiExpiresAt = new Date(0).toISOString()
+    await storage.writeApprovals(noClaimLedger)
+    expect(
+      (
+        (await (await approvalRpc('approvalClaim', { id: noClaim })).json()) as {
+          result: { status: string }
+        }
+      ).result.status
+    ).toBe('native_fallback')
     const fallback = await request()
     const fallbackClaim = (await (await approvalRpc('approvalClaim', { id: fallback })).json()) as {
       result: { claimToken: string }
@@ -571,6 +585,19 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
     if (!fallbackRequest) throw new Error('Expected fallback approval.')
     fallbackRequest.claimExpiresAt = new Date(0).toISOString()
     await storage.writeApprovals(fallbackLedger)
+    const fallbackAgain = (await (await approvalRpc('approvalClaim', { id: fallback })).json()) as {
+      result: { status: string; claimToken?: string }
+    }
+    expect(fallbackAgain.result.status).toBe('native_fallback')
+    expect(fallbackAgain.result.claimToken).toBeUndefined()
+    const fallbackDecision = await approvalRpc('approvalDecide', {
+      id: fallback,
+      decision: 'approve_session',
+      claimToken: fallbackClaim.result.claimToken,
+    })
+    expect(((await fallbackDecision.json()) as { error: { code: string } }).error.code).toBe(
+      'authorization'
+    )
     expect(
       (
         (await (await approvalRpc('approvalNativeApprove', { id: fallback })).json()) as {
@@ -733,6 +760,7 @@ test('Bash session grants are isolated by an opaque agent capability', async () 
         capability: agentA,
         workdir: root,
         expirySeconds: 30,
+        uiLeaseSeconds: 5,
       })
     ).json()) as { result: { id: string } }
     const claimed = (await (
@@ -1144,6 +1172,10 @@ test('bash wrapper keeps host metadata private and consumes native approval once
   const calls: string[] = []
   const daemon = {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    waitForApproval: async () => {
+      calls.push('wait')
+      return { id: 'approval', status: 'native_fallback' }
+    },
     approveNativeApproval: async () => {
       calls.push('approve')
       return { id: 'approval', status: 'approved_once' }
@@ -1193,6 +1225,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
     },
   } as never)
   expect(calls).toEqual([
+    'wait',
     'ask',
     'approve',
     'consume',
@@ -1265,6 +1298,7 @@ test('bash cancels durable approval when native ctx.ask is unavailable', async (
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    waitForApproval: async () => ({ id: 'approval', status: 'native_fallback' }),
     cancelApproval: async () => {
       calls.push('cancel')
       return { id: 'approval', status: 'cancelled' }
@@ -1325,6 +1359,73 @@ test('bash reuses a matching session grant without native approval', async () =>
   expect(calls).toEqual(['start'])
 })
 
+test('bash accepts a companion session decision without native ctx.ask', async () => {
+  const calls: string[] = []
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    waitForApproval: async () => ({ id: 'approval', status: 'approved_session' }),
+    consumeApproval: async () => {
+      calls.push('consume')
+      return { id: 'approval', status: 'approved_session' }
+    },
+    execStart: async () => {
+      calls.push('start')
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async () => ({
+      session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      outputLimited: false,
+      terminationConfirmed: true,
+      startedAt: '',
+      exitedAt: '',
+    }),
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  await expect(
+    bash.execute({ command: 'echo granted' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      ask: async () => calls.push('ask'),
+      metadata: () => {},
+    } as never)
+  ).resolves.toContain('status="exited"')
+  expect(calls).toEqual(['consume', 'start'])
+})
+
+test('bash never launches a rejected companion approval', async () => {
+  const calls: string[] = []
+  const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    waitForApproval: async () => ({ id: 'approval', status: 'rejected' }),
+    consumeApproval: async () => ({ id: 'approval', status: 'rejected' }),
+    cancelApproval: async () => ({ id: 'approval', status: 'cancelled' }),
+    execStart: async () => {
+      calls.push('start')
+      return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+    },
+    execWait: async () => {
+      throw new Error('must not wait')
+    },
+    stop: async () => ({ terminationConfirmed: true }),
+  } as never)
+  await expect(
+    bash.execute({ command: 'echo rejected' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      ask: async () => calls.push('ask'),
+      metadata: () => {},
+    } as never)
+  ).rejects.toThrow('not granted')
+  expect(calls).toEqual([])
+})
+
 test('Bash asks again when a session grant belongs to another agent', async () => {
   const calls: string[] = []
   const granted = bashApprovalCapability('agent-a')
@@ -1334,6 +1435,7 @@ test('Bash asks again when a session grant belongs to another agent', async () =
         ? { status: 'approved_session' }
         : { id: 'approval', status: 'pending' },
     approveNativeApproval: async () => ({ id: 'approval', status: 'approved_once' }),
+    waitForApproval: async () => ({ id: 'approval', status: 'native_fallback' }),
     consumeApproval: async () => ({ id: 'approval', status: 'consumed' }),
     cancelApproval: async () => ({ id: 'approval', status: 'cancelled' }),
     execStart: async () => ({ id: 'exec', status: 'running', mode: 'exec', pid: 1 }),
@@ -1368,6 +1470,7 @@ test('bash asks when no matching session grant is available', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    waitForApproval: async () => ({ id: 'approval', status: 'native_fallback' }),
     approveNativeApproval: async () => {
       calls.push('approve')
       return { id: 'approval', status: 'approved_once' }
@@ -1405,6 +1508,7 @@ test('bash abort cancels pending approval before dispatch', async () => {
   const controller = new AbortController()
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    waitForApproval: async () => ({ id: 'approval', status: 'native_fallback' }),
     approveNativeApproval: async () => ({ id: 'approval', status: 'approved_once' }),
     consumeApproval: async () => ({ id: 'approval', status: 'consumed' }),
     cancelApproval: async () => {
