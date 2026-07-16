@@ -61,25 +61,10 @@ export function ownerMatchesRoute(
   return ownerContext(sessionID, activeDirectory).projectDirectory === owner.projectDirectory
 }
 
-export function isApprovalClaim(value: unknown): value is {
-  request: ApprovalRequest
-  claimToken: string
-} {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const claim = value as Record<string, unknown>
-  return (
-    typeof claim.claimToken === 'string' &&
-    Boolean(claim.claimToken) &&
-    Boolean(claim.request) &&
-    typeof claim.request === 'object' &&
-    (claim.request as ApprovalRequest).status === 'claimed' &&
-    typeof (claim.request as ApprovalRequest).id === 'string'
-  )
-}
-
 export function canClaimApproval(request: ApprovalRequest): boolean {
-  // ponytail: native fallback has returned control to OpenCode; do not race it.
-  return request.status === 'pending'
+  // ponytail: no server request type currently declares a TUI lease, so native ctx.ask wins.
+  void request
+  return false
 }
 
 function secretValue(): string {
@@ -145,6 +130,14 @@ export function sessionCard(session: PTYSessionInfo): string {
 
 export function approvalSummary(request: ApprovalRequest): string {
   return `${request.status} | ${commandPreview(request.command, [])}`
+}
+
+export function approvalDetails(request: ApprovalRequest): string {
+  return [
+    `Command: ${commandPreview(request.command, [])}`,
+    `Reason: ${request.reason ? redactPreview(request.reason) : 'Not provided'}`,
+    `Workdir: ${redactPreview(request.workdir)}`,
+  ].join('\n')
 }
 
 export function grantSummary(grant: ApprovalGrant): string {

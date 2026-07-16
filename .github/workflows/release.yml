@@ -113,6 +113,7 @@ jobs:
           APPLE_NOTARY_KEYCHAIN_PROFILE=opencode-pty-release bun native:sign:macos ${{ matrix.target }}
       - name: Run daemon suite
         run: bun unittest
+      - run: bun run tui:verify
       - run: bun build:prod
       - name: Packaged-worker smoke
         run: bun package:smoke
@@ -251,9 +252,10 @@ jobs:
           set -euo pipefail
           bun typecheck
           bun unittest
-          bun lint
-          bun format
-          bun build:prod
+           bun lint
+           bun format
+           bun run tui:verify
+           bun build:prod
           bun package:smoke
           npm pack --dry-run
           package=$(mktemp -d)

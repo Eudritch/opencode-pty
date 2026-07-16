@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2025, macos-15]
-        quality: [unittest, typecheck, lint, format]
+        quality: [unittest, typecheck, lint, format, "run tui:verify"]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -92,7 +92,7 @@ jobs:
           trap 'rm -rf "$tmpdir"' EXIT
           npm pack --pack-destination "$tmpdir"
           npm install --prefix "$tmpdir/installed" "$tmpdir"/*.tgz
-          bun --cwd "$tmpdir/installed" -e "const plugin = await import('opencode-pty'); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin) throw new Error('Package is missing compatible PTYPlugin/server exports.')"
+          bun --cwd "$tmpdir/installed" -e "const [plugin, server, tui] = await Promise.all(['opencode-pty', 'opencode-pty/server', 'opencode-pty/tui'].map(specifier => import(specifier))); if (typeof plugin.PTYPlugin !== 'function' || plugin.server !== plugin.PTYPlugin || server.server !== plugin.PTYPlugin || typeof tui.tui !== 'function') throw new Error('Package is missing compatible server or TUI exports.')"
       - name: Start the packaged daemon entrypoint
         if: runner.os == 'Linux'
         run: |
@@ -146,3 +146,5 @@ jobs:
         run: devenv shell -- bun lint
       - name: Quality checks (format)
         run: devenv shell -- bun format
+      - name: Quality checks (TUI build)
+        run: devenv shell -- bun run tui:verify

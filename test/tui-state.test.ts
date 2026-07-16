@@ -1,10 +1,10 @@
 import { expect, test } from 'bun:test'
 import {
+  approvalDetails,
   commandPreview,
   approvalSummary,
   canClaimApproval,
   grantSummary,
-  isApprovalClaim,
   ownerForRoute,
   ownerMatchesRoute,
   redactPreview,
@@ -59,14 +59,9 @@ test('TUI scopes discard a stale route or project result', () => {
   expect(scopeMatchesRoute(route, `${process.cwd()}-other`, scope)).toBe(false)
 })
 
-test('TUI only claims pending approvals and keeps tokens out of display transforms', () => {
-  expect(canClaimApproval(approval())).toBe(true)
+test('TUI never claims native approval states', () => {
+  expect(canClaimApproval(approval())).toBe(false)
   expect(canClaimApproval(approval('native_fallback'))).toBe(false)
-  expect(isApprovalClaim(approval())).toBe(false)
-  expect(isApprovalClaim({ request: approval(), claimToken: 'secret-token' })).toBe(false)
-  expect(
-    isApprovalClaim({ request: { ...approval(), status: 'claimed' }, claimToken: 'secret-token' })
-  ).toBe(true)
   expect(approvalSummary(approval())).not.toContain('token-value')
   expect(
     grantSummary({
@@ -80,6 +75,20 @@ test('TUI only claims pending approvals and keeps tokens out of display transfor
       expiresAt: new Date().toISOString(),
     })
   ).toBe('https://[REDACTED]@example.test')
+})
+
+test('TUI approval details redact command, reason, and workdir', () => {
+  const details = approvalDetails({
+    ...approval(),
+    command: 'curl -H Cookie:cookie-value',
+    reason: 'Use Authorization: Bearer reason-value',
+    workdir: 'https://user:workdir-value@example.test',
+  })
+  expect(details).toContain('Command:')
+  expect(details).toContain('Reason:')
+  expect(details).toContain('Workdir:')
+  for (const secret of ['cookie-value', 'reason-value', 'workdir-value'])
+    expect(details).not.toContain(secret)
 })
 
 test('TUI previews redact command and text secrets', () => {
