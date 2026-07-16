@@ -29,9 +29,9 @@ export const PTYPlugin = async (
       pty_wait: ptyWait,
       pty_send_wait: ptySendWait,
       pty_resize: ptyResize,
-      ...(options.bash === false
-        ? {}
-        : { bash: createBash(createBashAuthorizer(client, directory)) }),
+      ...(options.bash === true
+        ? { bash: createBash(createBashAuthorizer(client, directory)) }
+        : {}),
     },
     event: async ({ event }) => {
       if (event.type === 'session.deleted') {

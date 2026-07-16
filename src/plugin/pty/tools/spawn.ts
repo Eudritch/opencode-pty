@@ -55,7 +55,13 @@ export function createPtySpawn(authorizeSpawn: SpawnAuthorizer) {
           'notifyOnExit is not supported by the durable daemon. Use pty_list or pty_read.'
         )
       }
-      const workdir = await authorizeSpawn(args.command, args.args ?? [], args.workdir, ctx.agent)
+      const workdir = await authorizeSpawn(
+        args.command,
+        args.args ?? [],
+        args.workdir,
+        ctx.agent,
+        ctx.ask
+      )
 
       const sessionId = ctx.sessionID
       const info = await manager.spawn(

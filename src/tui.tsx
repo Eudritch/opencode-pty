@@ -63,8 +63,8 @@ async function reviewApprovals(api: TuiPluginApi): Promise<void> {
     const { DialogSelect } = api.ui
     api.ui.dialog.replace(() => (
       <DialogSelect
-        title="PTY approvals"
-        placeholder="Claim an available approval or revoke a session grant"
+        title="Advanced PTY approvals"
+        placeholder="Advanced PTY approvals only; native Bash is not controlled here"
         options={[
           ...requests.map((request) => approvalOption(api, owner, scope, request)),
           ...grants.map((grant) => ({
@@ -311,9 +311,9 @@ function dialogIsCurrent(
 export const tui: TuiPlugin = async (api) => {
   api.command.register(() => [
     {
-      title: 'PTY approvals',
+      title: 'Advanced PTY approvals',
       value: 'opencode-pty.approvals',
-      description: 'Claim available PTY approvals and revoke session grants',
+      description: 'Claim advanced PTY approvals and revoke their session grants',
       category: 'PTY',
       onSelect: () => void reviewApprovals(api),
     },

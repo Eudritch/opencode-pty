@@ -1,7 +1,9 @@
 import type { PluginClient } from '../types.ts'
 import { match } from './wildcard.ts'
 import { realpath } from 'node:fs/promises'
-import { isAbsolute, relative, sep } from 'node:path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { dirname, isAbsolute, relative, sep } from 'node:path'
 
 type PermissionAction = 'allow' | 'ask' | 'deny'
 type PermissionRule = PermissionAction | Record<string, PermissionAction>
@@ -16,27 +18,43 @@ export type SpawnAuthorizer = (
   command: string,
   args: string[],
   workdir?: string,
-  agent?: string
+  agent?: string,
+  ask?: PermissionAsker
 ) => Promise<string>
+
+export type PermissionAsker = (request: {
+  permission: string
+  patterns: string[]
+  always: string[]
+  metadata: { output: string }
+}) => Promise<unknown>
 
 export type BashAuthorizer = (
   command: string,
   workdir?: string,
   agent?: string
-) => Promise<{ action: PermissionAction; workdir: string }>
+) => Promise<{
+  action: PermissionAction
+  workdir: string
+  externalAction?: PermissionAction
+  externalPattern?: string
+}>
 
-// ponytail: SDK 1.3.13 has no permission evaluator/request API, so this local adapter fails closed.
+const execFileAsync = promisify(execFile)
+
+// ponytail: SDK 1.3.13 cannot evaluate permissions, so only explicit local denies bypass ctx.ask.
 export function createSpawnAuthorizer(client: PluginClient, directory: string): SpawnAuthorizer {
-  return async (command, args, workdir, agent) => {
+  return async (command, args, workdir, agent, ask) => {
     const permissions = await permissionConfig(client)
-    const action = evaluate(permissions, agent, 'bash', [command, ...args].join(' '))
-    if (action !== 'allow') {
-      return deny(
-        client,
-        `PTY spawn denied: Command "${[command, ...args].join(' ')}" has no explicit allow rule.`
-      )
-    }
-    return authorizeWorkdir(client, permissions, directory, workdir, agent)
+    const pattern = [command, ...args].join(' ')
+    const action = evaluate(permissions, agent, 'bash', pattern)
+    const resolved = await workdirAuthorization(permissions, directory, workdir, agent)
+    if (action === 'deny' || resolved.action === 'deny')
+      return deny(client, 'PTY command denied by local permission policy.')
+    if (action !== 'allow') await requestApproval(ask, 'bash', pattern)
+    if (resolved.outside && resolved.action !== 'allow')
+      await requestApproval(ask, 'external_directory', resolved.pattern)
+    return resolved.workdir
   }
 }
 
@@ -45,11 +63,15 @@ export function createBashAuthorizer(client: PluginClient, directory: string): B
   return async (command, workdir, agent) => {
     const permissions = await permissionConfig(client)
     const action = evaluate(permissions, agent, 'bash', command)
-    if (!action || action === 'deny')
-      return deny(client, 'Bash command denied: no explicit allow rule.')
+    const resolved = await workdirAuthorization(permissions, directory, workdir, agent)
+    if (action === 'deny' || resolved.action === 'deny')
+      return deny(client, 'Bash command denied by local permission policy.')
     return {
-      action,
-      workdir: await authorizeWorkdir(client, permissions, directory, workdir, agent),
+      action: action === 'allow' ? 'allow' : 'ask',
+      workdir: resolved.workdir,
+      ...(resolved.outside
+        ? { externalAction: resolved.action, externalPattern: resolved.pattern }
+        : {}),
     }
   }
 }
@@ -73,30 +95,56 @@ async function deny(client: PluginClient, message: string): Promise<never> {
   throw new Error(message)
 }
 
-async function authorizeWorkdir(
-  client: PluginClient,
+async function workdirAuthorization(
   permissions: Config,
   directory: string,
   workdir: string | undefined,
   agent: string | undefined
-): Promise<string> {
+): Promise<{ workdir: string; outside: boolean; action?: PermissionAction; pattern: string }> {
   let resolvedPaths: [string, string]
   try {
     resolvedPaths = await Promise.all([realpath(workdir ?? directory), realpath(directory)])
   } catch {
-    return deny(client, 'PTY spawn denied: unable to verify the working directory.')
+    throw new Error('PTY command denied: unable to verify the working directory.')
   }
   const [resolvedWorkdir, resolvedProject] = resolvedPaths
-  const pathToWorkdir = relative(resolvedProject, resolvedWorkdir)
+  const boundary = await worktreeBoundary(resolvedProject)
+  const pathToWorkdir = relative(boundary, resolvedWorkdir)
   const outside =
     pathToWorkdir === '..' || pathToWorkdir.startsWith(`..${sep}`) || isAbsolute(pathToWorkdir)
-  if (!outside) return resolvedWorkdir
-  if (evaluate(permissions, agent, 'external_directory', resolvedWorkdir) === 'allow')
-    return resolvedWorkdir
-  return deny(
-    client,
-    `PTY spawn denied: Working directory "${workdir}" is outside project directory "${directory}" without explicit external_directory allow.`
-  )
+  return {
+    workdir: resolvedWorkdir,
+    outside,
+    action: outside ? evaluate(permissions, agent, 'external_directory', resolvedWorkdir) : undefined,
+    pattern: `${dirname(resolvedWorkdir).replace(/\\/g, '/')}/*`,
+  }
+}
+
+async function worktreeBoundary(directory: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
+      timeout: 2_000,
+      windowsHide: true,
+    })
+    return await realpath(stdout.trim())
+  } catch {
+    return directory
+  }
+}
+
+async function requestApproval(
+  ask: PermissionAsker | undefined,
+  permission: string,
+  pattern: string
+): Promise<void> {
+  if (typeof ask !== 'function')
+    throw new Error('PTY command denied: native permission approval is unavailable in this host.')
+  await ask({
+    permission,
+    patterns: [pattern],
+    always: [pattern],
+    metadata: { output: '[opencode-pty · authorization request]' },
+  })
 }
 
 function parseConfig(value: unknown): Config {
@@ -133,7 +181,10 @@ function evaluate(config: Config, agent: string | undefined, permission: string,
   for (const rules of [config.permission, agent ? config.agent?.[agent]?.permission : undefined]) {
     if (!rules) continue
     for (const rule of rulesFor(rules)) {
-      if (match(permission, rule.permission) && match(input, rule.pattern)) result = rule.action
+      if (match(permission, rule.permission) && match(input, rule.pattern)) {
+        if (rule.action === 'deny') return 'deny'
+        result = rule.action
+      }
     }
   }
   return result

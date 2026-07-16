@@ -39,8 +39,8 @@ import {
 import { formatLine, formatSessionInfo } from '../src/plugin/pty/formatters.ts'
 import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { createBashAuthorizer } from '../src/plugin/pty/permissions.ts'
+import { match } from '../src/plugin/pty/wildcard.ts'
 import {
-  bashApprovalCapability,
   bashArgv,
   bashTimeout,
   createBash,
@@ -736,7 +736,7 @@ test('approval preparation binds intent and retains a long native approval windo
   }
 })
 
-test('Bash session grants are isolated by an opaque agent capability', async () => {
+test('advanced approval grants are isolated by capability', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-approval-agent-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -757,9 +757,8 @@ test('Bash session grants are isolated by an opaque agent capability', async () 
         payload,
       }),
     })
-  const agentA = bashApprovalCapability('agent-a-private-name')
-  const agentB = bashApprovalCapability('agent-b-private-name')
-  expect(agentA).not.toContain('agent-a-private-name')
+  const agentA = 'advanced:agent-a'
+  const agentB = 'advanced:agent-b'
   try {
     const created = (await (
       await approvalRpc('approvalCreate', {
@@ -1055,76 +1054,70 @@ test('conversation cleanup excludes persistent sessions and environment values s
   await supervisor.flush()
 })
 
-test('spawn permission adapter fails closed, applies agent overrides, and isolates plugin contexts', async () => {
+test('spawn permission adapter uses native ask unless locally allowed or denied', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-'))
   const external = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-external-'))
   roots.push(root, external)
-  const authorizer = (permission: unknown, directory = root, agent?: unknown) =>
+  const authorizer = (permission: unknown) =>
     createSpawnAuthorizer(
       {
-        config: { get: async () => ({ data: { permission, agent } }) },
+        config: { get: async () => ({ data: { permission } }) },
         tui: { showToast: async () => {} },
       } as never,
-      directory
+      root
     )
-  const allow = authorizer({ bash: { '*': 'deny', [`${process.execPath} *`]: 'allow' } })
-  expect(await allow(process.execPath, ['-e', 'process.exit()'], root)).toBe(root)
-  await expect(authorizer({})(process.execPath, [], root)).rejects.toThrow('no explicit allow')
-  await expect(authorizer({ bash: { '*': 'allow' } })('other-command', [], root)).resolves.toBe(
-    root
-  )
+  const ask = async (request: {
+    permission: string
+    patterns: string[]
+    always: string[]
+    metadata: { output: string }
+  }) => void asks.push(request)
+  const asks: {
+    permission: string
+    patterns: string[]
+    always: string[]
+    metadata: { output: string }
+  }[] = []
+  await authorizer({ bash: 'ask' })(process.execPath, ['--version'], root, undefined, ask)
+  expect(asks).toEqual([
+    {
+      permission: 'bash',
+      patterns: [`${process.execPath} --version`],
+      always: [`${process.execPath} --version`],
+      metadata: { output: '[opencode-pty · authorization request]' },
+    },
+  ])
+
+  const denied = authorizer({ bash: 'deny' })
+  await expect(denied(process.execPath, [], root, undefined, ask)).rejects.toThrow('denied')
+  expect(asks).toHaveLength(1)
+
+  await authorizer({ bash: 'allow' })(process.execPath, [], root, undefined, ask)
+  expect(asks).toHaveLength(1)
+
+  await authorizer({ bash: 'allow' })(process.execPath, [], external, undefined, ask)
+  expect(asks.at(-1)).toEqual({
+    permission: 'external_directory',
+    patterns: [`${resolve(external, '..').replace(/\\/g, '/')}/*`],
+    always: [`${resolve(external, '..').replace(/\\/g, '/')}/*`],
+    metadata: { output: '[opencode-pty · authorization request]' },
+  })
+
   await expect(
-    authorizer({ bash: { '*': 'allow' } })(process.execPath, [], external)
-  ).rejects.toThrow('external_directory allow')
-  expect(
-    await authorizer({ bash: { '*': 'allow' }, external_directory: 'allow' })(
+    authorizer({ bash: 'allow', external_directory: 'deny' })(
       process.execPath,
       [],
-      external
+      external,
+      undefined,
+      ask
     )
-  ).toBe(external)
-  await expect(authorizer({ bash: 'ask' })(process.execPath, [], root)).rejects.toThrow(
-    'no explicit allow'
-  )
-  await expect(authorizer('allow')(process.execPath, [], root)).resolves.toBe(root)
-  await expect(
-    authorizer(
-      {
-        bash: { '*': 'allow' },
-      },
-      root,
-      { reviewer: { permission: { bash: { '*': 'deny' } } } }
-    )(process.execPath, [], root, 'reviewer')
-  ).rejects.toThrow('no explicit allow')
-  await expect(
-    authorizer(
-      {
-        bash: { '*': 'deny' },
-      },
-      root,
-      { builder: { permission: { bash: { '*': 'allow' } } } }
-    )(process.execPath, [], root, 'builder')
-  ).resolves.toBe(root)
-  const git = authorizer({ bash: { '*': 'deny', 'git status': 'allow' } })
-  await expect(git('git', ['status'], root)).resolves.toBe(root)
-  await expect(git('git', ['reset', '--hard', 'status'], root)).rejects.toThrow('no explicit allow')
-  await expect(
-    authorizer({ bash: { '*': 'deny', 'git *': 'allow' } })('git', ['status'], root)
-  ).resolves.toBe(root)
-  await expect(
-    authorizer({ bash: { '*': 'allow', 'git *': 'deny' } })('git', ['status'], root)
-  ).rejects.toThrow('no explicit allow')
-  const secondRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-second-'))
-  roots.push(secondRoot)
-  await Promise.all([
-    expect(allow(process.execPath, ['-e', 'process.exit()'], root)).resolves.toBe(root),
-    expect(
-      authorizer({ bash: 'deny' }, secondRoot)(process.execPath, [], secondRoot)
-    ).rejects.toThrow('no explicit allow'),
-  ])
+  ).rejects.toThrow('denied')
+
+  expect(match('git', 'git *')).toBeTrue()
+  expect(match('C:\\Work\\Repo', 'c:/work/*', 'win32')).toBeTrue()
 })
 
-test('bash policy matches opaque raw input and preserves external workdir checks', async () => {
+test('experimental Bash keeps raw policy input and external ask patterns', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-policy-'))
   const external = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-external-'))
   roots.push(root, external)
@@ -1143,7 +1136,7 @@ test('bash policy matches opaque raw input and preserves external workdir checks
     workdir: root,
   })
   await expect(authorizer({ bash: { '*': 'deny' } })('git status && whoami')).rejects.toThrow(
-    'no explicit allow'
+    'local permission policy'
   )
   expect(await authorizer({ bash: 'ask' })('git status')).toMatchObject({ action: 'ask' })
   await expect(
@@ -1160,14 +1153,31 @@ test('bash policy matches opaque raw input and preserves external workdir checks
         tui: { showToast: async () => {} },
       } as never,
       root
-    )('git status', undefined, 'restricted')
-  ).rejects.toThrow('no explicit allow')
-  await expect(authorizer({ bash: 'allow' })('git status', external)).rejects.toThrow(
-    'external_directory allow'
-  )
+  )('git status', undefined, 'restricted')
+  ).rejects.toThrow('local permission policy')
+  await expect(
+    createSpawnAuthorizer(
+      {
+        config: {
+          get: async () => ({
+            data: {
+              permission: { bash: 'deny' },
+              agent: { permissive: { permission: { bash: 'allow' } } },
+            },
+          }),
+        },
+        tui: { showToast: async () => {} },
+      } as never,
+      root
+    )(process.execPath, [], root, 'permissive', async () => {})
+  ).rejects.toThrow('local permission policy')
+  expect(await authorizer({ bash: 'allow' })('git status', external)).toMatchObject({
+    action: 'allow',
+    externalPattern: `${resolve(external, '..').replace(/\\/g, '/')}/*`,
+  })
 })
 
-test('bash wrapper keeps host metadata private and consumes native approval once', async () => {
+test('experimental Bash keeps host metadata private and uses native approval', async () => {
   expect(bashArgv('echo ok', 'win32', { ComSpec: 'cmd.exe' }, () => true)).toEqual([
     'cmd.exe',
     ['/d', '/s', '/c', 'echo ok'],
@@ -1233,10 +1243,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
     },
   } as never)
   expect(calls).toEqual([
-    'wait',
     'ask',
-    'approve',
-    'consume',
     `exec:${process.platform === 'win32' ? process.env.ComSpec : '/bin/sh'}:${process.platform === 'win32' ? '/d,/s,/c,echo ok' : '-lc,echo ok'}`,
   ])
   expect(metadata).toEqual([
@@ -1272,7 +1279,7 @@ test('bash wrapper keeps host metadata private and consumes native approval once
       metadata: () => {},
     } as never)
   ).rejects.toThrow('rejected')
-  expect(rejected).toEqual(['cancel'])
+  expect(rejected).toEqual([])
 })
 
 test('bash rejects nonterminal exec results rather than claiming completion', async () => {
@@ -1330,10 +1337,10 @@ test('bash cancels durable approval when native ctx.ask is unavailable', async (
       metadata: () => {},
     } as never)
   ).rejects.toThrow('approval is unavailable')
-  expect(calls).toEqual(['cancel'])
+  expect(calls).toEqual([])
 })
 
-test('bash reuses a matching session grant without native approval', async () => {
+test('bash session grants never bypass native approval', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ status: 'approved_session' }),
@@ -1365,10 +1372,10 @@ test('bash reuses a matching session grant without native approval', async () =>
       metadata: () => {},
     } as never)
   ).resolves.toContain('status="exited"')
-  expect(calls).toEqual(['start'])
+  expect(calls).toEqual(['ask', 'start'])
 })
 
-test('bash accepts a companion session decision without native ctx.ask', async () => {
+test('bash ignores companion approval decisions', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1403,10 +1410,10 @@ test('bash accepts a companion session decision without native ctx.ask', async (
       metadata: () => {},
     } as never)
   ).resolves.toContain('status="exited"')
-  expect(calls).toEqual(['consume', 'start'])
+  expect(calls).toEqual(['ask', 'start'])
 })
 
-test('bash never launches a rejected companion approval', async () => {
+test('bash only observes native approval rejection', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1428,16 +1435,19 @@ test('bash never launches a rejected companion approval', async () => {
       directory: process.cwd(),
       agent: 'test',
       abort: new AbortController().signal,
-      ask: async () => calls.push('ask'),
+      ask: async () => {
+        calls.push('ask')
+        throw new Error('rejected')
+      },
       metadata: () => {},
     } as never)
-  ).rejects.toThrow('not granted')
-  expect(calls).toEqual([])
+  ).rejects.toThrow('rejected')
+  expect(calls).toEqual(['ask'])
 })
 
-test('Bash asks again when a session grant belongs to another agent', async () => {
+test('Bash always asks regardless of advanced approval grants', async () => {
   const calls: string[] = []
-  const granted = bashApprovalCapability('agent-a')
+  const granted = 'advanced:agent-a'
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async (request: { capability: string }) =>
       request.capability === granted
@@ -1472,10 +1482,10 @@ test('Bash asks again when a session grant belongs to another agent', async () =
 
   await bash.execute({ command: 'echo granted' }, context('agent-a'))
   await bash.execute({ command: 'echo granted' }, context('agent-b'))
-  expect(calls).toEqual(['ask:agent-b'])
+  expect(calls).toEqual(['ask:agent-a', 'ask:agent-b'])
 })
 
-test('bash asks when no matching session grant is available', async () => {
+test('bash asks without consulting session grants', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1509,10 +1519,10 @@ test('bash asks when no matching session grant is available', async () => {
     },
     metadata: () => {},
   } as never)
-  expect(calls).toEqual(['ask', 'approve'])
+  expect(calls).toEqual(['ask'])
 })
 
-test('bash abort cancels pending approval before dispatch', async () => {
+test('bash abort before dispatch does not create a companion approval', async () => {
   const calls: string[] = []
   const controller = new AbortController()
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
@@ -1545,7 +1555,7 @@ test('bash abort cancels pending approval before dispatch', async () => {
       metadata: () => {},
     } as never)
   ).rejects.toThrow('cancelled')
-  expect(calls).toEqual(['cancel'])
+  expect(calls).toEqual([])
 })
 
 test('bash abort stops dispatched exec and waits for terminal evidence', async () => {
@@ -1638,16 +1648,17 @@ test('bash execStart stop reaches a terminal daemon record', async () => {
   }
 }, 10_000)
 
-test('bash override is enabled by default and can be omitted alone', async () => {
+test('bash override is opt-in and native Bash remains the default', async () => {
   const input = {
     client: { config: { get: async () => ({ data: { permission: { bash: 'allow' } } }) } },
     directory: process.cwd(),
   } as never
-  expect((await PTYPlugin(input)).tool).toHaveProperty('bash')
-  const withoutBash = await PTYPlugin(input, { bash: false })
-  expect(withoutBash.tool).not.toHaveProperty('bash')
-  expect(withoutBash.tool).toHaveProperty('pty_spawn')
-  expect(withoutBash.tool).toHaveProperty('shell_exec')
+  expect((await PTYPlugin(input)).tool).not.toHaveProperty('bash')
+  expect((await PTYPlugin(input, { bash: false })).tool).not.toHaveProperty('bash')
+  const withBash = await PTYPlugin(input, { bash: true })
+  expect(withBash.tool).toHaveProperty('bash')
+  expect(withBash.tool).toHaveProperty('pty_spawn')
+  expect(withBash.tool).toHaveProperty('shell_exec')
 })
 
 test('session deletion cleans up with the deleted session project owner', async () => {
