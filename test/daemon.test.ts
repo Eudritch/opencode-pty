@@ -569,6 +569,106 @@ test('daemon persists owner-bound approval decisions and cleanup', async () => {
   }
 })
 
+test('approval ledger discards legacy session grants without expiry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-legacy-approval-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  const descriptor = await server.start()
+  const context = await owner(storage, 'legacy', root)
+  const intent = {
+    command: 'bun test',
+    reason: 'legacy approval',
+    capability: 'tool',
+    workdir: root,
+  }
+  const digest = new Bun.CryptoHasher('sha256')
+    .update(
+      JSON.stringify({
+        command: intent.command,
+        capability: intent.capability,
+        workdir: intent.workdir,
+        reason: intent.reason,
+      })
+    )
+    .digest('hex')
+  const now = new Date().toISOString()
+  const expiresAt = new Date(Date.now() + 30_000).toISOString()
+  const approvals = await approvalCapability(storage, 'legacy', root)
+  const approvalRpc = (operation: string, payload: unknown) =>
+    fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation,
+        owner: context,
+        approvalCapability: approvals,
+        payload,
+      }),
+    })
+  try {
+    await writeFile(
+      join(root, 'approvals.json'),
+      JSON.stringify({
+        requests: [
+          {
+            id: 'session',
+            parentSessionId: 'legacy',
+            projectDirectory: root,
+            digest,
+            ...intent,
+            status: 'approved_session',
+            createdAt: now,
+            updatedAt: now,
+            expiresAt,
+          },
+          {
+            id: 'once',
+            parentSessionId: 'legacy',
+            projectDirectory: root,
+            digest,
+            ...intent,
+            status: 'approved_once',
+            createdAt: now,
+            updatedAt: now,
+            expiresAt,
+          },
+        ],
+        grants: [
+          {
+            id: 'grant',
+            parentSessionId: 'legacy',
+            projectDirectory: root,
+            digest,
+            capability: 'tool',
+            workdir: root,
+            createdAt: now,
+          },
+        ],
+      })
+    )
+    const consume = (id: string) => approvalRpc('approvalConsume', { id, ...intent })
+    const sessionResponse = (await (await consume('session')).json()) as {
+      result?: { status: string }
+      error?: { message: string }
+    }
+    if (!sessionResponse.result) throw new Error(sessionResponse.error?.message)
+    expect(sessionResponse.result.status).toBe('rejected')
+    expect(
+      ((await (await consume('once')).json()) as { result: { status: string } }).result.status
+    ).toBe('consumed')
+    expect((await storage.readApprovals()).grants).toHaveLength(0)
+    const rewritten = JSON.parse(await readFile(join(root, 'approvals.json'), 'utf8')) as {
+      grants: unknown[]
+    }
+    expect(rewritten.grants).toHaveLength(0)
+  } finally {
+    await server.stop()
+  }
+})
+
 test('a new client retains owned output, list, and cleanup access after daemon restart', async () => {
   if (process.platform === 'win32') return
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-restart-'))

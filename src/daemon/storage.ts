@@ -408,10 +408,15 @@ export class DaemonStorage {
               'consumed',
             ].includes(entry.status) &&
             (entry.claimExpiresAt === undefined || validTimestamp(entry.claimExpiresAt))
-        ) ||
-        !ledger.grants.every((entry) => validTimestamp(entry.expiresAt))
+        )
       ) {
         throw new Error('Approval ledger is invalid.')
+      }
+      // ponytail: legacy grants without an expiry are discarded, never extended.
+      const grants = ledger.grants.filter((entry) => validTimestamp(entry.expiresAt))
+      if (grants.length !== ledger.grants.length) {
+        ledger.grants = grants
+        await this.writeApprovals(ledger)
       }
       return ledger
     } catch (error) {
