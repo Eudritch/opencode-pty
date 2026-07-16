@@ -319,19 +319,26 @@ try {
     )
     if (!pty.ok) throw new Error(`Windows packaged ConPTY did not start: ${JSON.stringify(pty)}`)
     const id = (pty.result as { id: string }).id
-    const written = await rpc(started.descriptor, 'write', { id, data: 'conpty-check\n' }, owner)
-    if (!written.ok)
-      throw new Error(`Windows packaged ConPTY did not accept input: ${JSON.stringify(written)}`)
+    const marker = 'echo:conpty-check'
+    const written = await rpc(
+      started.descriptor,
+      'sendWait',
+      {
+        id,
+        data: 'conpty-check\r\n',
+        condition: { kind: 'output', literal: marker },
+        timeoutSeconds: 2,
+      },
+      owner
+    )
+    if (!written.ok || (written.result as { satisfied?: boolean } | undefined)?.satisfied !== true)
+      throw new Error(`Windows packaged ConPTY did not echo input: ${JSON.stringify(written)}`)
     const resized = await rpc(started.descriptor, 'resize', { id, cols: 100, rows: 30 }, owner)
     if (!resized.ok)
       throw new Error(`Windows packaged ConPTY did not resize: ${JSON.stringify(resized)}`)
-    let output = ''
-    for (let attempt = 0; attempt < 100 && !output.includes('echo:conpty-check'); attempt += 1) {
-      const read = await rpc(started.descriptor, 'rawOutput', { id }, owner)
-      output = (read.result as { raw?: string } | undefined)?.raw ?? ''
-      if (!output.includes('echo:conpty-check')) await Bun.sleep(25)
-    }
-    if (!output.includes('echo:conpty-check'))
+    const read = await rpc(started.descriptor, 'rawOutput', { id }, owner)
+    const output = (read.result as { raw?: string } | undefined)?.raw ?? ''
+    if (!read.ok || !output.includes(marker))
       throw new Error(`Windows packaged ConPTY did not echo input: ${JSON.stringify(output)}`)
     await rpc(started.descriptor, 'stop', { id }, owner)
   }

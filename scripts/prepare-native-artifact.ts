@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   NATIVE_WORKER_TARGETS,
@@ -6,6 +6,7 @@ import {
   nativeWorkerPackageName,
   type NativeWorkerTarget,
 } from '../src/shared/native-worker-targets.ts'
+import { stageNativeWorker } from './stage-native-worker.ts'
 
 const target = process.argv[2] as NativeWorkerTarget | undefined
 if (!target || !(target in NATIVE_WORKER_TARGETS))
@@ -17,7 +18,7 @@ const output = join('native-artifacts', target)
 const binary = join('target', 'release', nativeWorkerBinaryName(platform.os))
 await stat(binary)
 await mkdir(join(output, 'bin'), { recursive: true })
-await cp(binary, join(output, 'bin', nativeWorkerBinaryName(platform.os)))
+await stageNativeWorker(binary, join(output, 'bin', nativeWorkerBinaryName(platform.os)))
 await writeFile(
   join(output, 'package.json'),
   `${JSON.stringify(
