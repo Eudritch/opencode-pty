@@ -252,10 +252,10 @@ jobs:
           set -euo pipefail
           bun typecheck
           bun unittest
-           bun lint
-           bun format
-           bun run tui:verify
-           bun build:prod
+          bun lint
+          bun format
+          bun run tui:verify
+          bun build:prod
           bun package:smoke
           npm pack --dry-run
           package=$(mktemp -d)

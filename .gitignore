@@ -12,10 +12,6 @@ native-artifacts
 coverage
 *.lcov
 
-# test results and reports
-playwright-report/
-test-results/
-
 # logs
 logs
 _.log
@@ -32,6 +28,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .eslintcache
 .cache
 *.tsbuildinfo
+.lesshst
 
 # IntelliJ based IDEs
 .idea

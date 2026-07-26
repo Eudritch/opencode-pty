@@ -29,7 +29,10 @@ jobs:
           bun-version: 1.3.8
 
       - name: Setup Rust
+        if: matrix.quality == 'unittest'
         uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: clippy
 
       - name: Cache Bun dependencies
         uses: actions/cache@v5
@@ -42,14 +45,17 @@ jobs:
       - name: Install dependencies
         run: bun ci
 
-      - name: Build
-        run: bun build:prod
-
       - name: Build native worker
+        if: matrix.quality == 'unittest'
         run: cargo build --locked --workspace
 
       - name: Test native worker
+        if: matrix.quality == 'unittest'
         run: cargo test --locked --workspace
+
+      - name: Lint native worker
+        if: matrix.quality == 'unittest'
+        run: cargo clippy --locked --workspace -- -D warnings
 
       - name: Run quality step
         run: bun ${{matrix.quality}}
@@ -80,8 +86,6 @@ jobs:
       - run: cargo build --locked --workspace
       - name: Run daemon suite
         run: bun unittest
-      - name: Lint native worker
-        run: cargo clippy --locked --workspace -- -D warnings
       - run: bun build:prod
       - name: Packaged-worker smoke (including Windows ConPTY echo and Job drain)
         run: bun package:smoke
@@ -118,7 +122,7 @@ jobs:
 
   nix-flake-test:
     name: Devenv CI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -138,8 +142,9 @@ jobs:
       - name: Build (Devenv shell)
         run: devenv shell -- bun build:prod
 
-      - name: Quality checks (bun test)
-        run: devenv shell -- cargo build --locked --workspace && devenv shell -- bun unittest
+      # No cargo/unittest here: devenv.nix provides bun and biome, not Rust, so this
+      # job validates only what the devenv environment actually supplies. The full
+      # cargo build/test/clippy + bun unittest coverage lives in the test matrix.
       - name: Quality checks (typecheck)
         run: devenv shell -- bun typecheck
       - name: Quality checks (lint)

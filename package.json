@@ -49,7 +49,6 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "unittest": "bun test",
-    "test:all": "bun unittest",
     "build:plugin": "tsc -p tsconfig.build.json && bun x copyfiles -u 0 \"src/**/*.txt\" dist && bun run tui:build",
     "build:dev": "bun clean && bun build:plugin",
     "build:prod": "bun clean && bun build:plugin",
