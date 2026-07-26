@@ -1,5 +1,5 @@
 import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import {
   DAEMON_PROTOCOL_VERSION,
@@ -127,6 +127,14 @@ export async function processIdentityProbe(
   }
 }
 
+const WINDOWS_TRANSIENT_FS_ERROR_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+
+// Antivirus scanners and indexers briefly hold Windows files open, surfacing
+// as any of these codes; every retrying filesystem path shares this one set.
+export function isTransientWindowsFsError(code: string | undefined): boolean {
+  return code !== undefined && WINDOWS_TRANSIENT_FS_ERROR_CODES.has(code)
+}
+
 export async function renameWithWindowsRetry(
   source: string,
   destination: string,
@@ -139,7 +147,7 @@ export async function renameWithWindowsRetry(
       return
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
-      if (!windows || !['EPERM', 'EBUSY'].includes(code ?? '') || attempt >= WINDOWS_RENAME_RETRIES)
+      if (!windows || !isTransientWindowsFsError(code) || attempt >= WINDOWS_RENAME_RETRIES)
         throw error
       await Bun.sleep(WINDOWS_RENAME_RETRY_MS)
     }
@@ -196,7 +204,14 @@ function validNonnegativeInteger(value: unknown): value is number {
 }
 
 export function daemonDataDirectory(): string {
-  if (process.env.PTY_DAEMON_DIR) return process.env.PTY_DAEMON_DIR
+  const configured = process.env.PTY_DAEMON_DIR
+  if (configured) {
+    // Rejects relative junk and stringified non-values ("undefined", "null")
+    // that would otherwise resolve into a daemon directory under the cwd.
+    if (!isAbsolute(configured))
+      throw new Error(`PTY_DAEMON_DIR must be an absolute path (got "${configured}").`)
+    return configured
+  }
   const base = process.env.APPDATA ?? process.env.XDG_STATE_HOME ?? process.env.HOME
   if (!base) throw new Error('Unable to determine a per-user daemon data directory.')
   return join(base, 'opencode-pty')
@@ -316,8 +331,9 @@ export class DaemonStorage {
   async readDescriptor(): Promise<DaemonDescriptor | null> {
     try {
       return JSON.parse(await readFile(this.descriptorPath, 'utf8')) as DaemonDescriptor
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    } catch {
+      // Missing, unreadable, and corrupt descriptors are equivalent for every
+      // caller: no daemon is registered, so they fall back to daemon startup.
       return null
     }
   }
@@ -346,7 +362,7 @@ export class DaemonStorage {
       status === 'alive' ||
       (status === 'unknown' &&
         (descriptor.protocolVersion !== DAEMON_PROTOCOL_VERSION ||
-          this.authenticatedDescriptorHealthy(descriptor, deadline)))
+          (await this.authenticatedDescriptorHealthy(descriptor, deadline))))
     )
   }
 
@@ -503,17 +519,13 @@ export class DaemonStorage {
     }
   }
 
-  async releaseStartLock(token: string, deadline?: number): Promise<void> {
+  async releaseStartLock(token: string, _deadline?: number): Promise<void> {
     const lock = await this.readStartLock()
-    const processIdentity = await this.requiredCurrentProcessStartIdentity(deadline).catch(
-      () => null
-    )
-    if (
-      lock?.token === token &&
-      lock.pid === process.pid &&
-      processIdentity !== null &&
-      (lock.processIdentity === null || lock.processIdentity === processIdentity)
-    ) {
+    // A matching token plus our own pid proves ownership outright: the lease
+    // token is only ever handed to the process that wrote the lock, so a
+    // process-identity probe adds nothing here — and a failed or timed-out
+    // Windows probe must not leak the lock and block every future start.
+    if (lock?.token === token && lock.pid === process.pid) {
       await rm(this.startLockPath, { force: true })
       await this.syncDirectory(this.root)
     }
@@ -544,37 +556,44 @@ export class DaemonStorage {
   }
 
   private async acquireStartLockRecovery(deadline?: number): Promise<boolean> {
-    const lock: StartLock = {
-      token: crypto.randomUUID(),
-      handoffToken: null,
-      pid: process.pid,
-      processIdentity: await this.requiredCurrentProcessStartIdentity(deadline),
-    }
-    if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
-      return true
-    }
-    const recovery = await this.readStartLock(this.startLockRecoveryPath)
-    if (recovery && (await this.startLockOwnerAlive(recovery, deadline))) return false
-    const quarantine = join(this.root, `.${START_LOCK_RECOVERY_FILE}.${crypto.randomUUID()}`)
-    try {
-      await rename(this.startLockRecoveryPath, quarantine)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT')
-        return this.acquireStartLockRecovery(deadline)
-      throw error
-    }
-    const quarantined = await this.readStartLock(quarantine)
-    if (!recovery || quarantined?.token !== recovery.token) {
-      try {
-        await link(quarantine, this.startLockRecoveryPath)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    // A loop instead of recursion so two racing recoverers cannot ping-pong
+    // (quarantine, recreate, retry) past any budget the caller has set.
+    for (;;) {
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw new Error('Timed out acquiring the daemon start-lock recovery lock.')
       }
+      const lock: StartLock = {
+        token: crypto.randomUUID(),
+        handoffToken: null,
+        pid: process.pid,
+        processIdentity: await this.requiredCurrentProcessStartIdentity(deadline),
+      }
+      if (await this.writeExclusiveLock(this.startLockRecoveryPath, lock)) {
+        return true
+      }
+      const recovery = await this.readStartLock(this.startLockRecoveryPath)
+      if (recovery && (await this.startLockOwnerAlive(recovery, deadline))) return false
+      const quarantine = join(this.root, `.${START_LOCK_RECOVERY_FILE}.${crypto.randomUUID()}`)
+      try {
+        await renameWithWindowsRetry(this.startLockRecoveryPath, quarantine)
+      } catch (error) {
+        // Another recoverer already removed the stale lock; contend again.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw error
+      }
+      const quarantined = await this.readStartLock(quarantine)
+      if (!recovery || quarantined?.token !== recovery.token) {
+        try {
+          await link(quarantine, this.startLockRecoveryPath)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        }
+        await rm(quarantine, { force: true })
+        return false
+      }
+      // The stale recovery lock is quarantined; contend for a fresh one.
       await rm(quarantine, { force: true })
-      return false
     }
-    await rm(quarantine, { force: true })
-    return this.acquireStartLockRecovery(deadline)
   }
 
   private async writeExclusiveLock(path: string, lock: StartLock): Promise<boolean> {
@@ -595,7 +614,18 @@ export class DaemonStorage {
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code
           if (code === 'EEXIST') return false
-          if (code !== 'EACCES' || attempt >= WINDOWS_RENAME_RETRIES) throw error
+          if (code === 'EPERM' || code === 'EXDEV') {
+            // Filesystems without hardlink support (FAT/exFAT/SMB) report
+            // EPERM or EXDEV; an exclusive create ('wx') is the strongest
+            // atomicity those filesystems offer. Hardlinking stays primary.
+            const created = await this.createExclusiveLockFile(path, lock)
+            if (created !== null) {
+              if (!created) return false
+              break
+            }
+            // The fallback failed transiently; fall through to the retry.
+          }
+          if (!isTransientWindowsFsError(code) || attempt >= WINDOWS_RENAME_RETRIES) throw error
           await Bun.sleep(WINDOWS_RENAME_RETRY_MS)
         }
       }
@@ -607,6 +637,28 @@ export class DaemonStorage {
     } finally {
       await unlink(temporary).catch(() => undefined)
     }
+  }
+
+  // Returns true when the lock was created, false when it already exists, and
+  // null on a transient Windows error so the caller can retry.
+  private async createExclusiveLockFile(path: string, lock: StartLock): Promise<boolean | null> {
+    let handle: Awaited<ReturnType<typeof open>>
+    try {
+      handle = await open(path, 'wx', 0o600)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') return false
+      if (isTransientWindowsFsError(code)) return null
+      throw error
+    }
+    try {
+      await handle.writeFile(JSON.stringify(lock), 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await this.privateFile(path)
+    return true
   }
 
   private async startLockOwnerAlive(lock: StartLock, deadline?: number): Promise<boolean> {
@@ -1068,7 +1120,7 @@ export class DaemonStorage {
 
   private async quarantineSession(id: string, reason: string): Promise<void> {
     try {
-      await rename(
+      await renameWithWindowsRetry(
         this.sessionDirectory(id),
         join(this.root, QUARANTINE_DIRECTORY, `${id}-${Date.now()}-${crypto.randomUUID()}`)
       )

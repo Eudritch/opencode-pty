@@ -1,3 +1,4 @@
+import { isAbsolute, resolve } from 'node:path'
 import { DaemonServer } from './server.ts'
 import { DaemonStorage } from './storage.ts'
 import { SessionSupervisor } from './supervisor.ts'
@@ -24,8 +25,22 @@ function launchOptions(): DaemonLaunchOptions {
   }
 }
 
+// Rejects relative and stringified non-value ("undefined", "null") data
+// directories before any lock, session, or quarantine path is derived from
+// them; the plugin client surfaces this stderr on failed daemon startup.
+function storageRoot(dataDirectory: string | undefined): string | undefined {
+  if (dataDirectory === undefined) return undefined
+  if (!dataDirectory || !isAbsolute(dataDirectory)) {
+    console.error(
+      `PTY daemon dataDirectory must be a non-empty absolute path (got ${JSON.stringify(dataDirectory)}).`
+    )
+    process.exit(1)
+  }
+  return resolve(dataDirectory)
+}
+
 const options = launchOptions()
-const storage = new DaemonStorage(options.dataDirectory)
+const storage = new DaemonStorage(storageRoot(options.dataDirectory))
 const server = new DaemonServer(
   storage,
   new SessionSupervisor(storage),
