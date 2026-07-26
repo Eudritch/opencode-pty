@@ -14,7 +14,11 @@ export function createShellExec(authorizeSpawn: SpawnAuthorizer) {
       workdir: tool.schema.string().optional().describe('Working directory'),
       env: tool.schema.record(tool.schema.string(), tool.schema.string()).optional(),
       inheritEnv: tool.schema.boolean().optional(),
-      timeoutSeconds: tool.schema.number().describe('Required finite deadline in seconds'),
+      timeoutSeconds: tool.schema
+        .number()
+        .min(1)
+        .max(3600)
+        .describe('Required finite deadline in seconds, maximum 3600'),
       maxOutputBytes: tool.schema
         .number()
         .optional()
@@ -23,7 +27,7 @@ export function createShellExec(authorizeSpawn: SpawnAuthorizer) {
     async execute(args, ctx) {
       const workdir = await authorizeSpawn(
         args.command,
-        args.args ?? [],
+        args.args,
         args.workdir,
         ctx.agent,
         ctx.ask

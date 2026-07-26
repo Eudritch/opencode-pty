@@ -8,12 +8,12 @@ Unlike the built-in bash tool which runs commands synchronously and waits for co
 
 Usage:
 - The `command` parameter is required (e.g., "npm", "python", "bash")
-- Use `args` to pass arguments to the command (e.g., ["run", "dev"])
-- Use `workdir` to set the working directory (defaults to project root)
+- The `args` parameter is required: arguments for the command (e.g., ["run", "dev"]); pass [] when there are none
+- Use `workdir` to set the working directory (defaults to the plugin project directory, validated against the git worktree boundary)
 - Use `env` to set additional environment variables
 - Use `title` to give the session a human-readable name
 - The `description` parameter is required: a clear, concise 5-10 word description
-- `notifyOnExit` is accepted for compatibility but cannot deliver notifications from the durable daemon. Omit it.
+- `notifyOnExit` is not supported by the durable daemon and is rejected when set. Omit it.
 - Use `timeoutSeconds` to auto-kill the PTY after a fixed number of seconds
 - Do not set `timeoutSeconds` by default for sessions that are meant to keep running, such as dev servers, watch modes, local APIs, or REPLs. Only add a timeout for those when the user explicitly asks for one.
 - Prefer setting `timeoutSeconds` for long-running commands that are still expected to finish on their own, such as builds, unit test suites, end-to-end tests, migrations, or other commands where you are waiting for a result.
@@ -30,9 +30,9 @@ After spawning, use:
 - `pty_kill` to terminate the PTY
 
 Examples:
-- Start a dev server: command="npm", args=["run", "dev"], title="Dev Server"
-- Start a timed dev server when explicitly requested: command="npm", args=["run", "dev"], title="Dev Server", timeoutSeconds=600
-- Start a Python REPL: command="python3", title="Python REPL"
-- Run tests in watch mode: command="npm", args=["test", "--", "--watch"]
-- Run a build with a timeout: command="npm", args=["run", "build"], title="Build", timeoutSeconds=900
-- Run end-to-end tests with a timeout: command="npm", args=["run", "test:e2e"], title="E2E Tests", timeoutSeconds=1800
+- Start a dev server: command="npm", args=["run", "dev"], description="Run the npm dev server", title="Dev Server"
+- Start a timed dev server when explicitly requested: command="npm", args=["run", "dev"], description="Run the npm dev server briefly", title="Dev Server", timeoutSeconds=600
+- Start a Python REPL: command="python3", args=[], description="Interactive Python REPL session", title="Python REPL"
+- Run tests in watch mode: command="npm", args=["test", "--", "--watch"], description="Run the test suite in watch mode"
+- Run a build with a timeout: command="npm", args=["run", "build"], description="Build the project once", title="Build", timeoutSeconds=900
+- Run end-to-end tests with a timeout: command="npm", args=["run", "test:e2e"], description="Run the end-to-end test suite", title="E2E Tests", timeoutSeconds=1800

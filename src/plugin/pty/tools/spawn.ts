@@ -36,6 +36,7 @@ export function createPtySpawn(authorizeSpawn: SpawnAuthorizer) {
         .describe('Unsupported by the durable daemon; omit this option'),
       timeoutSeconds: tool.schema
         .number()
+        .min(1)
         .optional()
         .describe(
           'Optional per-session timeout in seconds. The daemon requests termination when this duration elapses.'
@@ -57,7 +58,7 @@ export function createPtySpawn(authorizeSpawn: SpawnAuthorizer) {
       }
       const workdir = await authorizeSpawn(
         args.command,
-        args.args ?? [],
+        args.args,
         args.workdir,
         ctx.agent,
         ctx.ask

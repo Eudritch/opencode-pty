@@ -6,7 +6,11 @@ import { parseEscapeSequences } from './write.ts'
 
 const waitArgs = {
   id: tool.schema.string().describe('PTY session ID'),
-  timeoutSeconds: tool.schema.number().describe('Deadline in seconds, maximum 3600'),
+  timeoutSeconds: tool.schema
+    .number()
+    .min(1)
+    .max(3600)
+    .describe('Deadline in seconds, maximum 3600'),
   literal: tool.schema.string().optional().describe('Wait for this literal output'),
   regex: tool.schema
     .string()

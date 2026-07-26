@@ -7,8 +7,8 @@ export const ptyResize = tool({
     'Resize a running native PTY terminal. Output remains a redacted UTF-8 stream, not a screen snapshot.',
   args: {
     id: tool.schema.string().describe('The PTY session ID'),
-    cols: tool.schema.number().describe('Terminal columns, from 1 to 1000'),
-    rows: tool.schema.number().describe('Terminal rows, from 1 to 1000'),
+    cols: tool.schema.number().min(1).max(1000).describe('Terminal columns, from 1 to 1000'),
+    rows: tool.schema.number().min(1).max(1000).describe('Terminal rows, from 1 to 1000'),
   },
   async execute(args, ctx) {
     const result = await manager.resize(

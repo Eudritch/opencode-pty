@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url'
 import { realpathSync } from 'node:fs'
 
 const RPC_TIMEOUT_MS = 5000
+// Spawn covers native worker startup plus the Windows PowerShell identity probe.
+const SPAWN_TIMEOUT_MS = 20_000
 const DAEMON_START_TIMEOUT_MS = 20_000
 const STARTUP_STDERR_TAIL_CHARS = 4096
 
@@ -79,8 +81,17 @@ async function captureStartupStderr(
   }
 }
 
-export function safeStartupStderrTail(..._values: string[]): null {
-  return null
+export function safeStartupStderrTail(
+  tail: string | null | undefined,
+  ...secrets: Array<string | null | undefined>
+): string | null {
+  if (!tail || !tail.trim()) return null
+  let sanitized = tail
+  for (const secret of secrets) {
+    if (secret) sanitized = sanitized.split(secret).join('[REDACTED]')
+  }
+  sanitized = sanitized.trim().slice(-STARTUP_STDERR_TAIL_CHARS)
+  return sanitized || null
 }
 
 function isSafeDescriptor(value: unknown): value is DaemonDescriptor {
@@ -117,11 +128,17 @@ function isSafeDescriptor(value: unknown): value is DaemonDescriptor {
 }
 
 export class DaemonClient {
-  private readonly storage = new DaemonStorage()
+  // Constructed lazily so the data directory (PTY_DAEMON_DIR) is read at first use, not at import.
+  private storageInstance: DaemonStorage | null = null
   private descriptor: DaemonDescriptor | null = null
 
+  private get storage(): DaemonStorage {
+    this.storageInstance ??= new DaemonStorage()
+    return this.storageInstance
+  }
+
   async spawn(options: SpawnOptions, owner?: OwnerContext): Promise<PTYSessionInfo> {
-    return this.call('spawn', options, RPC_TIMEOUT_MS, owner)
+    return this.call('spawn', options, SPAWN_TIMEOUT_MS, owner)
   }
 
   async exec(
@@ -249,10 +266,6 @@ export class DaemonClient {
     termination?: import('../../daemon/types.ts').TerminationResult
   } | null> {
     return this.call('rawOutput', { id }, RPC_TIMEOUT_MS, owner)
-  }
-
-  async getExecOutput(id: string, owner?: OwnerContext) {
-    return this.call('execOutput', { id }, RPC_TIMEOUT_MS, owner)
   }
 
   async stop(id: string, owner?: OwnerContext): Promise<StopResult> {
@@ -435,12 +448,7 @@ export class DaemonClient {
     let startupStderrDone: Promise<void> | undefined
     try {
       while (Date.now() < deadline) {
-        let descriptor: unknown = null
-        try {
-          descriptor = await this.storage.readDescriptor()
-        } catch {
-          // Invalid descriptor data is only replaced by the lock owner.
-        }
+        const descriptor: unknown = await this.storage.readDescriptor()
         if (isSafeDescriptor(descriptor)) {
           const state = await this.probe(descriptor, deadline)
           if (state === 'healthy') {
@@ -460,12 +468,7 @@ export class DaemonClient {
           if (startLock) continue
         }
         if (startLock && !started) {
-          let lockedDescriptor: unknown = null
-          try {
-            lockedDescriptor = await this.storage.readDescriptor()
-          } catch {
-            // This lock owner may replace an unreadable descriptor.
-          }
+          const lockedDescriptor: unknown = await this.storage.readDescriptor()
           if (isSafeDescriptor(lockedDescriptor)) {
             const state = await this.probe(lockedDescriptor, deadline)
             if (state === 'healthy') {
@@ -603,6 +606,14 @@ export interface OwnerContext {
 }
 
 export function ownerContext(parentSessionId: string, projectDirectory: string): OwnerContext {
+  if (
+    typeof parentSessionId !== 'string' ||
+    !parentSessionId ||
+    typeof projectDirectory !== 'string' ||
+    !projectDirectory
+  ) {
+    throw new Error('PTY owner context requires a session id and project directory.')
+  }
   return {
     parentSessionId,
     projectDirectory: realpathSync(projectDirectory),

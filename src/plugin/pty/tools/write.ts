@@ -5,6 +5,17 @@ import { escapeXml } from '../xml.ts'
 import DESCRIPTION from './write.txt'
 
 const ETX = String.fromCharCode(3)
+const PREVIEW_MAX_CHARS = 50
+
+export function writePreview(decoded: string): string {
+  const substituted = decoded
+    .replace(new RegExp(ETX, 'g'), '^C')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+  return substituted.length > PREVIEW_MAX_CHARS
+    ? `${substituted.slice(0, PREVIEW_MAX_CHARS)}...`
+    : substituted
+}
 
 export function parseEscapeSequences(input: string): string {
   return input.replace(/\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|[nrt\\])/g, (match, seq: string) => {
@@ -50,11 +61,7 @@ export const ptyWrite = tool({
 
     const result = await manager.write(args.id, parsedData, owner)
 
-    const preview = args.data.length > 50 ? `${args.data.slice(0, 50)}...` : args.data
-    const displayPreview = preview
-      .replace(new RegExp(ETX, 'g'), '^C')
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r')
+    const displayPreview = writePreview(parsedData)
     return `Accepted ${result.acceptedBytes} UTF-8 bytes (${result.acceptedCharacters} characters) for ${escapeXml(args.id)}: "${escapeXml(displayPreview)}"`
   },
 })
