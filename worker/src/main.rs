@@ -29,15 +29,20 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, DuplicateHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     Security::SECURITY_ATTRIBUTES,
-    Storage::FileSystem::{ReadFile, WriteFile},
+    Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        ReadFile, WriteFile,
+    },
     System::{
         Console::{
-            COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
-            SetConsoleCtrlHandler,
+            AllocConsole, COORD, ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, HPCON,
+            ResizePseudoConsole, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetConsoleCtrlHandler, SetStdHandle,
         },
         IO::CancelSynchronousIo,
         JobObjects::{
@@ -50,7 +55,8 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-            GetCurrentThread, GetExitCodeProcess, InitializeProcThreadAttributeList,
+            GetCurrentThread, GetExitCodeProcess, GetProcessTimes,
+            InitializeProcThreadAttributeList,
             LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread,
             STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
@@ -61,6 +67,7 @@ use windows_sys::Win32::{
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const PROTOCOL_VERSION: u32 = 5;
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const READER_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -86,9 +93,7 @@ struct Bootstrap {
     timeout_seconds: Option<u64>,
     max_output_bytes: usize,
     mode: String,
-    #[cfg_attr(not(unix), allow(dead_code))]
     cols: Option<u16>,
-    #[cfg_attr(not(unix), allow(dead_code))]
     rows: Option<u16>,
     fault: Option<String>,
 }
@@ -399,6 +404,10 @@ struct Worker {
     arrival: Mutex<()>,
     #[cfg(unix)]
     terminal_redaction_tail: Mutex<String>,
+    // The terminal reader and the pre-write drain read the same PTY stream, so the UTF-8 carry
+    // must be shared between them exactly like the redaction tail.
+    #[cfg(unix)]
+    terminal_utf8_carry: Mutex<Vec<u8>>,
     #[cfg(unix)]
     pause_terminal_reader_until_write: AtomicBool,
     state: Mutex<State>,
@@ -538,11 +547,18 @@ impl WindowsChild {
         if let Some(exit) = self.exit {
             return Ok(Some(exit));
         }
+        // A signaled process handle is the only exit proof; the exit code alone cannot be,
+        // because a child may legitimately exit with 259 (STILL_ACTIVE).
+        match unsafe { WaitForSingleObject(self.process.raw(), 0) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(None),
+            _ => return Err(std::io::Error::last_os_error()),
+        }
         let mut code = 0;
         if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let exit = (code != 259).then_some(WindowsExit(code));
+        let exit = Some(WindowsExit(code));
         self.exit = exit;
         Ok(exit)
     }
@@ -644,7 +660,14 @@ fn resolve_windows_executable(
     let extensions = if command_path.extension().is_some() {
         vec![String::new()]
     } else {
-        vec![".COM".into(), ".EXE".into()]
+        // PATHEXT decides which extensions a bare command resolves to, in order.
+        windows_environment_value(env, "PATHEXT")
+            .filter(|pathext| !pathext.trim().is_empty())
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(String::from)
+            .collect()
     };
     for entry in windows_environment_value(env, "PATH")
         .unwrap_or_default()
@@ -670,6 +693,81 @@ fn resolve_windows_executable(
         }
     }
     Err(format!("Windows executable not found: {command}"))
+}
+
+#[cfg(windows)]
+struct WindowsSpawnPlan {
+    application: String,
+    command_line: String,
+}
+
+#[cfg(windows)]
+fn windows_command_line(application: &str, args: &[String]) -> String {
+    std::iter::once(application)
+        .chain(args.iter().map(String::as_str))
+        .map(quote_windows_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn windows_command_interpreter(env: &BTreeMap<String, String>) -> Result<String, String> {
+    if let Some(interpreter) = windows_environment_value(env, "ComSpec")
+        && !interpreter.is_empty()
+    {
+        return Ok(interpreter.into());
+    }
+    if let Some(system_root) = windows_environment_value(env, "SystemRoot") {
+        let interpreter = Path::new(system_root).join("System32").join("cmd.exe");
+        if interpreter.is_file() {
+            return Ok(interpreter.to_string_lossy().into_owned());
+        }
+    }
+    Err("Windows command interpreter not found: ComSpec and SystemRoot are unset".into())
+}
+
+// cmd.exe rejects \\?\-prefixed script paths, so canonicalized batch paths shed the verbatim
+// prefix before they are handed to the interpreter.
+#[cfg(windows)]
+fn windows_batch_script_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.into()
+    } else {
+        path.into()
+    }
+}
+
+#[cfg(windows)]
+fn windows_spawn_plan(
+    command: &str,
+    args: &[String],
+    workdir: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<WindowsSpawnPlan, String> {
+    let resolved = resolve_windows_executable(command, workdir, env)?;
+    let batch = Path::new(&resolved).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    });
+    if !batch {
+        return Ok(WindowsSpawnPlan {
+            command_line: windows_command_line(&resolved, args),
+            application: resolved,
+        });
+    }
+    // CreateProcessW cannot execute batch scripts directly; route them through cmd.exe with one
+    // extra pair of quotes around the /c payload so quoted paths and arguments survive.
+    let interpreter = windows_command_interpreter(env)?;
+    let script = windows_batch_script_path(&resolved);
+    Ok(WindowsSpawnPlan {
+        command_line: format!(
+            "{} /d /c \"{}\"",
+            quote_windows_arg(&interpreter),
+            windows_command_line(&script, args)
+        ),
+        application: interpreter,
+    })
 }
 
 #[cfg(windows)]
@@ -824,8 +922,11 @@ fn windows_job() -> Result<WinHandle, String> {
 }
 
 #[cfg(windows)]
-fn windows_creation_flags(has_attributes: bool) -> u32 {
-    CREATE_NO_WINDOW
+fn windows_creation_flags(has_attributes: bool, pty: bool) -> u32 {
+    // CREATE_NO_WINDOW forces a fresh hidden console onto the child, which overrides
+    // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attachment and leaves the ConPTY silent; pty
+    // children attach to the headless pseudoconsole, so no window can appear anyway.
+    (if pty { 0 } else { CREATE_NO_WINDOW })
         | CREATE_SUSPENDED
         | CREATE_UNICODE_ENVIRONMENT
         | if has_attributes {
@@ -835,21 +936,104 @@ fn windows_creation_flags(has_attributes: bool) -> u32 {
         }
 }
 
+/// Points this process's std handles at its own console for the duration of a
+/// ConPTY child spawn, restoring the originals on drop.
+///
+/// CreateProcessW with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE only rebinds the
+/// child's stdio to the new pseudoconsole when the parent's std handles are
+/// console handles at the moment of the call. When they are pipes (as under a
+/// test harness or daemon), the child's stdio stays unusable and conhost's VT
+/// renderer never emits a byte (observed on Windows 11 build 26200; same
+/// bracket winpty-rs ships).
+#[cfg(windows)]
+struct PseudoConsoleStdioGuard {
+    saved: [(u32, HANDLE); 3],
+    _conout: WinHandle,
+    _conin: WinHandle,
+}
+
+#[cfg(windows)]
+impl PseudoConsoleStdioGuard {
+    fn engage() -> Option<Self> {
+        fn open_console(name: &str, desired_access: u32, share_mode: u32) -> Option<WinHandle> {
+            let path = wide(name).ok()?;
+            WinHandle::new(unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    desired_access,
+                    share_mode,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                )
+            })
+            .ok()
+        }
+        let open_both = || {
+            let conout = open_console(
+                "CONOUT$",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )?;
+            let conin = open_console("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ)?;
+            Some((conout, conin))
+        };
+        let (conout, conin) = open_both().or_else(|| {
+            // Headless contexts have no console to open; attach one and hide its window.
+            unsafe {
+                if AllocConsole() != 0 {
+                    let window = windows_sys::Win32::System::Console::GetConsoleWindow();
+                    if !window.is_null() {
+                        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                            window,
+                            windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                        );
+                    }
+                }
+            }
+            open_both()
+        })?;
+        let saved = [
+            (STD_OUTPUT_HANDLE, unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }),
+            (STD_ERROR_HANDLE, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
+            (STD_INPUT_HANDLE, unsafe { GetStdHandle(STD_INPUT_HANDLE) }),
+        ];
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, conout.raw());
+            SetStdHandle(STD_ERROR_HANDLE, conout.raw());
+            SetStdHandle(STD_INPUT_HANDLE, conin.raw());
+        }
+        Some(Self {
+            saved,
+            _conout: conout,
+            _conin: conin,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PseudoConsoleStdioGuard {
+    fn drop(&mut self) {
+        for (slot, handle) in self.saved {
+            unsafe { SetStdHandle(slot, handle) };
+        }
+    }
+}
+
 #[cfg(windows)]
 fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     let job = windows_job()?;
-    let application_path =
-        resolve_windows_executable(&bootstrap.command, &bootstrap.workdir, &bootstrap.env)?;
-    let application = wide(&application_path)?;
+    let plan = windows_spawn_plan(
+        &bootstrap.command,
+        &bootstrap.args,
+        &bootstrap.workdir,
+        &bootstrap.env,
+    )?;
+    let application = wide(&plan.application)?;
     let cwd = wide(&bootstrap.workdir)?;
     let environment = windows_environment(&bootstrap.env)?;
-    let mut command_line = wide(
-        &std::iter::once(application_path.as_str())
-            .chain(bootstrap.args.iter().map(String::as_str))
-            .map(quote_windows_arg)
-            .collect::<Vec<_>>()
-            .join(" "),
-    )?;
+    let mut command_line = wide(&plan.command_line)?;
     let (stdin, stdout, stderr, child_stdin, child_stdout, child_stderr, pty) =
         if bootstrap.mode == "pty" {
             let (console_input, parent_input) = pipe(true)?;
@@ -958,13 +1142,17 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         startup.StartupInfo.hStdInput = child_stdin.as_ref().expect("exec stdin").raw();
         startup.StartupInfo.hStdOutput = child_stdout.as_ref().expect("exec stdout").raw();
         startup.StartupInfo.hStdError = child_stderr.as_ref().expect("exec stderr").raw();
-    } else {
-        // STARTF_USESTDHANDLES with NULL slots prevents inherited worker pipes from becoming
-        // stdio; console attachment replaces NULL with this ConPTY's console handles.
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     }
+    // For the pty branch dwFlags stays 0: console attachment wires the child's stdio to the
+    // pseudoconsole, provided our own std handles are console handles during CreateProcessW
+    // (see PseudoConsoleStdioGuard).
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let flags = windows_creation_flags(attribute_list.is_some());
+    let flags = windows_creation_flags(attribute_list.is_some(), pty.is_some());
+    let stdio_guard = if pty.is_some() {
+        PseudoConsoleStdioGuard::engage()
+    } else {
+        None
+    };
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -979,6 +1167,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             &mut process,
         )
     };
+    drop(stdio_guard);
     drop(child_stdin);
     drop(child_stdout);
     drop(child_stderr);
@@ -1238,7 +1427,7 @@ fn write_spawn_failure(
             termination_confirmed,
             message: message.into(),
         })
-        .expect("spawn failure receipt serializes"),
+        .map_err(|error| format!("could not serialize spawn failure receipt: {error}"))?,
     )
     .map_err(|error| format!("could not persist spawn failure receipt: {error}"))
 }
@@ -1502,10 +1691,10 @@ fn containment_report_from_scan(
             .lock()
             .expect("escaped members lock");
         for pid in escaped {
-            let process = processes
-                .iter()
-                .find(|process| process.pid == pid)
-                .expect("descendant is scanned");
+            // A descendant absent from the scan already exited, which is containment success.
+            let Some(process) = processes.iter().find(|process| process.pid == pid) else {
+                continue;
+            };
             observed.insert(pid, process.identity());
         }
         let escaped = observed.keys().copied().collect::<Vec<_>>();
@@ -1746,17 +1935,10 @@ fn terminate_contained(worker: &Arc<Worker>, reason: &str) {
     }
 }
 
-fn mark_termination(worker: &Arc<Worker>, reason: &str) {
-    terminate_contained(worker, reason);
-}
-
 #[cfg(unix)]
 fn exit_signal(status: &ExitStatus) -> Option<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal().map(|signal| format!("SIG{signal}"))
-    }
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| format!("SIG{signal}"))
 }
 
 #[cfg(windows)]
@@ -1868,7 +2050,7 @@ fn observe_exit(worker: &Arc<Worker>) {
 }
 
 fn terminate_and_wait(worker: &Arc<Worker>, reason: &str) {
-    mark_termination(worker, reason);
+    terminate_contained(worker, reason);
     #[cfg(windows)]
     {
         let exit = worker
@@ -1921,7 +2103,7 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
         let _ = signal_direct_child(child, libc::SIGKILL);
         let _ = child.wait();
         let report = containment_report(&containment);
-        return SpawnCleanup {
+        SpawnCleanup {
             confirmed: containment_drained(&report),
             direct_child_pid: pid,
             message: if containment_drained(&report) {
@@ -1932,7 +2114,7 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
                     report.status
                 )
             },
-        };
+        }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -1943,15 +2125,6 @@ fn cleanup_unverified_spawn(child: &mut Child) -> SpawnCleanup {
             message: "spawn containment verification is unavailable; direct child was reaped but descendants are unknown".into(),
         }
     }
-}
-
-#[cfg(unix)]
-fn terminate_contained_child_and_wait(child: &mut Child, containment: &Containment) {
-    let _ = containment;
-    let _ = signal_direct_child(child, libc::SIGTERM);
-    thread::sleep(TERMINATION_GRACE);
-    let _ = signal_direct_child(child, libc::SIGKILL);
-    let _ = child.wait();
 }
 
 #[cfg(target_os = "linux")]
@@ -2101,6 +2274,30 @@ fn verify_containment(pid: u32) -> Result<Containment, String> {
 }
 
 #[cfg(windows)]
+fn windows_child_start_identity(child: &WindowsChild) -> Result<String, String> {
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    // The owned process handle pins this identity to the spawned child, never a PID lookup.
+    if unsafe {
+        GetProcessTimes(
+            child.process.raw(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    // Matches the daemon's PowerShell identity format: windows:{pid}:{StartTime.ToFileTimeUtc()}.
+    Ok(format!("windows:{}:{ticks}", child.id()))
+}
+
+#[cfg(windows)]
 fn verify_containment(child: &mut WindowsChild) -> Result<Containment, String> {
     if windows_job_empty(child.job.raw())? {
         // A fast child can legitimately leave its assigned Job before this first query.
@@ -2113,7 +2310,7 @@ fn verify_containment(child: &mut WindowsChild) -> Result<Containment, String> {
         root_pid: child.id(),
         process_group_id: None,
         session_id: None,
-        root_start_identity: format!("windows:{}:job", child.id()),
+        root_start_identity: windows_child_start_identity(child)?,
         job: child.job.raw() as usize,
         known_members: Mutex::new(BTreeMap::new()),
         escaped_members: Mutex::new(BTreeMap::new()),
@@ -2242,7 +2439,7 @@ fn append_output(worker: &Arc<Worker>, stdout: bool, data: String) {
         }
     }
     if let Some(reason) = terminate {
-        mark_termination(worker, reason);
+        terminate_contained(worker, reason);
     }
 }
 
@@ -2270,11 +2467,14 @@ fn mark_reader_failure(state: &mut State, stdout: bool, error: String, secrets: 
 }
 
 fn push_diagnostic(state: &mut State, message: String, secrets: &[String]) {
-    let limit = if cfg!(windows) && state.windows_pty_diagnostic.is_some() {
+    #[cfg(windows)]
+    let limit = if state.windows_pty_diagnostic.is_some() {
         3
     } else {
         4
     };
+    #[cfg(not(windows))]
+    let limit = 4;
     if state.diagnostics.len() < limit {
         state
             .diagnostics
@@ -2296,11 +2496,10 @@ fn update_reader_drain_state(state: &mut State) {
         && state
             .reader_drain_deadline
             .is_some_and(|deadline| SystemTime::now() >= deadline)
+        && !state.output_incomplete
     {
-        if !state.output_incomplete {
-            state.output_incomplete = true;
-            push_diagnostic(state, "reader drain deadline elapsed".into(), &[]);
-        }
+        state.output_incomplete = true;
+        push_diagnostic(state, "reader drain deadline elapsed".into(), &[]);
     }
 }
 
@@ -2327,23 +2526,21 @@ fn update_reader_drain(worker: &Arc<Worker>) {
             && state
                 .reader_cancel_deadline
                 .is_some_and(|deadline| SystemTime::now() >= deadline)
+            && !state.reader_cancel_requested
         {
-            if !state.reader_cancel_requested {
-                state.reader_cancel_requested = true;
-                cancel = true;
-            }
+            state.reader_cancel_requested = true;
+            cancel = true;
         }
         if state.reader_cancel_requested && state.terminal_reader_done && !output_complete(&state) {
             state.output_incomplete = true;
         }
         drop(state);
-        if cancel {
-            if let Some(reader_thread) =
+        if cancel
+            && let Some(reader_thread) =
                 &*worker.terminal_reader.lock().expect("terminal reader lock")
-            {
-                unsafe {
-                    CancelSynchronousIo(reader_thread.raw());
-                }
+        {
+            unsafe {
+                CancelSynchronousIo(reader_thread.raw());
             }
         }
     }
@@ -2352,6 +2549,51 @@ fn update_reader_drain(worker: &Arc<Worker>) {
 #[cfg(windows)]
 fn terminal_reader_finished(state: &State) -> bool {
     state.terminal_reader_done
+}
+
+#[cfg(not(windows))]
+fn terminal_reader_finished(_: &State) -> bool {
+    // Only Windows gates terminal shutdown on a dedicated ConPTY reader completion.
+    true
+}
+
+// Streaming reads can split a multi-byte UTF-8 sequence across chunk boundaries. Decode the
+// longest valid prefix, keep an incomplete trailing sequence (at most 3 bytes) as carry for the
+// next read, and replace invalid bytes without dropping the data that follows them.
+fn decode_utf8_stream(carry: &mut Vec<u8>, data: &[u8]) -> String {
+    carry.extend_from_slice(data);
+    let mut decoded = String::with_capacity(carry.len());
+    let mut consumed = 0;
+    loop {
+        match std::str::from_utf8(&carry[consumed..]) {
+            Ok(valid) => {
+                decoded.push_str(valid);
+                consumed = carry.len();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                decoded.push_str(
+                    std::str::from_utf8(&carry[consumed..consumed + valid_up_to])
+                        .expect("validated UTF-8 prefix"),
+                );
+                consumed += valid_up_to;
+                match error.error_len() {
+                    Some(invalid) => {
+                        decoded.push(char::REPLACEMENT_CHARACTER);
+                        consumed += invalid;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    carry.drain(..consumed);
+    decoded
+}
+
+fn flush_utf8_carry(carry: &mut Vec<u8>) -> String {
+    String::from_utf8_lossy(&std::mem::take(carry)).into_owned()
 }
 
 #[cfg(windows)]
@@ -2365,6 +2607,7 @@ fn mark_terminal_reader_event(state: &mut State) {
 fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: bool) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
+        let mut carry = Vec::new();
         let mut tail = String::new();
         loop {
             match pipe.read(&mut buffer) {
@@ -2372,7 +2615,12 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
                     append_output(
                         &worker,
                         stdout,
-                        redact_stream(String::new(), &mut tail, &worker.secrets, true),
+                        redact_stream(
+                            flush_utf8_carry(&mut carry),
+                            &mut tail,
+                            &worker.secrets,
+                            true,
+                        ),
                     );
                     mark_reader_eof(&worker, stdout);
                     return;
@@ -2381,7 +2629,12 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
                     append_output(
                         &worker,
                         stdout,
-                        redact_stream(String::new(), &mut tail, &worker.secrets, true),
+                        redact_stream(
+                            flush_utf8_carry(&mut carry),
+                            &mut tail,
+                            &worker.secrets,
+                            true,
+                        ),
                     );
                     if (worker.mode == "pty" && error.raw_os_error() == Some(libc::EIO))
                         || (cfg!(windows) && error.raw_os_error() == Some(109))
@@ -2397,7 +2650,7 @@ fn reader(worker: Arc<Worker>, mut pipe: impl Read + Send + 'static, stdout: boo
                     &worker,
                     stdout,
                     redact_stream(
-                        String::from_utf8_lossy(&buffer[..size]).into_owned(),
+                        decode_utf8_stream(&mut carry, &buffer[..size]),
                         &mut tail,
                         &worker.secrets,
                         false,
@@ -2428,6 +2681,7 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                 WinHandle::new(reader_thread).ok();
         }
         let mut buffer = [0_u8; 8192];
+        let mut carry = Vec::new();
         let mut tail = String::new();
         loop {
             match output.read(&mut buffer) {
@@ -2435,7 +2689,12 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                     append_output(
                         &worker,
                         true,
-                        redact_stream(String::new(), &mut tail, &worker.secrets, true),
+                        redact_stream(
+                            flush_utf8_carry(&mut carry),
+                            &mut tail,
+                            &worker.secrets,
+                            true,
+                        ),
                     );
                     mark_reader_eof(&worker, true);
                     let mut state = worker.state.lock().expect("state lock");
@@ -2452,7 +2711,12 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                     append_output(
                         &worker,
                         true,
-                        redact_stream(String::new(), &mut tail, &worker.secrets, true),
+                        redact_stream(
+                            flush_utf8_carry(&mut carry),
+                            &mut tail,
+                            &worker.secrets,
+                            true,
+                        ),
                     );
                     if error.raw_os_error() == Some(109) {
                         mark_reader_eof(&worker, true);
@@ -2480,7 +2744,7 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
                         &worker,
                         true,
                         redact_stream(
-                            String::from_utf8_lossy(&buffer[..size]).into_owned(),
+                            decode_utf8_stream(&mut carry, &buffer[..size]),
                             &mut tail,
                             &worker.secrets,
                             false,
@@ -2501,7 +2765,18 @@ fn terminal_reader_windows(worker: Arc<Worker>, mut output: WinHandle) {
 }
 
 #[cfg(unix)]
-fn append_terminal_output(worker: &Arc<Worker>, data: String, finish: bool) {
+fn append_terminal_output(worker: &Arc<Worker>, data: &[u8], finish: bool) {
+    let decoded = {
+        let mut carry = worker
+            .terminal_utf8_carry
+            .lock()
+            .expect("terminal utf8 carry lock");
+        let mut decoded = decode_utf8_stream(&mut carry, data);
+        if finish {
+            decoded.push_str(&flush_utf8_carry(&mut carry));
+        }
+        decoded
+    };
     let mut tail = worker
         .terminal_redaction_tail
         .lock()
@@ -2509,13 +2784,13 @@ fn append_terminal_output(worker: &Arc<Worker>, data: String, finish: bool) {
     append_output(
         worker,
         true,
-        redact_stream(data, &mut tail, &worker.secrets, finish),
+        redact_stream(decoded, &mut tail, &worker.secrets, finish),
     );
 }
 
 #[cfg(unix)]
 fn flush_terminal_redaction_tail(worker: &Arc<Worker>) {
-    append_terminal_output(worker, String::new(), true);
+    append_terminal_output(worker, &[], true);
 }
 
 #[cfg(unix)]
@@ -2534,13 +2809,13 @@ fn terminal_reader(worker: Arc<Worker>, mut terminal: File) {
             }
             match terminal.read(&mut buffer) {
                 Ok(0) => {
-                    append_terminal_output(&worker, String::new(), true);
+                    append_terminal_output(&worker, &[], true);
                     mark_reader_eof(&worker, true);
                     return;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => {
-                    append_terminal_output(&worker, String::new(), true);
+                    append_terminal_output(&worker, &[], true);
                     if error.raw_os_error() == Some(libc::EIO) {
                         mark_reader_eof(&worker, true);
                     } else {
@@ -2549,11 +2824,7 @@ fn terminal_reader(worker: Arc<Worker>, mut terminal: File) {
                     }
                     return;
                 }
-                Ok(size) => append_terminal_output(
-                    &worker,
-                    String::from_utf8_lossy(&buffer[..size]).into_owned(),
-                    false,
-                ),
+                Ok(size) => append_terminal_output(&worker, &buffer[..size], false),
             }
             drop(arrival);
             thread::sleep(Duration::from_millis(1));
@@ -2566,18 +2837,15 @@ fn drain_terminal(worker: &Arc<Worker>, terminal: &mut File) {
     let mut buffer = [0_u8; 8192];
     loop {
         match terminal.read(&mut buffer) {
-            Ok(0) | Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Ok(0) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
             Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
             Err(error) => {
                 let mut state = worker.state.lock().expect("state lock");
                 mark_reader_failure(&mut state, true, error.to_string(), &worker.secrets);
                 return;
             }
-            Ok(size) => append_terminal_output(
-                worker,
-                String::from_utf8_lossy(&buffer[..size]).into_owned(),
-                false,
-            ),
+            Ok(size) => append_terminal_output(worker, &buffer[..size], false),
         }
     }
 }
@@ -2602,7 +2870,7 @@ fn monitor(worker: Arc<Worker>) {
                 .deadline
                 .is_some_and(|deadline| SystemTime::now() >= deadline)
             {
-                mark_termination(&worker, "timeout");
+                terminate_contained(&worker, "timeout");
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -2623,6 +2891,7 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
         .cloned()
         .collect::<Vec<_>>()
         .join("; ");
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut diagnostics = state.diagnostics.clone();
     #[cfg(windows)]
     if let Some(mut diagnostic) = state.windows_pty_diagnostic.clone() {
@@ -2689,14 +2958,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_child_creation_hides_exec_and_conpty_processes() {
+    fn windows_child_creation_hides_exec_and_frees_conpty_console_choice() {
         assert_eq!(
-            windows_creation_flags(false),
+            windows_creation_flags(false, false),
             CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
         );
         assert_ne!(
-            windows_creation_flags(true) & EXTENDED_STARTUPINFO_PRESENT,
+            windows_creation_flags(true, false) & EXTENDED_STARTUPINFO_PRESENT,
             0
+        );
+        // Pty children must not carry CREATE_NO_WINDOW: it overrides pseudoconsole
+        // attachment with a fresh hidden console and the ConPTY stays silent.
+        assert_eq!(
+            windows_creation_flags(true, true),
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT
         );
     }
 
@@ -2764,6 +3039,21 @@ mod tests {
             redact_stream(String::new(), &mut tail, &["tail-secret".into()], true),
             "[REDACTED]"
         );
+    }
+
+    #[test]
+    fn utf8_decoder_reassembles_sequences_split_across_reads() {
+        let mut carry = Vec::new();
+        let emoji = "\u{1f980}".as_bytes();
+        assert_eq!(decode_utf8_stream(&mut carry, &emoji[..2]), "");
+        assert_eq!(carry, &emoji[..2]);
+        assert_eq!(decode_utf8_stream(&mut carry, &emoji[2..]), "\u{1f980}");
+        assert!(carry.is_empty());
+        assert_eq!(decode_utf8_stream(&mut carry, b"a\xffb"), "a\u{fffd}b");
+        assert!(carry.is_empty());
+        assert_eq!(decode_utf8_stream(&mut carry, &emoji[..3]), "");
+        assert_eq!(flush_utf8_carry(&mut carry), "\u{fffd}");
+        assert!(carry.is_empty());
     }
 
     #[cfg(windows)]
@@ -2849,26 +3139,117 @@ mod tests {
         create_dir_all(&bin).expect("create fixture directory");
         let node = bin.join("node.exe");
         let cmd = bin.join("cmd.exe");
+        let npm = bin.join("npm.cmd");
         File::create(&node).expect("create node fixture");
         File::create(&cmd).expect("create cmd fixture");
+        File::create(&npm).expect("create npm fixture");
+        let comspec = cmd.to_string_lossy().into_owned();
         let env = BTreeMap::from([
             ("Path".into(), bin.to_string_lossy().into_owned()),
             ("PATHEXT".into(), ".CMD;.EXE".into()),
+            ("ComSpec".into(), comspec.clone()),
         ]);
+        let workdir = root.to_str().expect("Unicode temp path");
         assert_eq!(
-            resolve_windows_executable("node", root.to_str().expect("Unicode temp path"), &env)
-                .expect("resolve bare node"),
+            resolve_windows_executable("node", workdir, &env).expect("resolve bare node"),
             std::fs::canonicalize(&node)
                 .expect("canonical node fixture")
                 .to_string_lossy()
         );
         assert_eq!(
-            resolve_windows_executable("cmd.exe", root.to_str().expect("Unicode temp path"), &env)
-                .expect("resolve cmd.exe"),
+            resolve_windows_executable("cmd.exe", workdir, &env).expect("resolve cmd.exe"),
             std::fs::canonicalize(&cmd)
                 .expect("canonical cmd fixture")
                 .to_string_lossy()
         );
+        let resolved_npm =
+            resolve_windows_executable("npm", workdir, &env).expect("resolve bare npm via PATHEXT");
+        assert_eq!(
+            resolved_npm,
+            std::fs::canonicalize(&npm)
+                .expect("canonical npm fixture")
+                .to_string_lossy()
+        );
+        let plan = windows_spawn_plan("npm", &["install".into(), "left pad".into()], workdir, &env)
+            .expect("plan npm shim spawn");
+        assert_eq!(plan.application, comspec);
+        let script = windows_batch_script_path(&resolved_npm);
+        assert!(!script.starts_with(r"\\?\"));
+        assert!(!plan.command_line.contains(r"\\?\"));
+        assert_eq!(
+            plan.command_line,
+            format!(
+                "{} /d /c \"{} install \"left pad\"\"",
+                quote_windows_arg(&comspec),
+                quote_windows_arg(&script)
+            )
+        );
+        let direct = windows_spawn_plan("node", &[], workdir, &env).expect("plan node spawn");
+        assert_eq!(
+            direct.application,
+            std::fs::canonicalize(&node)
+                .expect("canonical node fixture")
+                .to_string_lossy()
+        );
+        assert_eq!(direct.command_line, quote_windows_arg(&direct.application));
+        remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_runs_cmd_shims_through_the_command_interpreter() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-pty-worker-shim-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        create_dir_all(&bin).expect("create fixture directory");
+        std::fs::write(bin.join("shim.cmd"), "@echo shim-ran %1\r\n").expect("write shim fixture");
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let bootstrap = Bootstrap {
+            command: "shim".into(),
+            args: vec!["hello".into()],
+            workdir: root.to_string_lossy().into_owned(),
+            env: BTreeMap::from([
+                ("Path".into(), bin.to_string_lossy().into_owned()),
+                ("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()),
+                ("ComSpec".into(), format!("{system_root}\\System32\\cmd.exe")),
+                ("SystemRoot".into(), system_root),
+            ]),
+            redaction_secrets: Vec::new(),
+            session_directory: String::new(),
+            worker_control_token: String::new(),
+            worker_id: String::new(),
+            timeout_seconds: None,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            mode: "exec".into(),
+            cols: None,
+            rows: None,
+            fault: None,
+        };
+        let mut child = windows_spawn(&bootstrap).expect("spawn cmd shim");
+        drop(child.stdin.take());
+        let mut stdout = child.stdout.take().expect("shim stdout");
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => output.extend_from_slice(&buffer[..size]),
+                Err(error) if error.raw_os_error() == Some(109) => break,
+                Err(error) => panic!("read shim output: {error}"),
+            }
+        }
+        let exit = child
+            .wait_for(Duration::from_secs(10))
+            .expect("wait for shim")
+            .expect("shim exit");
+        assert_eq!(exit.code(), Some(0));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("shim-ran hello"), "output: {output:?}");
         remove_dir_all(root).expect("remove fixture directory");
     }
 
@@ -2889,16 +3270,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reader_error_keeps_monitoring_a_live_child_until_timeout() {
-        #[cfg(unix)]
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .expect("start child");
-        #[cfg(windows)]
-        let child = Command::new("cmd")
-            .args(["/C", "ping -n 31 127.0.0.1 > NUL"])
-            .spawn()
-            .expect("start child");
+        // A single-process child: POSIX termination signals the direct child only, so an
+        // `sh -c` wrapper would orphan its grandchild and confirmation would honestly fail.
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        // Containment verification requires the production session-leader setup.
+        contain_child(&mut command);
+        let child = command.spawn().expect("start child");
+        let containment = verify_containment(child.id()).expect("verify containment");
         let output_directory = std::env::temp_dir().join(format!(
             "opencode-pty-worker-test-{}",
             SystemTime::now()
@@ -2909,13 +3288,10 @@ mod tests {
         create_dir_all(&output_directory).expect("create output directory");
         let worker = Arc::new(Worker {
             child: Mutex::new(child),
-            #[cfg(unix)]
             terminal: None,
-            #[cfg(unix)]
             arrival: Mutex::new(()),
-            #[cfg(unix)]
             terminal_redaction_tail: Mutex::new(String::new()),
-            #[cfg(unix)]
+            terminal_utf8_carry: Mutex::new(Vec::new()),
             pause_terminal_reader_until_write: AtomicBool::new(false),
             state: Mutex::new(State {
                 started_at: now(),
@@ -2925,14 +3301,7 @@ mod tests {
             output_directory: output_directory.clone(),
             max_output_bytes: MAX_OUTPUT_BYTES,
             deadline: Some(SystemTime::now() - Duration::from_millis(1)),
-            containment: Containment {
-                root_pid: 0,
-                process_group_id: None,
-                session_id: None,
-                root_start_identity: "test".into(),
-                known_members: Mutex::new(BTreeMap::new()),
-                escaped_members: Mutex::new(BTreeMap::new()),
-            },
+            containment,
             mode: "exec".into(),
         });
         reader(worker.clone(), FailingReader, true);
@@ -2967,9 +3336,9 @@ mod tests {
         );
         monitor(worker.clone());
         let result = wait_for_final_snapshot(&worker, false);
-        assert_eq!(result["status"], "lost");
-        assert_eq!(result["timedOut"], true);
-        assert_eq!(result["terminationConfirmed"], true);
+        assert_eq!(result["status"], "lost", "snapshot: {result}");
+        assert_eq!(result["timedOut"], true, "snapshot: {result}");
+        assert_eq!(result["terminationConfirmed"], true, "snapshot: {result}");
         remove_dir_all(output_directory).ok();
     }
 
@@ -3123,10 +3492,19 @@ mod tests {
 }
 
 fn wait_for_final_snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
+    let deadline = SystemTime::now() + Duration::from_secs(10);
     loop {
         let result = snapshot(worker, include_exec_output);
         if result["status"] != "running" {
             return result;
+        }
+        if SystemTime::now() >= deadline {
+            push_diagnostic(
+                &mut worker.state.lock().expect("state lock"),
+                "final snapshot wait timed out".into(),
+                &worker.secrets,
+            );
+            return snapshot(worker, include_exec_output);
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -3143,7 +3521,7 @@ fn handle(worker: &Arc<Worker>, request: Value) -> Result<(Value, bool), WorkerE
     match operation {
         "health" => Ok((
             json!({
-                "protocolVersion": 5,
+                "protocolVersion": PROTOCOL_VERSION,
                 "pid": std::process::id(),
                 "processIdentity": process_identity().map_err(|message| WorkerError {
                     code: "process",
@@ -3528,7 +3906,7 @@ fn main() -> Result<(), String> {
             listener.local_addr().map_err(|error| error.to_string())?
         ),
         token: bootstrap.worker_control_token.clone(),
-        protocol_version: 5,
+        protocol_version: PROTOCOL_VERSION,
     };
     write_atomic(
         &descriptor_path,
@@ -3703,14 +4081,7 @@ fn main() -> Result<(), String> {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                #[cfg(unix)]
                 let cleanup = cleanup_unverified_spawn(&mut child);
-                #[cfg(windows)]
-                {
-                    let _ = child.terminate_job();
-                    let _ = child.wait();
-                }
-                #[cfg(unix)]
                 write_spawn_failure(
                     &session_directory,
                     &bootstrap,
@@ -3719,16 +4090,6 @@ fn main() -> Result<(), String> {
                     Some(cleanup.direct_child_pid),
                     cleanup.confirmed,
                     &cleanup.message,
-                )?;
-                #[cfg(windows)]
-                write_spawn_failure(
-                    &session_directory,
-                    &bootstrap,
-                    &descriptor,
-                    true,
-                    Some(child.id()),
-                    true,
-                    "missing stdout",
                 )?;
                 let _ = remove_file(&descriptor_path);
                 return Err("missing stdout".into());
@@ -3737,14 +4098,7 @@ fn main() -> Result<(), String> {
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                #[cfg(unix)]
                 let cleanup = cleanup_unverified_spawn(&mut child);
-                #[cfg(windows)]
-                {
-                    let _ = child.terminate_job();
-                    let _ = child.wait();
-                }
-                #[cfg(unix)]
                 write_spawn_failure(
                     &session_directory,
                     &bootstrap,
@@ -3753,16 +4107,6 @@ fn main() -> Result<(), String> {
                     Some(cleanup.direct_child_pid),
                     cleanup.confirmed,
                     &cleanup.message,
-                )?;
-                #[cfg(windows)]
-                write_spawn_failure(
-                    &session_directory,
-                    &bootstrap,
-                    &descriptor,
-                    true,
-                    Some(child.id()),
-                    true,
-                    "missing stderr",
                 )?;
                 let _ = remove_file(&descriptor_path);
                 return Err("missing stderr".into());
@@ -3789,6 +4133,8 @@ fn main() -> Result<(), String> {
         #[cfg(unix)]
         terminal_redaction_tail: Mutex::new(String::new()),
         #[cfg(unix)]
+        terminal_utf8_carry: Mutex::new(Vec::new()),
+        #[cfg(unix)]
         pause_terminal_reader_until_write: AtomicBool::new(
             bootstrap.fault.as_deref() == Some("pause_terminal_reader_until_write"),
         ),
@@ -3800,8 +4146,9 @@ fn main() -> Result<(), String> {
         }),
         secrets: bootstrap
             .redaction_secrets
-            .into_iter()
+            .iter()
             .filter(|secret| secret.len() >= 4)
+            .cloned()
             .collect(),
         output_directory,
         max_output_bytes: bootstrap.max_output_bytes.min(MAX_OUTPUT_BYTES),
@@ -3818,14 +4165,11 @@ fn main() -> Result<(), String> {
     if bootstrap.mode == "pty" {
         #[cfg(unix)]
         {
-            let terminal = match worker
-                .terminal
-                .as_ref()
-                .expect("PTY terminal")
-                .lock()
-                .expect("terminal lock")
-                .try_clone()
-            {
+            let terminal = match worker.terminal.as_ref() {
+                Some(terminal) => terminal.lock().expect("terminal lock").try_clone(),
+                None => Err(std::io::Error::other("PTY terminal is unavailable")),
+            };
+            let terminal = match terminal {
                 Ok(terminal) => terminal,
                 Err(error) => {
                     let mut child = worker.child.lock().expect("child lock");
@@ -3848,28 +4192,57 @@ fn main() -> Result<(), String> {
         }
         #[cfg(windows)]
         {
-            let mut child = worker.child.lock().expect("child lock");
-            let pty = child.pty.as_mut().expect("Windows PTY");
-            let output = pty.output.take().expect("Windows PTY output");
-            worker
-                .state
+            let output = worker
+                .child
                 .lock()
-                .expect("state lock")
-                .terminal_reader_active = true;
-            worker
-                .state
-                .lock()
-                .expect("state lock")
-                .windows_pty_diagnostic
+                .expect("child lock")
+                .pty
                 .as_mut()
-                .expect("Windows PTY diagnostic")
-                .reader_started = true;
-            terminal_reader_windows(worker.clone(), output);
+                .and_then(|pty| pty.output.take());
+            match output {
+                Some(output) => {
+                    {
+                        let mut state = worker.state.lock().expect("state lock");
+                        state.terminal_reader_active = true;
+                        if let Some(diagnostic) = &mut state.windows_pty_diagnostic {
+                            diagnostic.reader_started = true;
+                        }
+                    }
+                    terminal_reader_windows(worker.clone(), output);
+                }
+                None => {
+                    // No reader can ever run; report the loss instead of aborting the worker.
+                    let mut state = worker.state.lock().expect("state lock");
+                    state.terminal_reader_done = true;
+                    mark_reader_failure(
+                        &mut state,
+                        true,
+                        "Windows PTY output is unavailable".into(),
+                        &worker.secrets,
+                    );
+                }
+            }
             mark_reader_eof(&worker, false);
         }
     } else {
-        reader(worker.clone(), stdout.expect("exec stdout"), true);
-        reader(worker.clone(), stderr.expect("exec stderr"), false);
+        match stdout {
+            Some(stdout) => reader(worker.clone(), stdout, true),
+            None => mark_reader_failure(
+                &mut worker.state.lock().expect("state lock"),
+                true,
+                "exec stdout pipe is unavailable".into(),
+                &worker.secrets,
+            ),
+        }
+        match stderr {
+            Some(stderr) => reader(worker.clone(), stderr, false),
+            None => mark_reader_failure(
+                &mut worker.state.lock().expect("state lock"),
+                false,
+                "exec stderr pipe is unavailable".into(),
+                &worker.secrets,
+            ),
+        }
     }
     monitor(worker.clone());
     let shutdown = Arc::new(AtomicBool::new(false));
