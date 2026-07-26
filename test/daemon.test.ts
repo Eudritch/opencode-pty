@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterAll, afterEach, expect, test } from 'bun:test'
 import { existsSync, realpathSync, watch } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -41,6 +41,7 @@ import { createSpawnAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { createBashAuthorizer } from '../src/plugin/pty/permissions.ts'
 import { match } from '../src/plugin/pty/wildcard.ts'
 import {
+  bashApprovalCapability,
   bashArgv,
   bashTimeout,
   createBash,
@@ -78,6 +79,28 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
+afterAll(() => {
+  // Regression tripwire: an unguarded `process.env.PTY_DAEMON_DIR = <saved undefined>`
+  // coerces to the literal string "undefined" and creates an `undefined/` directory.
+  expect(process.env.PTY_DAEMON_DIR).not.toBe('undefined')
+})
+
+async function withProcessEnv<T>(
+  values: Record<string, string>,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = new Map(Object.keys(values).map((key) => [key, process.env[key]] as const))
+  for (const [key, value] of Object.entries(values)) process.env[key] = value
+  try {
+    return await run()
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
 test('runtime environment keeps a single trusted PATH despite caller overrides', () => {
   const environment = runtimeEnvironment(
     { PATH: '.', Path: 'also-malicious', CUSTOM: 'preserved' },
@@ -106,6 +129,8 @@ test('safe Windows environment retains credential locations but excludes secrets
       ComSpec: 'C:\\Windows\\System32\\cmd.exe',
       TEMP: 'C:\\Temp',
       ProgramData: 'C:\\ProgramData',
+      ALLUSERSPROFILE: 'C:\\ProgramData',
+      PUBLIC: 'C:\\Users\\Public',
       Path: 'trusted-path',
       PATHEXT: '.EXE;.CMD',
       GH_TOKEN: 'secret',
@@ -122,6 +147,10 @@ test('safe Windows environment retains credential locations but excludes secrets
     SystemDrive: 'C:',
     ComSpec: 'C:\\Windows\\System32\\cmd.exe',
     TEMP: 'C:\\Temp',
+    ProgramData: 'C:\\ProgramData',
+    ALLUSERSPROFILE: 'C:\\ProgramData',
+    PUBLIC: 'C:\\Users\\Public',
+    PATHEXT: '.EXE;.CMD',
     PATH: 'trusted-path',
   })
 })
@@ -244,63 +273,67 @@ async function rpc(
   })
 }
 
-test('daemon authenticates RPC and retains PTY output', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
-  const descriptor = await server.start()
-  const context = await owner(storage, 'test-session', root)
-  const rpc = async (operation: string, payload?: unknown, token = 'test-token') =>
-    fetch(`${descriptor.endpoint}/rpc`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: crypto.randomUUID(),
-        version: DAEMON_PROTOCOL_VERSION,
-        operation,
-        owner: context,
-        payload,
-      }),
-    })
+test.skipIf(process.platform === 'win32')(
+  'daemon authenticates RPC and retains PTY output',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-'))
+    roots.push(root)
+    const storage = new DaemonStorage(root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+    const descriptor = await server.start()
+    const context = await owner(storage, 'test-session', root)
+    const rpc = async (operation: string, payload?: unknown, token = 'test-token') =>
+      fetch(`${descriptor.endpoint}/rpc`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          id: crypto.randomUUID(),
+          version: DAEMON_PROTOCOL_VERSION,
+          operation,
+          owner: context,
+          payload,
+        }),
+      })
 
-  try {
-    expect((await rpc('health', undefined, 'wrong-token')).status).toBe(401)
-    expect((await rpc('health', undefined, 'test-token')).status).toBe(200)
-    const mismatch = await fetch(`${descriptor.endpoint}/rpc`, {
-      method: 'POST',
-      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'mismatch', version: 99, operation: 'health' }),
-    })
-    expect(mismatch.status).toBe(400)
-    const spawned = await rpc('spawn', {
-      command: process.execPath,
-      args: ['-e', "console.log('durable output')"],
-      description: 'test daemon output',
-      parentSessionId: 'test-session',
-    })
-    const session = ((await spawned.json()) as { result: { id: string } }).result
+    try {
+      expect((await rpc('health', undefined, 'wrong-token')).status).toBe(401)
+      expect((await rpc('health', undefined, 'test-token')).status).toBe(200)
+      const mismatch = await fetch(`${descriptor.endpoint}/rpc`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ id: 'mismatch', version: 99, operation: 'health' }),
+      })
+      expect(mismatch.status).toBe(400)
+      const spawned = await rpc('spawn', {
+        command: process.execPath,
+        args: ['-e', "console.log('durable output')"],
+        description: 'test daemon output',
+        parentSessionId: 'test-session',
+        workdir: root,
+      })
+      const session = ((await spawned.json()) as { result: { id: string } }).result
 
-    let output = ''
-    let exited = false
-    for (
-      let attempt = 0;
-      attempt < 40 && (!output.includes('durable output') || !exited);
-      attempt += 1
-    ) {
-      await Bun.sleep(25)
-      const response = await rpc('rawOutput', { id: session.id })
-      output = ((await response.json()) as { result: { raw: string } }).result.raw
-      const details = await rpc('get', { id: session.id })
-      exited = ((await details.json()) as { result: { status: string } }).result.status === 'exited'
+      let output = ''
+      let exited = false
+      for (
+        let attempt = 0;
+        attempt < 40 && (!output.includes('durable output') || !exited);
+        attempt += 1
+      ) {
+        await Bun.sleep(25)
+        const response = await rpc('rawOutput', { id: session.id })
+        output = ((await response.json()) as { result: { raw: string } }).result.raw
+        const details = await rpc('get', { id: session.id })
+        exited =
+          ((await details.json()) as { result: { status: string } }).result.status === 'exited'
+      }
+      expect(output).toContain('durable output')
+      expect(exited).toBeTrue()
+    } finally {
+      await server.stop()
     }
-    expect(output).toContain('durable output')
-    expect(exited).toBeTrue()
-  } finally {
-    await server.stop()
   }
-})
+)
 
 test('daemon validates RPC fields and uses literal searches', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-validation-'))
@@ -328,51 +361,59 @@ test('daemon validates RPC fields and uses literal searches', async () => {
   }
 })
 
-test('daemon denies other owners and reports bounded diagnostics', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
-  const descriptor = await server.start()
-  const one = await owner(storage, 'one', root)
-  const two = await owner(storage, 'two', root)
-  const rpc = async (operation: string, payload: unknown, context = one) =>
-    fetch(`${descriptor.endpoint}/rpc`, {
-      method: 'POST',
-      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: crypto.randomUUID(),
-        version: DAEMON_PROTOCOL_VERSION,
-        operation,
-        owner: context,
-        payload,
-      }),
-    })
-  try {
-    const spawned = await rpc('spawn', {
-      command: process.execPath,
-      args: ['-e', 'setTimeout(() => {}, 5000)'],
-      description: 'owner isolation test',
-      parentSessionId: 'forged',
-    })
-    const id = ((await spawned.json()) as { result: { id: string } }).result.id
-    const denied = await rpc('read', { id }, two)
-    expect(((await denied.json()) as { error: { code: string } }).error.code).toBe('authorization')
-    const invalidCapability = await rpc('list', {}, { ...one, capability: 'x'.repeat(64) })
-    expect(((await invalidCapability.json()) as { error: { code: string } }).error.code).toBe(
-      'authorization'
-    )
-    const diagnostics = (await (await rpc('diagnostics', {})).json()) as {
-      result: { limits: { maxSessionsPerOwner: number }; platform: { nativeContainment: boolean } }
+test.skipIf(process.platform === 'win32')(
+  'daemon denies other owners and reports bounded diagnostics',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-'))
+    roots.push(root)
+    const storage = new DaemonStorage(root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+    const descriptor = await server.start()
+    const one = await owner(storage, 'one', root)
+    const two = await owner(storage, 'two', root)
+    const rpc = async (operation: string, payload: unknown, context = one) =>
+      fetch(`${descriptor.endpoint}/rpc`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          id: crypto.randomUUID(),
+          version: DAEMON_PROTOCOL_VERSION,
+          operation,
+          owner: context,
+          payload,
+        }),
+      })
+    try {
+      const spawned = await rpc('spawn', {
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => {}, 5000)'],
+        description: 'owner isolation test',
+        parentSessionId: 'forged',
+        workdir: root,
+      })
+      const id = ((await spawned.json()) as { result: { id: string } }).result.id
+      const denied = await rpc('read', { id }, two)
+      expect(((await denied.json()) as { error: { code: string } }).error.code).toBe(
+        'authorization'
+      )
+      const invalidCapability = await rpc('list', {}, { ...one, capability: 'x'.repeat(64) })
+      expect(((await invalidCapability.json()) as { error: { code: string } }).error.code).toBe(
+        'authorization'
+      )
+      const diagnostics = (await (await rpc('diagnostics', {})).json()) as {
+        result: {
+          limits: { maxSessionsPerOwner: number }
+          platform: { nativeContainment: boolean }
+        }
+      }
+      expect(diagnostics.result.limits.maxSessionsPerOwner).toBe(32)
+      expect(diagnostics.result.platform.nativeContainment).toBeTrue()
+      await rpc('stop', { id })
+    } finally {
+      await server.stop()
     }
-    expect(diagnostics.result.limits.maxSessionsPerOwner).toBe(32)
-    expect(diagnostics.result.platform.nativeContainment).toBeTrue()
-    await rpc('stop', { id })
-  } finally {
-    await server.stop()
   }
-})
+)
 
 test('daemon persists owner-bound approval decisions and cleanup', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-approval-'))
@@ -895,164 +936,185 @@ test('approval ledger discards legacy session grants without expiry', async () =
   }
 })
 
-test('a new client retains owned output, list, and cleanup access after daemon restart', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-restart-'))
-  roots.push(root)
-  const previousDirectory = process.env.PTY_DAEMON_DIR
-  process.env.PTY_DAEMON_DIR = root
-  const storage = new DaemonStorage(root)
-  const first = new DaemonServer(storage, new SessionSupervisor(storage), 'first-token')
-  await first.start()
-  const context = ownerContext('same-parent', root)
-  let restarted: DaemonServer | undefined
-  try {
-    const client = new DaemonClient()
-    const session = await client.spawn(
-      {
-        command: process.execPath,
-        args: ['-e', "console.log('retained')"],
-        parentSessionId: 'same-parent',
-      },
-      context
-    )
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const output = (await client.getRawBuffer(session.id, context))?.raw
-      const status = (await client.get(session.id, context))?.status
-      if (output?.includes('retained') && status === 'exited') break
-      await Bun.sleep(25)
+test.skipIf(process.platform === 'win32')(
+  'a new client retains owned output, list, and cleanup access after daemon restart',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-restart-'))
+    roots.push(root)
+    const previousDirectory = process.env.PTY_DAEMON_DIR
+    process.env.PTY_DAEMON_DIR = root
+    const storage = new DaemonStorage(root)
+    const first = new DaemonServer(storage, new SessionSupervisor(storage), 'first-token')
+    await first.start()
+    const context = ownerContext('same-parent', root)
+    let restarted: DaemonServer | undefined
+    try {
+      const client = new DaemonClient()
+      const session = await client.spawn(
+        {
+          command: process.execPath,
+          args: ['-e', "console.log('retained')"],
+          parentSessionId: 'same-parent',
+          workdir: root,
+        },
+        context
+      )
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const output = (await client.getRawBuffer(session.id, context))?.raw
+        const status = (await client.get(session.id, context))?.status
+        if (output?.includes('retained') && status === 'exited') break
+        await Bun.sleep(25)
+      }
+      await first.stop()
+
+      restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'second-token')
+      await restarted.start()
+      const recreated = new DaemonClient()
+      expect((await recreated.list(context)).map((item) => item.id)).toContain(session.id)
+      expect((await recreated.getRawBuffer(session.id, context))?.raw).toContain('retained')
+      expect(await recreated.cleanup(session.id, context)).toBeTrue()
+      await restarted.stop()
+    } finally {
+      await first.stop().catch(() => undefined)
+      await restarted?.stop().catch(() => undefined)
+      if (previousDirectory === undefined) delete process.env.PTY_DAEMON_DIR
+      else process.env.PTY_DAEMON_DIR = previousDirectory
     }
-    await first.stop()
-
-    restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'second-token')
-    await restarted.start()
-    const recreated = new DaemonClient()
-    expect((await recreated.list(context)).map((item) => item.id)).toContain(session.id)
-    expect((await recreated.getRawBuffer(session.id, context))?.raw).toContain('retained')
-    expect(await recreated.cleanup(session.id, context)).toBeTrue()
-    await restarted.stop()
-  } finally {
-    await first.stop().catch(() => undefined)
-    await restarted?.stop().catch(() => undefined)
-    process.env.PTY_DAEMON_DIR = previousDirectory
   }
-})
+)
 
-test('server canonicalizes project owners and limits only active PTY and exec sessions', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-path-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token', 1)
-  const descriptor = await server.start()
-  const canonical = await owner(storage, 'parent', root)
-  const alias = { ...canonical, projectDirectory: join(root, '.') }
-  try {
-    const pty = await rpc(
-      descriptor,
-      'spawn',
-      {
-        command: process.execPath,
-        args: ['-e', 'setTimeout(() => {}, 5000)'],
-        workdir: join(root, '.'),
-      },
-      alias
+test.skipIf(process.platform === 'win32')(
+  'server canonicalizes project owners and limits only active PTY and exec sessions',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-path-'))
+    roots.push(root)
+    const storage = new DaemonStorage(root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token', 1)
+    const descriptor = await server.start()
+    const canonical = await owner(storage, 'parent', root)
+    const alias = { ...canonical, projectDirectory: join(root, '.') }
+    try {
+      const pty = await rpc(
+        descriptor,
+        'spawn',
+        {
+          command: process.execPath,
+          args: ['-e', 'setTimeout(() => {}, 5000)'],
+          workdir: join(root, '.'),
+        },
+        alias
+      )
+      const ptyId = ((await pty.json()) as { result: { id: string } }).result.id
+      expect(
+        (
+          (await (
+            await rpc(
+              descriptor,
+              'exec',
+              {
+                command: process.execPath,
+                args: ['-e', 'process.exit()'],
+                timeoutSeconds: 1,
+                workdir: root,
+              },
+              canonical
+            )
+          ).json()) as { error: { code: string } }
+        ).error.code
+      ).toBe('limit')
+      await rpc(descriptor, 'stop', { id: ptyId }, canonical)
+      await Bun.sleep(50)
+      const [firstExec, secondExec] = await Promise.all([
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'setTimeout(() => {}, 100)'],
+            timeoutSeconds: 1,
+            workdir: root,
+          },
+          canonical
+        ),
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'setTimeout(() => {}, 100)'],
+            timeoutSeconds: 1,
+            workdir: root,
+          },
+          canonical
+        ),
+      ])
+      const results = [await firstExec.json(), await secondExec.json()] as Array<{
+        result?: { session: { id: string } }
+        error?: { code: string }
+      }>
+      expect(results.filter((result) => result.error?.code === 'limit')).toHaveLength(1)
+      const exec = results.find((result) => result.result) as {
+        result: { session: { id: string } }
+      }
+      expect(exec.result.session.id).toStartWith('exec_')
+    } finally {
+      await server.stop()
+    }
+  }
+)
+
+test.skipIf(process.platform === 'win32')(
+  'conversation cleanup excludes persistent sessions and environment values stay out of records',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-'))
+    const otherProject = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-other-'))
+    roots.push(root, otherProject)
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    const common = {
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      parentSessionId: 'owner',
+      ownerProjectDirectory: root,
+      ownerCapabilityHash: 'capability',
+      workdir: root,
+      env: { API_TOKEN: 'test-secret-value' },
+    }
+    const conversation = await supervisor.spawn(common)
+    const persistent = await supervisor.spawn({ ...common, lifecycle: 'persistent' })
+    const other = await supervisor.spawn({
+      ...common,
+      ownerProjectDirectory: otherProject,
+      ownerCapabilityHash: 'other-capability',
+    })
+    expect((await supervisor.get(conversation.id))?.environment).toEqual({
+      kind: 'safe',
+      keys: expect.arrayContaining(['[REDACTED_ENV_KEY]']),
+      fingerprint: expect.any(String),
+      sensitive: true,
+    })
+    expect(JSON.stringify(await new DaemonStorage(root).loadSessions())).not.toContain(
+      'test-secret-value'
     )
-    const ptyId = ((await pty.json()) as { result: { id: string } }).result.id
     expect(
       (
-        (await (
-          await rpc(
-            descriptor,
-            'exec',
-            {
-              command: process.execPath,
-              args: ['-e', 'process.exit()'],
-              timeoutSeconds: 1,
-            },
-            canonical
-          )
-        ).json()) as { error: { code: string } }
-      ).error.code
-    ).toBe('limit')
-    await rpc(descriptor, 'stop', { id: ptyId }, canonical)
+        await supervisor.exec({
+          ...common,
+          args: ['-e', 'console.log(process.env.API_TOKEN)'],
+          timeoutSeconds: 2,
+        })
+      ).stdout
+    ).toBe('[REDACTED]\n')
+    await supervisor.cleanupByParentSession('owner', root, 'capability')
+    expect((await supervisor.get(conversation.id))?.terminationRequested).toBeTrue()
+    expect((await supervisor.get(persistent.id))?.terminationRequested).toBeFalse()
+    expect((await supervisor.get(other.id))?.terminationRequested).toBeFalse()
+    await supervisor.stop(persistent.id)
+    await supervisor.stop(other.id)
     await Bun.sleep(50)
-    const [firstExec, secondExec] = await Promise.all([
-      rpc(
-        descriptor,
-        'exec',
-        { command: process.execPath, args: ['-e', 'setTimeout(() => {}, 100)'], timeoutSeconds: 1 },
-        canonical
-      ),
-      rpc(
-        descriptor,
-        'exec',
-        { command: process.execPath, args: ['-e', 'setTimeout(() => {}, 100)'], timeoutSeconds: 1 },
-        canonical
-      ),
-    ])
-    const results = [await firstExec.json(), await secondExec.json()] as Array<{
-      result?: { session: { id: string } }
-      error?: { code: string }
-    }>
-    expect(results.filter((result) => result.error?.code === 'limit')).toHaveLength(1)
-    const exec = results.find((result) => result.result) as { result: { session: { id: string } } }
-    expect(exec.result.session.id).toStartWith('exec_')
-  } finally {
-    await server.stop()
+    await supervisor.flush()
   }
-})
-
-test('conversation cleanup excludes persistent sessions and environment values stay out of records', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-'))
-  const otherProject = await mkdtemp(join(tmpdir(), 'opencode-pty-lifecycle-other-'))
-  roots.push(root, otherProject)
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  const common = {
-    command: process.execPath,
-    args: ['-e', 'setTimeout(() => {}, 5000)'],
-    parentSessionId: 'owner',
-    ownerProjectDirectory: root,
-    ownerCapabilityHash: 'capability',
-    workdir: root,
-    env: { API_TOKEN: 'test-secret-value' },
-  }
-  const conversation = await supervisor.spawn(common)
-  const persistent = await supervisor.spawn({ ...common, lifecycle: 'persistent' })
-  const other = await supervisor.spawn({
-    ...common,
-    ownerProjectDirectory: otherProject,
-    ownerCapabilityHash: 'other-capability',
-  })
-  expect((await supervisor.get(conversation.id))?.environment).toEqual({
-    kind: 'safe',
-    keys: expect.arrayContaining(['[REDACTED_ENV_KEY]']),
-    fingerprint: expect.any(String),
-    sensitive: true,
-  })
-  expect(JSON.stringify(await new DaemonStorage(root).loadSessions())).not.toContain(
-    'test-secret-value'
-  )
-  expect(
-    (
-      await supervisor.exec({
-        ...common,
-        args: ['-e', 'console.log(process.env.API_TOKEN)'],
-        timeoutSeconds: 2,
-      })
-    ).stdout
-  ).toBe('[REDACTED]\n')
-  await supervisor.cleanupByParentSession('owner', root, 'capability')
-  expect((await supervisor.get(conversation.id))?.terminationRequested).toBeTrue()
-  expect((await supervisor.get(persistent.id))?.terminationRequested).toBeFalse()
-  expect((await supervisor.get(other.id))?.terminationRequested).toBeFalse()
-  await supervisor.stop(persistent.id)
-  await supervisor.stop(other.id)
-  await Bun.sleep(50)
-  await supervisor.flush()
-})
+)
 
 test('spawn permission adapter uses native ask unless locally allowed or denied', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-'))
@@ -1153,7 +1215,7 @@ test('experimental Bash keeps raw policy input and external ask patterns', async
         tui: { showToast: async () => {} },
       } as never,
       root
-  )('git status', undefined, 'restricted')
+    )('git status', undefined, 'restricted')
   ).rejects.toThrow('local permission policy')
   await expect(
     createSpawnAuthorizer(
@@ -1177,7 +1239,7 @@ test('experimental Bash keeps raw policy input and external ask patterns', async
   })
 })
 
-test('experimental Bash keeps host metadata private and uses native approval', async () => {
+test('bash wrapper keeps host metadata private and consumes native approval once', async () => {
   expect(bashArgv('echo ok', 'win32', { ComSpec: 'cmd.exe' }, () => true)).toEqual([
     'cmd.exe',
     ['/d', '/s', '/c', 'echo ok'],
@@ -1189,7 +1251,16 @@ test('experimental Bash keeps host metadata private and uses native approval', a
   expect(() => bashTimeout(3_601_000)).toThrow('3600 second limit')
   const calls: string[] = []
   const daemon = {
-    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
+    prepareApproval: async (request: unknown) => {
+      expect(request).toEqual({
+        command: 'echo ok',
+        capability: bashApprovalCapability('test'),
+        workdir: process.cwd(),
+        expirySeconds: 3600,
+        uiLeaseSeconds: 5,
+      })
+      return { id: 'approval', status: 'pending' }
+    },
     waitForApproval: async () => {
       calls.push('wait')
       return { id: 'approval', status: 'native_fallback' }
@@ -1229,9 +1300,16 @@ test('experimental Bash keeps host metadata private and uses native approval', a
     directory: process.cwd(),
     agent: 'test',
     abort: new AbortController().signal,
-    ask: async (request: { patterns: string[]; metadata: unknown }) => {
+    ask: async (request: {
+      permission: string
+      patterns: string[]
+      always: string[]
+      metadata: unknown
+    }) => {
       calls.push('ask')
+      expect(request.permission).toBe('bash')
       expect(request.patterns).toEqual(['echo ok'])
+      expect(request.always).toEqual(['echo ok'])
       expect(request.metadata).toEqual({
         output: '[opencode-pty · foreground · awaiting approval]',
       })
@@ -1243,7 +1321,10 @@ test('experimental Bash keeps host metadata private and uses native approval', a
     },
   } as never)
   expect(calls).toEqual([
+    'wait',
     'ask',
+    'approve',
+    'consume',
     `exec:${process.platform === 'win32' ? process.env.ComSpec : '/bin/sh'}:${process.platform === 'win32' ? '/d,/s,/c,echo ok' : '-lc,echo ok'}`,
   ])
   expect(metadata).toEqual([
@@ -1257,6 +1338,7 @@ test('experimental Bash keeps host metadata private and uses native approval', a
   const rejected: string[] = []
   const rejectingBash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     ...daemon,
+    prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
     waitForApproval: async () => ({ id: 'approval', status: 'native_fallback' }),
     cancelApproval: async () => {
       rejected.push('cancel')
@@ -1279,7 +1361,7 @@ test('experimental Bash keeps host metadata private and uses native approval', a
       metadata: () => {},
     } as never)
   ).rejects.toThrow('rejected')
-  expect(rejected).toEqual([])
+  expect(rejected).toEqual(['cancel'])
 })
 
 test('bash rejects nonterminal exec results rather than claiming completion', async () => {
@@ -1337,10 +1419,10 @@ test('bash cancels durable approval when native ctx.ask is unavailable', async (
       metadata: () => {},
     } as never)
   ).rejects.toThrow('approval is unavailable')
-  expect(calls).toEqual([])
+  expect(calls).toEqual(['cancel'])
 })
 
-test('bash session grants never bypass native approval', async () => {
+test('bash reuses a matching session grant without native approval', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ status: 'approved_session' }),
@@ -1372,10 +1454,52 @@ test('bash session grants never bypass native approval', async () => {
       metadata: () => {},
     } as never)
   ).resolves.toContain('status="exited"')
-  expect(calls).toEqual(['ask', 'start'])
+  expect(calls).toEqual(['start'])
 })
 
-test('bash ignores companion approval decisions', async () => {
+test('bash retains the external directory ask when not locally allowed', async () => {
+  const calls: string[] = []
+  const external = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-external-ask-'))
+  roots.push(external)
+  const externalPattern = `${resolve(external, '..').replace(/\\/g, '/')}/*`
+  const bash = createBash(
+    async () => ({ action: 'allow', workdir: external, externalPattern, externalAction: 'ask' }),
+    {
+      execStart: async () => {
+        calls.push('start')
+        return { id: 'exec', status: 'running', mode: 'exec', pid: 1 }
+      },
+      execWait: async () => ({
+        session: { id: 'exec', status: 'exited', mode: 'exec', pid: 1 },
+        stdout: '',
+        stderr: '',
+        timedOut: false,
+        outputLimited: false,
+        terminationConfirmed: true,
+        startedAt: '',
+        exitedAt: '',
+      }),
+      stop: async () => ({ terminationConfirmed: true }),
+    } as never
+  )
+  await expect(
+    bash.execute({ command: 'echo external' }, {
+      sessionID: 'test-session',
+      directory: process.cwd(),
+      agent: 'test',
+      abort: new AbortController().signal,
+      ask: async (request: { permission: string; patterns: string[]; always: string[] }) => {
+        calls.push(`ask:${request.permission}`)
+        expect(request.patterns).toEqual([externalPattern])
+        expect(request.always).toEqual([externalPattern])
+      },
+      metadata: () => {},
+    } as never)
+  ).resolves.toContain('status="exited"')
+  expect(calls).toEqual(['ask:external_directory', 'start'])
+})
+
+test('bash accepts a companion session decision without native ctx.ask', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1410,10 +1534,10 @@ test('bash ignores companion approval decisions', async () => {
       metadata: () => {},
     } as never)
   ).resolves.toContain('status="exited"')
-  expect(calls).toEqual(['ask', 'start'])
+  expect(calls).toEqual(['consume', 'start'])
 })
 
-test('bash only observes native approval rejection', async () => {
+test('bash never launches a rejected companion approval', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1435,19 +1559,17 @@ test('bash only observes native approval rejection', async () => {
       directory: process.cwd(),
       agent: 'test',
       abort: new AbortController().signal,
-      ask: async () => {
-        calls.push('ask')
-        throw new Error('rejected')
-      },
+      ask: async () => calls.push('ask'),
       metadata: () => {},
     } as never)
-  ).rejects.toThrow('rejected')
-  expect(calls).toEqual(['ask'])
+  ).rejects.toThrow('not granted')
+  expect(calls).toEqual([])
 })
 
-test('Bash always asks regardless of advanced approval grants', async () => {
+test('Bash asks again when a session grant belongs to another agent', async () => {
   const calls: string[] = []
-  const granted = 'advanced:agent-a'
+  const granted = bashApprovalCapability('agent-a')
+  expect(granted).not.toContain('agent-a')
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async (request: { capability: string }) =>
       request.capability === granted
@@ -1482,10 +1604,10 @@ test('Bash always asks regardless of advanced approval grants', async () => {
 
   await bash.execute({ command: 'echo granted' }, context('agent-a'))
   await bash.execute({ command: 'echo granted' }, context('agent-b'))
-  expect(calls).toEqual(['ask:agent-a', 'ask:agent-b'])
+  expect(calls).toEqual(['ask:agent-b'])
 })
 
-test('bash asks without consulting session grants', async () => {
+test('bash asks when no matching session grant is available', async () => {
   const calls: string[] = []
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
     prepareApproval: async () => ({ id: 'approval', status: 'pending' }),
@@ -1519,10 +1641,10 @@ test('bash asks without consulting session grants', async () => {
     },
     metadata: () => {},
   } as never)
-  expect(calls).toEqual(['ask'])
+  expect(calls).toEqual(['ask', 'approve'])
 })
 
-test('bash abort before dispatch does not create a companion approval', async () => {
+test('bash abort cancels pending approval before dispatch', async () => {
   const calls: string[] = []
   const controller = new AbortController()
   const bash = createBash(async () => ({ action: 'ask', workdir: process.cwd() }), {
@@ -1555,7 +1677,7 @@ test('bash abort before dispatch does not create a companion approval', async ()
       metadata: () => {},
     } as never)
   ).rejects.toThrow('cancelled')
-  expect(calls).toEqual([])
+  expect(calls).toEqual(['cancel'])
 })
 
 test('bash abort stops dispatched exec and waits for terminal evidence', async () => {
@@ -1606,47 +1728,50 @@ test('bash abort stops dispatched exec and waits for terminal evidence', async (
   expect(calls).toEqual(['start', 'wait:125', 'stop', 'wait:5'])
 })
 
-test('bash execStart stop reaches a terminal daemon record', async () => {
-  if (!existsSync(nativeWorkerPath)) return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-abort-'))
-  roots.push(root)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
-  const storage = new DaemonStorage(root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'bash-abort')
-  try {
-    const descriptor = await server.start()
-    const context = await owner(storage, 'bash-abort', root)
-    const started = (await rpc(
-      descriptor,
-      'execStart',
-      {
-        command: process.execPath,
-        args: ['-e', 'setInterval(() => {}, 1000)'],
-        timeoutSeconds: 10,
-        workdir: root,
-      },
-      context
-    ).then((response) => response.json())) as { result: { id: string } }
-    const stopped = await rpc(descriptor, 'stop', { id: started.result.id }, context).then(
-      (response) => response.json()
-    )
-    expect(stopped).toMatchObject({ result: { requested: true, terminationConfirmed: true } })
-    const terminal = await rpc(
-      descriptor,
-      'execWait',
-      { id: started.result.id, timeoutSeconds: 5 },
-      context
-    ).then((response) => response.json())
-    expect(terminal).toMatchObject({
-      result: { session: { status: 'exited' }, terminationConfirmed: true },
-    })
-  } finally {
-    await server.stop()
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
-  }
-}, 10_000)
+test.skipIf(!existsSync(nativeWorkerPath))(
+  'bash execStart stop reaches a terminal daemon record',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-bash-abort-'))
+    roots.push(root)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+    const storage = new DaemonStorage(root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'bash-abort')
+    try {
+      const descriptor = await server.start()
+      const context = await owner(storage, 'bash-abort', root)
+      const started = (await rpc(
+        descriptor,
+        'execStart',
+        {
+          command: process.execPath,
+          args: ['-e', 'setInterval(() => {}, 1000)'],
+          timeoutSeconds: 10,
+          workdir: root,
+        },
+        context
+      ).then((response) => response.json())) as { result: { id: string } }
+      const stopped = await rpc(descriptor, 'stop', { id: started.result.id }, context).then(
+        (response) => response.json()
+      )
+      expect(stopped).toMatchObject({ result: { requested: true, terminationConfirmed: true } })
+      const terminal = await rpc(
+        descriptor,
+        'execWait',
+        { id: started.result.id, timeoutSeconds: 5 },
+        context
+      ).then((response) => response.json())
+      expect(terminal).toMatchObject({
+        result: { session: { status: 'exited' }, terminationConfirmed: true },
+      })
+    } finally {
+      await server.stop()
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    }
+  },
+  10_000
+)
 
 test('bash override is opt-in and native Bash remains the default', async () => {
   const input = {
@@ -1699,6 +1824,7 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
     ],
     env: { API_TOKEN: 'split-secret-value' },
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
   })
   expect(exec.stdout).toBe('before [REDACTED] after\n')
@@ -1749,12 +1875,14 @@ test('process identity probe stops at its deadline', async () => {
   ).toBeNull()
 })
 
-test('Windows process identity probe identifies the current process', async () => {
-  if (process.platform !== 'win32') return
-  expect(await processStartIdentity(process.pid)).toMatch(
-    new RegExp(`^windows:${process.pid}:\\d+$`)
-  )
-})
+test.skipIf(process.platform !== 'win32')(
+  'Windows process identity probe identifies the current process',
+  async () => {
+    expect(await processStartIdentity(process.pid)).toMatch(
+      new RegExp(`^windows:${process.pid}:\\d+$`)
+    )
+  }
+)
 
 test('required process identity reports the failed probe', async () => {
   await expect(requiredProcessStartIdentity(process.pid, Date.now())).rejects.toThrow(
@@ -1889,6 +2017,7 @@ test('start lock handoff permits one distinct daemon identity', async () => {
         root,
         token,
       ],
+      cwd: root,
       stdout: 'pipe',
       stderr: 'pipe',
     })
@@ -1927,6 +2056,7 @@ test('a claimed handoff lock survives its launching client and blocks duplicates
       root,
       lock.handoffToken,
     ],
+    cwd: root,
     stdout: 'pipe',
     stderr: 'pipe',
   })
@@ -2027,8 +2157,20 @@ test('claimed handoff recovery locks with a reused PID do not block startup', as
   if (claimed) await storage.releaseStartLock(claimed)
 }, 30_000)
 
-test('startup stderr never reports a three-character environment secret', () => {
-  expect(safeStartupStderrTail('daemon failed: abc', 'token', 'options')).toBeNull()
+test('startup stderr tail redacts secrets and is null only when empty', () => {
+  expect(
+    safeStartupStderrTail(
+      'daemon failed: startup-token-value startup-options-value',
+      'startup-token-value',
+      'startup-options-value'
+    )
+  ).toBe('daemon failed: [REDACTED] [REDACTED]')
+  expect(safeStartupStderrTail('daemon failed: plain', 'startup-token-value')).toBe(
+    'daemon failed: plain'
+  )
+  expect(safeStartupStderrTail('', 'startup-token-value')).toBeNull()
+  expect(safeStartupStderrTail(undefined, 'startup-token-value')).toBeNull()
+  expect(safeStartupStderrTail('   ', 'startup-token-value')).toBeNull()
 })
 
 test('descriptor ownership rejects a reused PID with a different process identity', async () => {
@@ -2250,6 +2392,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', "console.log('out'); console.error('err')"],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
   })
   expect(success).toMatchObject({ stdout: 'out\n', stderr: 'err\n', exitCode: 0, timedOut: false })
@@ -2258,6 +2401,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', "console.error('failed'); process.exit(7)"],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
   })
   expect(failure).toMatchObject({ stderr: 'failed\n', exitCode: 7, timedOut: false })
@@ -2266,6 +2410,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', 'setTimeout(() => {}, 5000)'],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 1,
   })
   expect(timeout.timedOut).toBeTrue()
@@ -2274,6 +2419,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', "process.stdout.write('x'.repeat(100))"],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
     maxOutputBytes: 8,
   })
@@ -2301,6 +2447,7 @@ test('exec force-kills after grace and reports bounded, truthful termination sta
         : "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
     ],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 1,
   })
   expect(Date.now() - started).toBeLessThan(3000)
@@ -2317,6 +2464,7 @@ test('exec truncation preserves complete UTF-8 text', async () => {
     command: process.execPath,
     args: ['-e', "process.stdout.write('A😀B')"],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
     maxOutputBytes: 4,
   })
@@ -2335,6 +2483,7 @@ test('exec truncation redacts a secret that crosses the output cap', async () =>
     args: ['-e', "process.stdout.write('before-super-secret-value-after')"],
     env: { API_TOKEN: 'super-secret-value' },
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
     maxOutputBytes: 12,
   })
@@ -2350,62 +2499,71 @@ test('exec truncation redacts a secret that crosses the output cap', async () =>
   }
 })
 
-test('PTY idempotency reuses only an active matching owner and spec', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const supervisor = new SessionSupervisor(storage)
-  await supervisor.initialize()
-  const options = {
-    command: process.execPath,
-    args: ['-e', 'setTimeout(() => {}, 5000)'],
-    parentSessionId: 'owner',
-    workdir: root,
-    name: 'server',
-    idempotencyKey: 'deploy-1',
+test.skipIf(process.platform === 'win32')(
+  'PTY idempotency reuses only an active matching owner and spec',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-'))
+    roots.push(root)
+    const storage = new DaemonStorage(root)
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize()
+    const options = {
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      parentSessionId: 'owner',
+      workdir: root,
+      name: 'server',
+      idempotencyKey: 'deploy-1',
+    }
+    const first = await supervisor.spawn(options)
+    const reused = await supervisor.spawn(options)
+    expect(reused.id).toBe(first.id)
+    expect(
+      (
+        await supervisor.spawn({
+          ...options,
+          title: 'renamed',
+          description: 'changed presentation',
+        })
+      ).id
+    ).toBe(first.id)
+    await expect(supervisor.spawn({ ...options, args: ['-e', 'process.exit()'] })).rejects.toThrow(
+      'different command or specification'
+    )
+    await expect(supervisor.spawn({ ...options, name: 'other-server' })).rejects.toThrow(
+      'different command or specification'
+    )
+    await supervisor.stop(first.id)
+    await Bun.sleep(25)
+    await supervisor.flush()
   }
-  const first = await supervisor.spawn(options)
-  const reused = await supervisor.spawn(options)
-  expect(reused.id).toBe(first.id)
-  expect(
-    (await supervisor.spawn({ ...options, title: 'renamed', description: 'changed presentation' }))
-      .id
-  ).toBe(first.id)
-  await expect(supervisor.spawn({ ...options, args: ['-e', 'process.exit()'] })).rejects.toThrow(
-    'different command or specification'
-  )
-  await expect(supervisor.spawn({ ...options, name: 'other-server' })).rejects.toThrow(
-    'different command or specification'
-  )
-  await supervisor.stop(first.id)
-  await Bun.sleep(25)
-  await supervisor.flush()
-})
+)
 
-test('PTY idempotency canonicalizes environment order and scopes only by parent and workdir', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
-  roots.push(root)
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  const base = {
-    command: process.execPath,
-    args: ['-e', 'setTimeout(() => {}, 5000)'],
-    parentSessionId: 'owner',
-    workdir: root,
-    idempotencyKey: 'same',
-    env: { A: '1', Z: '2' },
+test.skipIf(process.platform === 'win32')(
+  'PTY idempotency canonicalizes environment order and scopes only by parent and workdir',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
+    roots.push(root)
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    const base = {
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      parentSessionId: 'owner',
+      workdir: root,
+      idempotencyKey: 'same',
+      env: { A: '1', Z: '2' },
+    }
+    const first = await supervisor.spawn(base)
+    expect((await supervisor.spawn({ ...base, env: { Z: '2', A: '1' } })).id).toBe(first.id)
+    const other = await supervisor.spawn({ ...base, parentSessionId: 'other' })
+    expect(other.id).not.toBe(first.id)
+    await supervisor.stop(first.id)
+    await supervisor.stop(other.id)
+    await Bun.sleep(25)
+    await supervisor.flush()
   }
-  const first = await supervisor.spawn(base)
-  expect((await supervisor.spawn({ ...base, env: { Z: '2', A: '1' } })).id).toBe(first.id)
-  const other = await supervisor.spawn({ ...base, parentSessionId: 'other' })
-  expect(other.id).not.toBe(first.id)
-  await supervisor.stop(first.id)
-  await supervisor.stop(other.id)
-  await Bun.sleep(25)
-  await supervisor.flush()
-})
+)
 
 test('PTY idempotency rejects a matching fingerprint with a different environment profile', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-environment-'))
@@ -2442,54 +2600,56 @@ test('PTY idempotency rejects a matching fingerprint with a different environmen
   ).toThrow('different command or specification')
 })
 
-test('daemon waits for output, exit, and deadline without plugin polling', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-wait-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const supervisor = new SessionSupervisor(storage)
-  await supervisor.initialize()
-  const session = await supervisor.spawn({
-    command: process.execPath,
-    args: [
-      '-e',
-      "setTimeout(() => console.log('ready'), 50); setTimeout(() => process.exit(3), 100)",
-    ],
-    parentSessionId: 'parent',
-    workdir: root,
-  })
-  await Bun.sleep(50)
-  await expect(
-    supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
-  ).resolves.toMatchObject({
-    satisfied: true,
-    reason: 'output',
-    matched: 'ready',
-  })
-  await expect(supervisor.wait(session.id, { kind: 'exit' }, 2)).resolves.toMatchObject({
-    satisfied: true,
-    reason: 'exit',
-    exitCode: 3,
-  })
-  const running = await supervisor.spawn({
-    command: process.execPath,
-    args: ['-e', 'setTimeout(() => {}, 5000)'],
-    parentSessionId: 'parent',
-    workdir: root,
-  })
-  await expect(
-    supervisor.wait(running.id, { kind: 'output', regex: 'never' }, 1)
-  ).resolves.toMatchObject({
-    satisfied: false,
-    reason: 'deadline',
-  })
-  await expect(
-    supervisor.wait(running.id, { kind: 'output', regex: '(never)+' }, 1)
-  ).rejects.toThrow('limited-safe')
-  await supervisor.stop(running.id)
-  await Bun.sleep(25)
-  await supervisor.flush()
-})
+test.skipIf(process.platform === 'win32')(
+  'daemon waits for output, exit, and deadline without plugin polling',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-wait-'))
+    roots.push(root)
+    const storage = new DaemonStorage(root)
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize()
+    const session = await supervisor.spawn({
+      command: process.execPath,
+      args: [
+        '-e',
+        "setTimeout(() => console.log('ready'), 50); setTimeout(() => process.exit(3), 100)",
+      ],
+      parentSessionId: 'parent',
+      workdir: root,
+    })
+    await Bun.sleep(50)
+    await expect(
+      supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
+    ).resolves.toMatchObject({
+      satisfied: true,
+      reason: 'output',
+      matched: 'ready',
+    })
+    await expect(supervisor.wait(session.id, { kind: 'exit' }, 2)).resolves.toMatchObject({
+      satisfied: true,
+      reason: 'exit',
+      exitCode: 3,
+    })
+    const running = await supervisor.spawn({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      parentSessionId: 'parent',
+      workdir: root,
+    })
+    await expect(
+      supervisor.wait(running.id, { kind: 'output', regex: 'never' }, 1)
+    ).resolves.toMatchObject({
+      satisfied: false,
+      reason: 'deadline',
+    })
+    await expect(
+      supervisor.wait(running.id, { kind: 'output', regex: '(never)+' }, 1)
+    ).rejects.toThrow('limited-safe')
+    await supervisor.stop(running.id)
+    await Bun.sleep(25)
+    await supervisor.flush()
+  }
+)
 
 test('native exec wait stops a running record after its deadline and requires terminal evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-wait-'))
@@ -2601,147 +2761,159 @@ test('native exec allows the bounded terminal grace after maximum runtime', asyn
   }
 })
 
-test('sendWait ignores output before input acceptance and waits for later output', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-'))
-  roots.push(root)
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  const session = await supervisor.spawn({
-    command: process.execPath,
-    args: [
-      '-e',
-      "process.stdin.setRawMode(true); console.log('ready'); process.stdin.once('data', (data) => { if (data.includes('go')) { console.log('ready'); process.exit(0) } })",
-    ],
-    parentSessionId: 'parent',
-    workdir: root,
-  })
-  try {
-    await expect(
-      supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
-    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
-    expect((await supervisor.read(session.id)).lines.join('\n')).toContain('ready')
-    const result = await supervisor.sendWait(
-      session.id,
-      'go\n',
-      { kind: 'output', literal: 'ready' },
-      2
+test.skipIf(process.platform === 'win32')(
+  'sendWait ignores output before input acceptance and waits for later output',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-'))
+    roots.push(root)
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    const session = await supervisor.spawn({
+      command: process.execPath,
+      args: [
+        '-e',
+        "process.stdin.setRawMode(true); console.log('ready'); process.stdin.once('data', (data) => { if (data.includes('go')) { console.log('ready'); process.exit(0) } })",
+      ],
+      parentSessionId: 'parent',
+      workdir: root,
+    })
+    try {
+      await expect(
+        supervisor.wait(session.id, { kind: 'output', literal: 'ready' }, 2)
+      ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
+      expect((await supervisor.read(session.id)).lines.join('\n')).toContain('ready')
+      const result = await supervisor.sendWait(
+        session.id,
+        'go\n',
+        { kind: 'output', literal: 'ready' },
+        2
+      )
+      expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
+      const exit = await supervisor.wait(session.id, { kind: 'exit' }, 2)
+      expect(exit).toMatchObject({ satisfied: true, reason: 'exit', exitCode: 0 })
+      expect((await supervisor.get(session.id))?.lastWaitResult).toMatchObject({ reason: 'exit' })
+    } finally {
+      await supervisor.stop(session.id).catch(() => undefined)
+      await supervisor.flush()
+    }
+  }
+)
+
+test.skipIf(process.platform === 'win32')(
+  'sendWait observes an immediate response after accepted input',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-immediate-'))
+    roots.push(root)
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    const session = await supervisor.spawn({
+      command: process.execPath,
+      args: [
+        '-e',
+        "process.stdin.setRawMode(true); process.stdin.once('data', () => { process.stdout.write('immediate\\n') })",
+      ],
+      parentSessionId: 'parent',
+      workdir: root,
+    })
+    try {
+      await expect(
+        supervisor.sendWait(session.id, 'x', { kind: 'output', literal: 'immediate' }, 2)
+      ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'immediate' })
+    } finally {
+      await supervisor.stop(session.id).catch(() => undefined)
+      await supervisor.flush()
+    }
+  }
+)
+
+test.skipIf(process.platform === 'win32')(
+  'sendWait excludes drained pre-acceptance output and observes its immediate reply',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-buffered-'))
+    roots.push(root)
+    const marker = join(root, 'buffered')
+    let watcher: ReturnType<typeof watch> | undefined
+    const markerReady = new Promise<void>((resolve, reject) => {
+      watcher = watch(root, (_event, filename) => {
+        if (filename !== 'buffered') return
+        watcher?.close()
+        resolve()
+      })
+      watcher.on('error', reject)
+    })
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    const session = await withProcessEnv(
+      { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'pause_terminal_reader_until_write' },
+      () =>
+        supervisor.spawn({
+          command: process.execPath,
+          args: [
+            '-e',
+            `process.stdin.setRawMode(true); process.stdout.write('old\\n'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new\\n'))`,
+          ],
+          parentSessionId: 'parent',
+          workdir: root,
+        })
     )
-    expect(result).toMatchObject({ satisfied: true, reason: 'output', matched: 'ready' })
-    const exit = await supervisor.wait(session.id, { kind: 'exit' }, 2)
-    expect(exit).toMatchObject({ satisfied: true, reason: 'exit', exitCode: 0 })
-    expect((await supervisor.get(session.id))?.lastWaitResult).toMatchObject({ reason: 'exit' })
-  } finally {
-    await supervisor.stop(session.id).catch(() => undefined)
-    await supervisor.flush()
-  }
-})
-
-test('sendWait observes an immediate response after accepted input', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-immediate-'))
-  roots.push(root)
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  const session = await supervisor.spawn({
-    command: process.execPath,
-    args: [
-      '-e',
-      "process.stdin.setRawMode(true); process.stdin.once('data', () => { process.stdout.write('immediate\\n') })",
-    ],
-    parentSessionId: 'parent',
-    workdir: root,
-  })
-  try {
-    await expect(
-      supervisor.sendWait(session.id, 'x', { kind: 'output', literal: 'immediate' }, 2)
-    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'immediate' })
-  } finally {
-    await supervisor.stop(session.id).catch(() => undefined)
-    await supervisor.flush()
-  }
-})
-
-test('sendWait excludes drained pre-acceptance output and observes its immediate reply', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-buffered-'))
-  roots.push(root)
-  const marker = join(root, 'buffered')
-  let watcher: ReturnType<typeof watch> | undefined
-  const markerReady = new Promise<void>((resolve, reject) => {
-    watcher = watch(root, (_event, filename) => {
-      if (filename !== 'buffered') return
+    try {
+      await markerReady
+      expect(existsSync(marker)).toBeTrue()
+      await expect(
+        supervisor.sendWait(session.id, 'x', { kind: 'output', regex: 'old|new' }, 1)
+      ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'new' })
+    } finally {
       watcher?.close()
-      resolve()
-    })
-    watcher.on('error', reject)
-  })
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  const session = await supervisor.spawn({
-    command: process.execPath,
-    args: [
-      '-e',
-      `process.stdin.setRawMode(true); process.stdout.write('old\\n'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new\\n'))`,
-    ],
-    env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'pause_terminal_reader_until_write' },
-    parentSessionId: 'parent',
-    workdir: root,
-  })
-  try {
-    await markerReady
-    expect(existsSync(marker)).toBeTrue()
-    await expect(
-      supervisor.sendWait(session.id, 'x', { kind: 'output', regex: 'old|new' }, 1)
-    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'new' })
-  } finally {
-    watcher?.close()
-    await supervisor.stop(session.id).catch(() => undefined)
-    await supervisor.flush()
+      await supervisor.stop(session.id).catch(() => undefined)
+      await supervisor.flush()
+    }
   }
-})
+)
 
-test('sendWait flushes a held redaction tail before its input boundary', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-redaction-tail-'))
-  roots.push(root)
-  const marker = join(root, 'buffered')
-  let watcher: ReturnType<typeof watch> | undefined
-  const markerReady = new Promise<void>((resolve, reject) => {
-    watcher = watch(root, (_event, filename) => {
-      if (filename !== 'buffered') return
-      watcher?.close()
-      resolve()
+test.skipIf(process.platform === 'win32')(
+  'sendWait flushes a held redaction tail before its input boundary',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-send-wait-redaction-tail-'))
+    roots.push(root)
+    const marker = join(root, 'buffered')
+    let watcher: ReturnType<typeof watch> | undefined
+    const markerReady = new Promise<void>((resolve, reject) => {
+      watcher = watch(root, (_event, filename) => {
+        if (filename !== 'buffered') return
+        watcher?.close()
+        resolve()
+      })
+      watcher.on('error', reject)
     })
-    watcher.on('error', reject)
-  })
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  const session = await supervisor.spawn({
-    command: process.execPath,
-    args: [
-      '-e',
-      `process.stdin.setRawMode(true); process.stdout.write('old-match'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new-match\\n'))`,
-    ],
-    env: {
-      API_TOKEN: 'tail-secret',
-      OPENCODE_PTY_NATIVE_WORKER_FAULT: 'pause_terminal_reader_until_write',
-    },
-    parentSessionId: 'parent',
-    workdir: root,
-  })
-  try {
-    await markerReady
-    await expect(
-      supervisor.sendWait(session.id, 'x', { kind: 'output', regex: 'old-match|new-match' }, 1)
-    ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'new-match' })
-    expect((await supervisor.read(session.id)).lines.join('\n')).not.toContain('tail-secret')
-  } finally {
-    watcher?.close()
-    await supervisor.stop(session.id).catch(() => undefined)
-    await supervisor.flush()
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    const session = await withProcessEnv(
+      { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'pause_terminal_reader_until_write' },
+      () =>
+        supervisor.spawn({
+          command: process.execPath,
+          args: [
+            '-e',
+            `process.stdin.setRawMode(true); process.stdout.write('old-match'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new-match\\n'))`,
+          ],
+          env: { API_TOKEN: 'tail-secret' },
+          parentSessionId: 'parent',
+          workdir: root,
+        })
+    )
+    try {
+      await markerReady
+      await expect(
+        supervisor.sendWait(session.id, 'x', { kind: 'output', regex: 'old-match|new-match' }, 1)
+      ).resolves.toMatchObject({ satisfied: true, reason: 'output', matched: 'new-match' })
+      expect((await supervisor.read(session.id)).lines.join('\n')).not.toContain('tail-secret')
+    } finally {
+      watcher?.close()
+      await supervisor.stop(session.id).catch(() => undefined)
+      await supervisor.flush()
+    }
   }
-})
+)
 
 test('exec output remains separately recoverable after restart', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-record-'))
@@ -2753,6 +2925,7 @@ test('exec output remains separately recoverable after restart', async () => {
     command: process.execPath,
     args: ['-e', "process.stdout.write('out'); process.stderr.write('err')"],
     parentSessionId: 'parent',
+    workdir: root,
     timeoutSeconds: 2,
   })
   const recovered = new SessionSupervisor(storage)
@@ -2777,9 +2950,7 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
   await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-owner', root)
@@ -2798,6 +2969,7 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
         ],
         timeoutSeconds: 8,
         maxOutputBytes: 1024,
+        workdir: root,
       },
       context
     )
@@ -2865,8 +3037,6 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
   } finally {
     await restarted?.stop()
     await first.stop().catch(() => undefined)
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
@@ -2882,9 +3052,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
   await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-limits', root)
@@ -2900,6 +3068,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
         args: ['-e', "process.stdout.write('x'.repeat(64)); process.stderr.write('y'.repeat(64))"],
         timeoutSeconds: 2,
         maxOutputBytes: 64,
+        workdir: root,
       },
       context
     ).then((response) => response.json())
@@ -2916,6 +3085,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
         command: process.execPath,
         args: ['-e', "setTimeout(() => process.stdout.write('will fail'), 200)"],
         timeoutSeconds: 3,
+        workdir: root,
       },
       context
     )
@@ -2948,8 +3118,6 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
     await expect(stat(join(root, 'sessions', id, 'worker.json'))).rejects.toThrow()
   } finally {
     await server.stop()
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
@@ -2965,26 +3133,28 @@ test('native startup failures clean up the direct child and report the proven ou
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
   await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-startup-failure', root)
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-startup-failure')
   try {
     const descriptor = await server.start()
-    const descriptorFailure = await rpc(
-      descriptor,
-      'exec',
-      {
-        command: process.execPath,
-        args: ['-e', 'setInterval(() => {}, 1000)'],
-        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'descriptor_write' },
-        timeoutSeconds: 2,
-      },
-      context
-    ).then((response) => response.json())
+    const descriptorFailure = await withProcessEnv(
+      { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'descriptor_write' },
+      () =>
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'setInterval(() => {}, 1000)'],
+            timeoutSeconds: 2,
+            workdir: root,
+          },
+          context
+        ).then((response) => response.json())
+    )
     expect(descriptorFailure).toMatchObject({
       ok: false,
       error: { code: 'process', spawnFailure: { cleanup: { terminationConfirmed: true } } },
@@ -3003,6 +3173,7 @@ test('native startup failures clean up the direct child and report the proven ou
         command: join(root, 'does-not-exist'),
         args: [],
         timeoutSeconds: 2,
+        workdir: root,
       },
       context
     ).then((response) => response.json())
@@ -3034,34 +3205,42 @@ test('native startup failures clean up the direct child and report the proven ou
     })
 
     if (process.platform === 'win32') {
-      const assignmentFailure = await rpc(
-        descriptor,
-        'exec',
-        {
-          command: process.execPath,
-          args: ['-e', 'setInterval(() => {}, 1000)'],
-          env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'job_assign' },
-          timeoutSeconds: 2,
-        },
-        context
-      ).then((response) => response.json())
+      const assignmentFailure = await withProcessEnv(
+        { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'job_assign' },
+        () =>
+          rpc(
+            descriptor,
+            'exec',
+            {
+              command: process.execPath,
+              args: ['-e', 'setInterval(() => {}, 1000)'],
+              timeoutSeconds: 2,
+              workdir: root,
+            },
+            context
+          ).then((response) => response.json())
+      )
       expect(assignmentFailure).toMatchObject({ ok: false, error: { code: 'process' } })
     }
 
-    const readinessFailure = await rpc(
-      descriptor,
-      'exec',
+    const readinessFailure = await withProcessEnv(
       {
-        command: process.execPath,
-        args: ['-e', 'setInterval(() => {}, 1000)'],
-        env: {
-          OPENCODE_PTY_NATIVE_WORKER_FAULT: 'missing_ready',
-          OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS: '1000',
-        },
-        timeoutSeconds: 2,
+        OPENCODE_PTY_NATIVE_WORKER_FAULT: 'missing_ready',
+        OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS: '1000',
       },
-      context
-    ).then((response) => response.json())
+      () =>
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'setInterval(() => {}, 1000)'],
+            timeoutSeconds: 2,
+            workdir: root,
+          },
+          context
+        ).then((response) => response.json())
+    )
     expect(readinessFailure).toMatchObject({
       ok: false,
       error: {
@@ -3093,17 +3272,21 @@ test('native startup failures clean up the direct child and report the proven ou
       process.platform === 'darwin' ||
       process.platform === 'win32'
     ) {
-      const containmentFailure = await rpc(
-        descriptor,
-        'exec',
-        {
-          command: process.execPath,
-          args: ['-e', 'setInterval(() => {}, 1000)'],
-          env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'unverified_containment' },
-          timeoutSeconds: 2,
-        },
-        context
-      ).then((response) => response.json())
+      const containmentFailure = await withProcessEnv(
+        { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'unverified_containment' },
+        () =>
+          rpc(
+            descriptor,
+            'exec',
+            {
+              command: process.execPath,
+              args: ['-e', 'setInterval(() => {}, 1000)'],
+              timeoutSeconds: 2,
+              workdir: root,
+            },
+            context
+          ).then((response) => response.json())
+      )
       if (process.platform === 'linux' || process.platform === 'win32')
         expect(containmentFailure).toMatchObject({
           error: {
@@ -3143,8 +3326,6 @@ test('native startup failures clean up the direct child and report the proven ou
     }
   } finally {
     await server.stop()
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
@@ -3160,11 +3341,9 @@ test('native worker identity and ready-output failures close the owned worker be
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
   await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
   const previousProbeFault = process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL
   const previousProbeThrow = process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-bootstrap-failure', root)
@@ -3179,7 +3358,12 @@ test('native worker identity and ready-output failures close the owned worker be
     const identityFailure = await rpc(
       descriptor,
       'exec',
-      { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], timeoutSeconds: 2 },
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        timeoutSeconds: 2,
+        workdir: root,
+      },
       context
     ).then((response) => response.json())
     expect(identityFailure).toMatchObject({
@@ -3198,6 +3382,7 @@ test('native worker identity and ready-output failures close the owned worker be
           `require('node:fs').writeFileSync(${JSON.stringify(directChildMarker)}, 'started')`,
         ],
         timeoutSeconds: 2,
+        workdir: root,
       },
       context
     ).then((response) => response.json())
@@ -3206,24 +3391,26 @@ test('native worker identity and ready-output failures close the owned worker be
     })
     await expect(stat(directChildMarker)).rejects.toThrow()
     delete process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW
-    const readyFailure = await rpc(
-      descriptor,
-      'exec',
-      {
-        command: process.execPath,
-        args: ['-e', 'setInterval(() => {}, 1000)'],
-        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'ready_stdout' },
-        timeoutSeconds: 2,
-      },
-      context
-    ).then((response) => response.json())
+    const readyFailure = await withProcessEnv(
+      { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'ready_stdout' },
+      () =>
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'setInterval(() => {}, 1000)'],
+            timeoutSeconds: 2,
+            workdir: root,
+          },
+          context
+        ).then((response) => response.json())
+    )
     expect(readyFailure).toMatchObject({
       error: { spawnFailure: { cleanup: { terminationConfirmed: true } } },
     })
   } finally {
     await server.stop()
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
     if (previousProbeFault === undefined)
@@ -3287,9 +3474,7 @@ test('native worker accepts a split readiness frame and immediate post-resume ex
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
   await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-split-ready', root)
@@ -3297,85 +3482,89 @@ test('native worker accepts a split readiness frame and immediate post-resume ex
   try {
     const descriptor = await server.start()
     expect(
-      await rpc(
-        descriptor,
-        'exec',
-        {
-          command: process.execPath,
-          args: ['-e', 'process.exit(0)'],
-          env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'split_ready' },
-          timeoutSeconds: 2,
-        },
-        context
-      ).then((response) => response.json())
+      await withProcessEnv({ OPENCODE_PTY_NATIVE_WORKER_FAULT: 'split_ready' }, () =>
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'process.exit(0)'],
+            timeoutSeconds: 2,
+            workdir: root,
+          },
+          context
+        ).then((response) => response.json())
+      )
     ).toMatchObject({ ok: true, result: { session: { status: 'exited' }, exitCode: 0 } })
   } finally {
     await server.stop()
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
 }, 10_000)
 
-test('Windows native stop drains Job descendants', async () => {
-  if (process.platform !== 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-windows-job-'))
-  roots.push(root)
-  const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker.exe')
-  await stat(workerPath)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = workerPath
-  const storage = new DaemonStorage(root)
-  const context = await owner(storage, 'native-windows-job', root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-windows-job')
-  const descendantMarker = join(root, 'job-descendant-started')
-  try {
-    const descriptor = await server.start()
-    const executing = rpc(
-      descriptor,
-      'exec',
-      {
-        command: process.execPath,
-        args: [
-          '-e',
-          `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(descendantMarker)}, 'started'); setInterval(() => {}, 1000)`)}], { stdio: 'ignore' }); setInterval(() => {}, 1000)`,
-        ],
-        timeoutSeconds: 5,
-      },
-      context
-    )
-    let id = ''
-    for (let attempt = 0; attempt < 50 && !id; attempt += 1) {
-      id = (await storage.loadSessions()).find((session) => session.mode === 'exec')?.id ?? ''
-      if (!id) await Bun.sleep(20)
-    }
-    expect(id).not.toBe('')
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      if (
-        await stat(descendantMarker).then(
-          () => true,
-          () => false
-        )
+test.skipIf(process.platform !== 'win32')(
+  'Windows native stop drains Job descendants',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-windows-job-'))
+    roots.push(root)
+    const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker.exe')
+    await stat(workerPath)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    const storage = new DaemonStorage(root)
+    const context = await owner(storage, 'native-windows-job', root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-windows-job')
+    const descendantMarker = join(root, 'job-descendant-started')
+    try {
+      const descriptor = await server.start()
+      const executing = rpc(
+        descriptor,
+        'exec',
+        {
+          command: process.execPath,
+          args: [
+            '-e',
+            `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(descendantMarker)}, 'started'); setInterval(() => {}, 1000)`)}], { stdio: 'ignore' }); setInterval(() => {}, 1000)`,
+          ],
+          timeoutSeconds: 5,
+          workdir: root,
+        },
+        context
       )
-        break
-      await Bun.sleep(20)
+      let id = ''
+      for (let attempt = 0; attempt < 50 && !id; attempt += 1) {
+        id = (await storage.loadSessions()).find((session) => session.mode === 'exec')?.id ?? ''
+        if (!id) await Bun.sleep(20)
+      }
+      expect(id).not.toBe('')
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (
+          await stat(descendantMarker).then(
+            () => true,
+            () => false
+          )
+        )
+          break
+        await Bun.sleep(20)
+      }
+      await stat(descendantMarker)
+      expect(
+        await rpc(descriptor, 'stop', { id }, context).then((response) => response.json())
+      ).toMatchObject({
+        result: { terminationConfirmed: true, containment: { status: 'windows_job_empty' } },
+      })
+      await expect(executing.then((response) => response.json())).resolves.toMatchObject({
+        result: { terminationConfirmed: true },
+      })
+    } finally {
+      await server.stop()
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
     }
-    await stat(descendantMarker)
-    expect(
-      await rpc(descriptor, 'stop', { id }, context).then((response) => response.json())
-    ).toMatchObject({
-      result: { terminationConfirmed: true, containment: { status: 'windows_job_empty' } },
-    })
-    await expect(executing.then((response) => response.json())).resolves.toMatchObject({
-      result: { terminationConfirmed: true },
-    })
-  } finally {
-    await server.stop()
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
-  }
-}, 10_000)
+  },
+  10_000
+)
 
 test('native RPC loss after command start reaps the direct child before persisting unknown', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-rpc-loss-'))
@@ -3387,26 +3576,28 @@ test('native RPC loss after command start reaps the direct child before persisti
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
   await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
   process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-rpc-loss', root)
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-rpc-loss')
   try {
     const descriptor = await server.start()
-    const result = await rpc(
-      descriptor,
-      'exec',
-      {
-        command: process.execPath,
-        args: ['-e', 'setInterval(() => {}, 1000)'],
-        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'rpc_loss_after_start' },
-        timeoutSeconds: 2,
-      },
-      context
-    ).then((response) => response.json())
+    const result = await withProcessEnv(
+      { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'rpc_loss_after_start' },
+      () =>
+        rpc(
+          descriptor,
+          'exec',
+          {
+            command: process.execPath,
+            args: ['-e', 'setInterval(() => {}, 1000)'],
+            timeoutSeconds: 2,
+            workdir: root,
+          },
+          context
+        ).then((response) => response.json())
+    )
     expect(result.ok).toBeBoolean()
     const session = (await storage.loadSessions()).find((entry) => entry.mode === 'exec')
     expect(await processGone(session?.pid ?? 0)).toBeTrue()
@@ -3414,417 +3605,489 @@ test('native RPC loss after command start reaps the direct child before persisti
     else expect(session).toMatchObject({ status: 'lost', exitReason: { kind: 'unknown' } })
   } finally {
     await server.stop()
-    if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-    else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
 }, 10_000)
 
-test('native exec POSIX containment creates a fresh session, drains groups, escalates, and reports escapes', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-posix-'))
+test('spawn payload fault knobs are stripped from session env and never trigger fault injection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-fault-env-strip-'))
   roots.push(root)
-  const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker')
-  await stat(workerPath)
-  const previousEnabled = process.env.PTY_NATIVE_WORKER_ENABLED
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_ENABLED = '1'
-  process.env.PTY_NATIVE_WORKER_PATH = workerPath
   const storage = new DaemonStorage(root)
-  const context = await owner(storage, 'native-posix', root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-posix')
-  const directChildPidFile = join(root, 'direct-child.pid')
-  let directChildPid = 0
-  let escapedPid = 0
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'fault-strip')
+  const descriptor = await server.start()
+  const context = await owner(storage, 'fault-strip', root)
+  const marker = join(root, 'fault-env.txt')
   try {
-    const descriptor = await server.start()
-    const run = async (script: string) =>
-      rpc(
-        descriptor,
-        'exec',
-        { command: process.execPath, args: ['-e', script], timeoutSeconds: 3 },
-        context
-      )
-    const running = run(
-      `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});writeFileSync(${JSON.stringify(directChildPidFile)},String(child.pid));setInterval(()=>{},1000)`
-    )
-    let record: SessionRecord | undefined
-    for (let attempt = 0; attempt < 50 && !record; attempt += 1) {
-      record = (await storage.loadSessions()).find((entry) => entry.mode === 'exec')
-      if (!record) await Bun.sleep(20)
-    }
-    expect(record?.containment).toMatchObject({
-      platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
-      rootPid: record?.pid,
-      processGroupId: record?.pid,
-      sessionId: record?.pid,
-    })
-    for (let attempt = 0; attempt < 50 && !directChildPid; attempt += 1) {
-      directChildPid = Number((await readFile(directChildPidFile, 'utf8').catch(() => '')).trim())
-      if (!directChildPid) await Bun.sleep(20)
-    }
-    if (process.platform === 'darwin') expect(directChildPid).toBeGreaterThan(0)
-    const stopped = await rpc(descriptor, 'stop', { id: record?.id }, context).then((response) =>
-      response.json()
-    )
-    if (process.platform === 'linux') {
-      expect(stopped).toMatchObject({
-        result: {
-          containment: { status: 'posix_processes_remaining' },
-          terminationConfirmed: false,
-        },
-      })
-    } else {
-      expect(stopped).toMatchObject({
-        result: {
-          containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
-          directChildExited: true,
-          termination: { termSignalSent: true, killSignalSent: true, directChildExited: true },
-        },
-      })
-    }
-    await running
-
-    const termIgnoring = await run("process.on('SIGTERM',()=>{});setInterval(()=>{},1000)").then(
-      (response) => response.json()
-    )
-    expect(termIgnoring).toMatchObject(
-      process.platform === 'linux'
-        ? {
-            result: { timedOut: true, termination: { termSignalSent: true, killSignalSent: true } },
-          }
-        : {
-            result: {
-              timedOut: true,
-              containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
-              termination: { termSignalSent: true, killSignalSent: true, directChildExited: true },
-            },
-          }
-    )
-
-    const escaped = run(
-      "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});console.log(child.pid);setInterval(()=>{},1000)"
-    )
-    let escapedRecord: SessionRecord | undefined
-    for (let attempt = 0; attempt < 50 && !escapedRecord; attempt += 1) {
-      escapedRecord = (await storage.loadSessions()).find(
-        (entry) => entry.mode === 'exec' && entry.id !== record?.id
-      )
-      if (!escapedRecord) await Bun.sleep(20)
-    }
-    for (let attempt = 0; attempt < 50 && !escapedPid; attempt += 1) {
-      escapedPid = Number(
-        (await storage.loadSessions())
-          .find((entry) => entry.id === escapedRecord?.id)
-          ?.execOutput?.stdout.trim()
-      )
-      if (!escapedPid) await Bun.sleep(20)
-    }
-    const escapedStop = await rpc(descriptor, 'stop', { id: escapedRecord?.id }, context).then(
-      (response) => response.json()
-    )
-    if (process.platform === 'linux')
-      expect(escapedStop).toMatchObject({
-        result: { containment: { status: 'posix_escape_observed' } },
-      })
-    if (process.platform === 'darwin') {
-      expect(await processGone(escapedPid)).toBeFalse()
-      process.kill(escapedPid, 'SIGKILL')
-      escapedPid = 0
-    }
-    await escaped
-  } finally {
-    try {
-      if (directChildPid) {
-        try {
-          process.kill(directChildPid, 'SIGKILL')
-        } catch (error) {
-          expect((error as NodeJS.ErrnoException).code).toBe('ESRCH')
-        }
-        expect(await processGone(directChildPid)).toBeTrue()
-      }
-      if (escapedPid) process.kill(escapedPid, 'SIGKILL')
-    } finally {
-      await server.stop()
-      if (previousEnabled === undefined) delete process.env.PTY_NATIVE_WORKER_ENABLED
-      else process.env.PTY_NATIVE_WORKER_ENABLED = previousEnabled
-      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
-    }
-  }
-}, 15_000)
-
-test('macOS normal direct-child completion is readable and cleanable without descendant confirmation', async () => {
-  if (process.platform !== 'darwin') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-macos-normal-'))
-  roots.push(root)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  try {
-    const result = await supervisor.nativeExec({
-      command: process.execPath,
-      args: ['-e', "console.log('macos-normal')"],
-      parentSessionId: 'macos',
-      timeoutSeconds: 2,
-      workdir: root,
-    })
-    expect(result).toMatchObject({ stdout: 'macos-normal\n', terminationConfirmed: true })
-    expect(await supervisor.get(result.session.id)).toMatchObject({
-      status: 'exited',
-      directChildExited: true,
-      containment: { status: 'posix_containment_unknown' },
-    })
-    expect(await supervisor.cleanup(result.session.id)).toBeTrue()
-  } finally {
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
-  }
-}, 10_000)
-
-test('native PTY writes, resizes, rejects exec resize, and recovers after daemon restart', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-pty-'))
-  roots.push(root)
-  const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker')
-  await stat(workerPath)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = workerPath
-  const storage = new DaemonStorage(root)
-  const context = await owner(storage, 'native-pty', root)
-  const first = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-first')
-  let restarted: DaemonServer | undefined
-  try {
-    const descriptor = await first.start()
-    const spawned = await rpc(
+    const spawned = (await rpc(
       descriptor,
       'spawn',
       {
         command: process.execPath,
-        args: ['-e', "process.stdin.on('data', value => process.stdout.write('echo:' + value))"],
-        description: 'native pty integration',
+        args: [
+          '-e',
+          `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'fault=' + String(process.env.OPENCODE_PTY_NATIVE_WORKER_FAULT)); setTimeout(() => {}, 250)`,
+        ],
+        env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'job_assign' },
+        description: 'fault knob stripping',
+        workdir: root,
       },
       context
-    ).then((response) => response.json())
-    const id = (spawned as { result: { id: string } }).result.id
-    expect(
-      await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then((response) =>
-        response.json()
-      )
-    ).toMatchObject({ result: { cols: 100, rows: 30 } })
-    await rpc(descriptor, 'write', { id, data: 'conpty-check\n' }, context)
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const output = (await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
-        response.json()
-      )) as { result?: { raw?: string } }
-      if (output.result?.raw?.includes('echo:conpty-check')) break
-      await Bun.sleep(20)
+    ).then((response) => response.json())) as { ok: boolean; result?: { id: string } }
+    // A live job_assign fault would fail the native spawn outright; a successful
+    // session with an unset variable proves the knob was stripped from session env.
+    expect(spawned.ok).toBeTrue()
+    const id = spawned.result?.id
+    if (!id) throw new Error('Expected a spawned session despite the fault knob in session env.')
+    let evidence = ''
+    for (let attempt = 0; attempt < 200 && !evidence; attempt += 1) {
+      evidence = await readFile(marker, 'utf8').catch(() => '')
+      if (!evidence) await Bun.sleep(25)
     }
-    expect(
-      await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: { raw: expect.stringContaining('echo:conpty-check') } })
-    await first.stop()
-    restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-second')
-    const restartedDescriptor = await restarted.start()
-    expect(
-      await rpc(restartedDescriptor, 'resize', { id, cols: 90, rows: 25 }, context).then(
-        (response) => response.json()
-      )
-    ).toMatchObject({ result: { cols: 90, rows: 25 } })
-    expect(
-      await rpc(restartedDescriptor, 'stop', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: {} })
+    expect(evidence).toBe('fault=undefined')
+    const record = (await rpc(descriptor, 'get', { id }, context).then((response) =>
+      response.json()
+    )) as { result?: { status?: string } }
+    expect(['running', 'exited']).toContain(record.result?.status ?? '')
+    await rpc(descriptor, 'stop', { id }, context)
   } finally {
-    await restarted?.stop()
-    await first.stop().catch(() => undefined)
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    await server.stop()
   }
 }, 15_000)
 
-test('Windows ConPTY cmd more accepts unique input, resizes, and cleans up', async () => {
-  if (process.platform !== 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-'))
-  roots.push(root)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
-  const storage = new DaemonStorage(root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'windows-conpty')
-  let descriptor: { endpoint: string; token: string } | undefined
-  let id: string | undefined
-  let cmdPid: number | undefined
-  let workerPid: number | undefined
-  try {
-    descriptor = await server.start()
-    const context = await owner(storage, 'windows-conpty', root)
-    const spawned = (await rpc(
-      descriptor,
-      'spawn',
-      {
-        command: 'cmd.exe',
-        args: ['/d', '/c', 'more'],
-        description: 'Windows ConPTY more',
-      },
-      context
-    ).then((response) => response.json())) as {
-      ok: boolean
-      result?: { id: unknown }
-      error?: unknown
+test.skipIf(process.platform === 'win32')(
+  'native exec POSIX containment creates a fresh session, drains groups, escalates, and reports escapes',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-posix-'))
+    roots.push(root)
+    const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker')
+    await stat(workerPath)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    const storage = new DaemonStorage(root)
+    const context = await owner(storage, 'native-posix', root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-posix')
+    const directChildPidFile = join(root, 'direct-child.pid')
+    let directChildPid = 0
+    let escapedPid = 0
+    try {
+      const descriptor = await server.start()
+      const run = async (script: string) =>
+        rpc(
+          descriptor,
+          'exec',
+          { command: process.execPath, args: ['-e', script], timeoutSeconds: 3, workdir: root },
+          context
+        )
+      const running = run(
+        `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});writeFileSync(${JSON.stringify(directChildPidFile)},String(child.pid));setInterval(()=>{},1000)`
+      )
+      let record: SessionRecord | undefined
+      for (let attempt = 0; attempt < 50 && !record; attempt += 1) {
+        record = (await storage.loadSessions()).find((entry) => entry.mode === 'exec')
+        if (!record) await Bun.sleep(20)
+      }
+      expect(record?.containment).toMatchObject({
+        platform: process.platform === 'linux' ? 'linux_proc' : 'posix_verification_unavailable',
+        rootPid: record?.pid,
+        processGroupId: record?.pid,
+        sessionId: record?.pid,
+      })
+      for (let attempt = 0; attempt < 50 && !directChildPid; attempt += 1) {
+        directChildPid = Number((await readFile(directChildPidFile, 'utf8').catch(() => '')).trim())
+        if (!directChildPid) await Bun.sleep(20)
+      }
+      if (process.platform === 'darwin') expect(directChildPid).toBeGreaterThan(0)
+      const stopped = await rpc(descriptor, 'stop', { id: record?.id }, context).then((response) =>
+        response.json()
+      )
+      if (process.platform === 'linux') {
+        expect(stopped).toMatchObject({
+          result: {
+            containment: { status: 'posix_processes_remaining' },
+            terminationConfirmed: false,
+          },
+        })
+      } else {
+        expect(stopped).toMatchObject({
+          result: {
+            containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
+            directChildExited: true,
+            termination: { termSignalSent: true, killSignalSent: true, directChildExited: true },
+          },
+        })
+      }
+      await running
+
+      const termIgnoring = await run("process.on('SIGTERM',()=>{});setInterval(()=>{},1000)").then(
+        (response) => response.json()
+      )
+      expect(termIgnoring).toMatchObject(
+        process.platform === 'linux'
+          ? {
+              result: {
+                timedOut: true,
+                termination: { termSignalSent: true, killSignalSent: true },
+              },
+            }
+          : {
+              result: {
+                timedOut: true,
+                containment: { status: 'posix_containment_unknown', rootIdentityVerified: false },
+                termination: {
+                  termSignalSent: true,
+                  killSignalSent: true,
+                  directChildExited: true,
+                },
+              },
+            }
+      )
+
+      const escaped = run(
+        "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});console.log(child.pid);setInterval(()=>{},1000)"
+      )
+      let escapedRecord: SessionRecord | undefined
+      for (let attempt = 0; attempt < 50 && !escapedRecord; attempt += 1) {
+        escapedRecord = (await storage.loadSessions()).find(
+          (entry) => entry.mode === 'exec' && entry.id !== record?.id
+        )
+        if (!escapedRecord) await Bun.sleep(20)
+      }
+      for (let attempt = 0; attempt < 50 && !escapedPid; attempt += 1) {
+        escapedPid = Number(
+          (await storage.loadSessions())
+            .find((entry) => entry.id === escapedRecord?.id)
+            ?.execOutput?.stdout.trim()
+        )
+        if (!escapedPid) await Bun.sleep(20)
+      }
+      const escapedStop = await rpc(descriptor, 'stop', { id: escapedRecord?.id }, context).then(
+        (response) => response.json()
+      )
+      if (process.platform === 'linux')
+        expect(escapedStop).toMatchObject({
+          result: { containment: { status: 'posix_escape_observed' } },
+        })
+      if (process.platform === 'darwin') {
+        expect(await processGone(escapedPid)).toBeFalse()
+        process.kill(escapedPid, 'SIGKILL')
+        escapedPid = 0
+      }
+      await escaped
+    } finally {
+      try {
+        if (directChildPid) {
+          try {
+            process.kill(directChildPid, 'SIGKILL')
+          } catch (error) {
+            expect((error as NodeJS.ErrnoException).code).toBe('ESRCH')
+          }
+          expect(await processGone(directChildPid)).toBeTrue()
+        }
+        if (escapedPid) process.kill(escapedPid, 'SIGKILL')
+      } finally {
+        await server.stop()
+        if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+        else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+      }
     }
-    expect(spawned.ok).toBeTrue()
-    if (!spawned.result || typeof spawned.result.id !== 'string')
-      throw new Error(JSON.stringify(spawned.error ?? spawned))
-    id = spawned.result.id
-    const running = (await rpc(descriptor, 'get', { id }, context).then((response) =>
-      response.json()
-    )) as { result?: { pid?: unknown } }
-    if (typeof running.result?.pid !== 'number')
-      throw new Error('Windows ConPTY cmd pid is invalid')
-    cmdPid = running.result.pid
-    const worker = JSON.parse(
-      await readFile(join(root, 'sessions', id, 'worker.json'), 'utf8')
-    ) as { pid?: unknown }
-    if (typeof worker.pid !== 'number') throw new Error('Windows ConPTY worker pid is invalid')
-    workerPid = worker.pid
-    const marker = `conpty-more-${crypto.randomUUID()}`
-    expect(
-      await rpc(
+  },
+  15_000
+)
+
+test.skipIf(process.platform !== 'darwin')(
+  'macOS normal direct-child completion is readable and cleanable without descendant confirmation',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-macos-normal-'))
+    roots.push(root)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    try {
+      const result = await supervisor.nativeExec({
+        command: process.execPath,
+        args: ['-e', "console.log('macos-normal')"],
+        parentSessionId: 'macos',
+        timeoutSeconds: 2,
+        workdir: root,
+      })
+      expect(result).toMatchObject({ stdout: 'macos-normal\n', terminationConfirmed: true })
+      expect(await supervisor.get(result.session.id)).toMatchObject({
+        status: 'exited',
+        directChildExited: true,
+        containment: { status: 'posix_containment_unknown' },
+      })
+      expect(await supervisor.cleanup(result.session.id)).toBeTrue()
+    } finally {
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    }
+  },
+  10_000
+)
+
+test.skipIf(process.platform === 'win32')(
+  'native PTY writes, resizes, rejects exec resize, and recovers after daemon restart',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-pty-'))
+    roots.push(root)
+    const workerPath = join(process.cwd(), 'target', 'debug', 'opencode-pty-worker')
+    await stat(workerPath)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    const storage = new DaemonStorage(root)
+    const context = await owner(storage, 'native-pty', root)
+    const first = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-first')
+    let restarted: DaemonServer | undefined
+    try {
+      const descriptor = await first.start()
+      const spawned = await rpc(
         descriptor,
-        'sendWait',
+        'spawn',
         {
-          id,
-          data: `${marker}\r\n`,
-          condition: { kind: 'output', literal: marker },
-          timeoutSeconds: 2,
+          command: process.execPath,
+          args: ['-e', "process.stdin.on('data', value => process.stdout.write('echo:' + value))"],
+          description: 'native pty integration',
+          workdir: root,
         },
         context
       ).then((response) => response.json())
-    ).toMatchObject({ result: { satisfied: true } })
-    const resized = await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then(
-      (response) => response.json()
-    )
-    expect(resized).toMatchObject({ result: { cols: 100, rows: 30 } })
-    expect(
-      await rpc(descriptor, 'list', {}, context).then((response) => response.json())
-    ).toMatchObject({ result: [{ id, status: 'running' }] })
-    expect(
-      await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: { raw: expect.stringContaining(marker) } })
-    const stopped = await rpc(descriptor, 'stop', { id }, context).then((response) =>
-      response.json()
-    )
-    expect(stopped).toMatchObject({
-      result: { terminationConfirmed: true, containment: { status: 'windows_job_empty' } },
-    })
-    expect(
-      await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
-    ).toMatchObject({
-      result: {
-        status: 'exited',
-        terminationConfirmed: true,
-        containment: { status: 'windows_job_empty' },
-      },
-    })
-    expect(
-      await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: true })
-    id = undefined
-    expect(await processGone(cmdPid)).toBeTrue()
-    expect(await processGone(workerPid)).toBeTrue()
-  } finally {
-    if (descriptor && id) {
-      const context = await owner(storage, 'windows-conpty', root).catch(() => undefined)
-      if (context) {
-        await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
-        await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
+      const id = (spawned as { result: { id: string } }).result.id
+      expect(
+        await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then((response) =>
+          response.json()
+        )
+      ).toMatchObject({ result: { cols: 100, rows: 30 } })
+      await rpc(descriptor, 'write', { id, data: 'conpty-check\n' }, context)
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const output = (await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
+          response.json()
+        )) as { result?: { raw?: string } }
+        if (output.result?.raw?.includes('echo:conpty-check')) break
+        await Bun.sleep(20)
       }
+      expect(
+        await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
+      ).toMatchObject({ result: { raw: expect.stringContaining('echo:conpty-check') } })
+      await first.stop()
+      restarted = new DaemonServer(storage, new SessionSupervisor(storage), 'native-pty-second')
+      const restartedDescriptor = await restarted.start()
+      expect(
+        await rpc(restartedDescriptor, 'resize', { id, cols: 90, rows: 25 }, context).then(
+          (response) => response.json()
+        )
+      ).toMatchObject({ result: { cols: 90, rows: 25 } })
+      expect(
+        await rpc(restartedDescriptor, 'stop', { id }, context).then((response) => response.json())
+      ).toMatchObject({ result: {} })
+    } finally {
+      await restarted?.stop()
+      await first.stop().catch(() => undefined)
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
     }
-    await server.stop().catch(() => undefined)
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
-  }
-}, 10_000)
+  },
+  15_000
+)
 
-test('Windows ConPTY cmd echo drains terminal output and its Job', async () => {
-  if (process.platform !== 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-finite-'))
-  roots.push(root)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
-  const storage = new DaemonStorage(root)
-  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'windows-conpty-finite')
-  let descriptor: { endpoint: string; token: string } | undefined
-  let id: string | undefined
-  try {
-    descriptor = await server.start()
-    const context = await owner(storage, 'windows-conpty-finite', root)
-    const markerPath = join(root, 'marker.txt')
-    const spawned = (await rpc(
-      descriptor,
-      'spawn',
-      {
-        command: 'cmd.exe',
-        args: ['/d', '/c', `echo conpty-ok & echo conpty-ok > ${markerPath}`],
-        description: 'Windows ConPTY echo',
-      },
-      context
-    ).then((response) => response.json())) as { result?: { id?: unknown } }
-    if (typeof spawned.result?.id !== 'string') throw new Error('finite ConPTY id is invalid')
-    id = spawned.result.id
-    for (let attempt = 0; attempt < 1500; attempt += 1) {
-      const session = (await rpc(descriptor, 'get', { id }, context).then((response) =>
+test.skipIf(process.platform !== 'win32')(
+  'Windows ConPTY cmd more accepts unique input, resizes, and cleans up',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-'))
+    roots.push(root)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+    const storage = new DaemonStorage(root)
+    const server = new DaemonServer(storage, new SessionSupervisor(storage), 'windows-conpty')
+    let descriptor: { endpoint: string; token: string } | undefined
+    let id: string | undefined
+    let cmdPid: number | undefined
+    let workerPid: number | undefined
+    try {
+      descriptor = await server.start()
+      const context = await owner(storage, 'windows-conpty', root)
+      const spawned = (await rpc(
+        descriptor,
+        'spawn',
+        {
+          command: 'cmd.exe',
+          args: ['/d', '/c', 'more'],
+          description: 'Windows ConPTY more',
+          workdir: root,
+        },
+        context
+      ).then((response) => response.json())) as {
+        ok: boolean
+        result?: { id: unknown }
+        error?: unknown
+      }
+      expect(spawned.ok).toBeTrue()
+      if (!spawned.result || typeof spawned.result.id !== 'string')
+        throw new Error(JSON.stringify(spawned.error ?? spawned))
+      id = spawned.result.id
+      const running = (await rpc(descriptor, 'get', { id }, context).then((response) =>
         response.json()
-      )) as { result?: { status?: string } }
-      if (session.result?.status !== 'running') break
-      await Bun.sleep(20)
-    }
-    expect(existsSync(markerPath)).toBeTrue()
-    expect(await readFile(markerPath, 'utf8')).toContain('conpty-ok')
-    const output = await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
-      response.json()
-    )
-    const session = await rpc(descriptor, 'get', { id }, context).then((response) =>
-      response.json()
-    )
-    const raw = (output as { result?: { raw?: string } }).result?.raw
-    const diagnostics = (session as { result?: { diagnostics?: string[] } }).result?.diagnostics
-    if (!raw?.includes('conpty-ok'))
-      throw new Error(`finite ConPTY output loss diagnostics: ${JSON.stringify(diagnostics)}`)
-    expect(session).toMatchObject({
-      result: {
-        status: 'exited',
-        terminationConfirmed: true,
-        containment: { status: 'windows_job_empty' },
-      },
-    })
-    const diagnosticPresent = diagnostics?.some((diagnostic) => {
-      try {
-        const value = JSON.parse(diagnostic) as { hpconNonzero?: boolean; readerStarted?: boolean }
-        return value.hpconNonzero === true && value.readerStarted === true
-      } catch {
-        return false
+      )) as { result?: { pid?: unknown } }
+      if (typeof running.result?.pid !== 'number')
+        throw new Error('Windows ConPTY cmd pid is invalid')
+      cmdPid = running.result.pid
+      const worker = JSON.parse(
+        await readFile(join(root, 'sessions', id, 'worker.json'), 'utf8')
+      ) as { pid?: unknown }
+      if (typeof worker.pid !== 'number') throw new Error('Windows ConPTY worker pid is invalid')
+      workerPid = worker.pid
+      const marker = `conpty-more-${crypto.randomUUID()}`
+      expect(
+        await rpc(
+          descriptor,
+          'sendWait',
+          {
+            id,
+            data: `${marker}\r\n`,
+            condition: { kind: 'output', literal: marker },
+            timeoutSeconds: 2,
+          },
+          context
+        ).then((response) => response.json())
+      ).toMatchObject({ result: { satisfied: true } })
+      const resized = await rpc(descriptor, 'resize', { id, cols: 100, rows: 30 }, context).then(
+        (response) => response.json()
+      )
+      expect(resized).toMatchObject({ result: { cols: 100, rows: 30 } })
+      expect(
+        await rpc(descriptor, 'list', {}, context).then((response) => response.json())
+      ).toMatchObject({ result: [{ id, status: 'running' }] })
+      expect(
+        await rpc(descriptor, 'rawOutput', { id }, context).then((response) => response.json())
+      ).toMatchObject({ result: { raw: expect.stringContaining(marker) } })
+      const stopped = await rpc(descriptor, 'stop', { id }, context).then((response) =>
+        response.json()
+      )
+      expect(stopped).toMatchObject({
+        result: { terminationConfirmed: true, containment: { status: 'windows_job_empty' } },
+      })
+      expect(
+        await rpc(descriptor, 'get', { id }, context).then((response) => response.json())
+      ).toMatchObject({
+        result: {
+          status: 'exited',
+          terminationConfirmed: true,
+          containment: { status: 'windows_job_empty' },
+        },
+      })
+      expect(
+        await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
+      ).toMatchObject({ result: true })
+      id = undefined
+      expect(await processGone(cmdPid)).toBeTrue()
+      expect(await processGone(workerPid)).toBeTrue()
+    } finally {
+      if (descriptor && id) {
+        const context = await owner(storage, 'windows-conpty', root).catch(() => undefined)
+        if (context) {
+          await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
+          await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
+        }
       }
-    })
-    if (!diagnosticPresent) throw new Error(`finite ConPTY diagnostics: ${JSON.stringify(session)}`)
-    expect(
-      await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
-    ).toMatchObject({ result: true })
-    id = undefined
-  } finally {
-    if (descriptor && id) {
-      const context = await owner(storage, 'windows-conpty-finite', root).catch(() => undefined)
-      if (context) {
-        await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
-        await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
-      }
+      await server.stop().catch(() => undefined)
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
     }
-    await server.stop().catch(() => undefined)
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
-  }
-}, 30_000)
+  },
+  10_000
+)
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows ConPTY cmd echo drains terminal output and its Job',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-conpty-finite-'))
+    roots.push(root)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+    const storage = new DaemonStorage(root)
+    const server = new DaemonServer(
+      storage,
+      new SessionSupervisor(storage),
+      'windows-conpty-finite'
+    )
+    let descriptor: { endpoint: string; token: string } | undefined
+    let id: string | undefined
+    try {
+      descriptor = await server.start()
+      const context = await owner(storage, 'windows-conpty-finite', root)
+      const markerPath = join(root, 'marker.txt')
+      const spawned = (await rpc(
+        descriptor,
+        'spawn',
+        {
+          command: 'cmd.exe',
+          args: ['/d', '/c', `echo conpty-ok & echo conpty-ok > ${markerPath}`],
+          description: 'Windows ConPTY echo',
+          workdir: root,
+        },
+        context
+      ).then((response) => response.json())) as { result?: { id?: unknown } }
+      if (typeof spawned.result?.id !== 'string') throw new Error('finite ConPTY id is invalid')
+      id = spawned.result.id
+      for (let attempt = 0; attempt < 1500; attempt += 1) {
+        const session = (await rpc(descriptor, 'get', { id }, context).then((response) =>
+          response.json()
+        )) as { result?: { status?: string } }
+        if (session.result?.status !== 'running') break
+        await Bun.sleep(20)
+      }
+      expect(existsSync(markerPath)).toBeTrue()
+      expect(await readFile(markerPath, 'utf8')).toContain('conpty-ok')
+      const output = await rpc(descriptor, 'rawOutput', { id }, context).then((response) =>
+        response.json()
+      )
+      const session = await rpc(descriptor, 'get', { id }, context).then((response) =>
+        response.json()
+      )
+      const raw = (output as { result?: { raw?: string } }).result?.raw
+      const diagnostics = (session as { result?: { diagnostics?: string[] } }).result?.diagnostics
+      if (!raw?.includes('conpty-ok'))
+        throw new Error(`finite ConPTY output loss diagnostics: ${JSON.stringify(diagnostics)}`)
+      expect(session).toMatchObject({
+        result: {
+          status: 'exited',
+          terminationConfirmed: true,
+          containment: { status: 'windows_job_empty' },
+        },
+      })
+      const diagnosticPresent = diagnostics?.some((diagnostic) => {
+        try {
+          const value = JSON.parse(diagnostic) as {
+            hpconNonzero?: boolean
+            readerStarted?: boolean
+          }
+          return value.hpconNonzero === true && value.readerStarted === true
+        } catch {
+          return false
+        }
+      })
+      if (!diagnosticPresent)
+        throw new Error(`finite ConPTY diagnostics: ${JSON.stringify(session)}`)
+      expect(
+        await rpc(descriptor, 'cleanup', { id }, context).then((response) => response.json())
+      ).toMatchObject({ result: true })
+      id = undefined
+    } finally {
+      if (descriptor && id) {
+        const context = await owner(storage, 'windows-conpty-finite', root).catch(() => undefined)
+        if (context) {
+          await rpc(descriptor, 'stop', { id }, context).catch(() => undefined)
+          await rpc(descriptor, 'cleanup', { id }, context).catch(() => undefined)
+        }
+      }
+      await server.stop().catch(() => undefined)
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    }
+  },
+  30_000
+)
 
 test('tool output XML escaping covers text and attributes', () => {
   expect(escapeXml(`<&>"'`)).toBe('&lt;&amp;&gt;&quot;&apos;')
@@ -3833,29 +4096,31 @@ test('tool output XML escaping covers text and attributes', () => {
   expect(formatLine('😀x', 1, 1)).toContain('😀...')
 })
 
-test('native PTY has no implicit worker deadline', async () => {
-  if (process.platform === 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-pty-no-timeout-'))
-  roots.push(root)
-  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
-  const supervisor = new SessionSupervisor(new DaemonStorage(root))
-  await supervisor.initialize()
-  try {
-    const session = await supervisor.spawn({
-      command: process.execPath,
-      args: ['-e', 'setInterval(() => {}, 1000)'],
-      parentSessionId: 'parent',
-      workdir: root,
-    })
-    expect(session.timeoutSeconds).toBeUndefined()
-    expect((await supervisor.get(session.id))?.timeoutSeconds).toBeUndefined()
-    await supervisor.stop(session.id)
-  } finally {
-    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
-    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+test.skipIf(process.platform === 'win32')(
+  'native PTY has no implicit worker deadline',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-pty-no-timeout-'))
+    roots.push(root)
+    const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+    process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+    const supervisor = new SessionSupervisor(new DaemonStorage(root))
+    await supervisor.initialize()
+    try {
+      const session = await supervisor.spawn({
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        parentSessionId: 'parent',
+        workdir: root,
+      })
+      expect(session.timeoutSeconds).toBeUndefined()
+      expect((await supervisor.get(session.id))?.timeoutSeconds).toBeUndefined()
+      await supervisor.stop(session.id)
+    } finally {
+      if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+      else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+    }
   }
-})
+)
 
 test('tool session rendering preserves containment survivors and unknown verification', () => {
   const root = process.cwd()
@@ -3947,7 +4212,8 @@ test('client does not contact a live incompatible daemon descriptor', async () =
     expect((await storage.readDescriptor())?.protocolVersion).toBe(DAEMON_PROTOCOL_VERSION + 1)
   } finally {
     server.stop(true)
-    process.env.PTY_DAEMON_DIR = previousDirectory
+    if (previousDirectory === undefined) delete process.env.PTY_DAEMON_DIR
+    else process.env.PTY_DAEMON_DIR = previousDirectory
   }
 })
 
@@ -3979,7 +4245,7 @@ test('daemon launcher detaches without a Windows console window', () => {
 test('Windows worker launcher isolates native workers without a console window', () => {
   expect(workerLaunchOptions(['worker.exe'])).toMatchObject({
     cmd: ['worker.exe'],
-    detached: process.platform === 'win32',
+    detached: true,
     windowsHide: true,
     stdin: 'pipe',
     stdout: 'pipe',
@@ -4011,8 +4277,10 @@ $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($everyone, [Sy
 $acl.AddAccessRule($rule)
 Set-Acl -LiteralPath $env:PTY_DAEMON_ACL_PATH -AclObject $acl`,
       ],
+      cwd: root,
       stdout: 'ignore',
       stderr: 'pipe',
+      windowsHide: true,
       env: { ...process.env, PTY_DAEMON_ACL_PATH: root },
     })
     expect(await foreignAcl.exited).toBe(0)
@@ -4052,8 +4320,10 @@ Set-Acl -LiteralPath $env:PTY_DAEMON_ACL_PATH -AclObject $acl`,
           '-Command',
           '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
         ],
+        cwd: root,
         stdout: 'pipe',
         stderr: 'pipe',
+        windowsHide: true,
       })
       const sid = (await new Response(sidProcess.stdout).text()).trim()
       expect(await sidProcess.exited).toBe(0)
@@ -4069,8 +4339,10 @@ foreach ($item in $items) {
   if ($rules.Count -ne 2 -or @($rules | Where-Object { $_.IdentityReference.Value -notin @($env:PTY_DAEMON_ACL_USER_SID, 'S-1-5-18') }).Count -ne 0) { throw "Foreign ACE survived daemon storage initialization: $($item.FullName): $($rules.IdentityReference.Value -join ',')." }
 }`,
         ],
+        cwd: root,
         stdout: 'pipe',
         stderr: 'pipe',
+        windowsHide: true,
         env: {
           ...process.env,
           PTY_DAEMON_ACL_PATH: root,
@@ -4342,45 +4614,47 @@ test('native finalization persists a lost storage failure', async () => {
   ])
 })
 
-test('Windows native high exit status persists as an unsigned code', async () => {
-  if (process.platform !== 'win32') return
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-exit-code-'))
-  roots.push(root)
-  const storage = new DaemonStorage(root)
-  const supervisor = new SessionSupervisor(storage)
-  const session = record(root, 'pty_windows_high_exit')
-  await storage.writeSession(session)
-  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
-    session.id,
-    session
-  )
-  const exited = workerSnapshot({
-    status: 'exited',
-    exitCode: 0xc0000005,
-    exitReason: 'code',
-    exitedAt: new Date().toISOString(),
-    terminationConfirmed: true,
-    directChildExited: true,
-    stdoutEof: true,
-    stderrEof: true,
-    outputComplete: true,
-  })
-
-  await (
-    supervisor as unknown as {
-      finishNative: (record: SessionRecord, result: WorkerSnapshot) => Promise<unknown>
-    }
-  ).finishNative(session, exited)
-
-  expect(await storage.loadSessions()).toMatchObject([
-    {
-      id: session.id,
+test.skipIf(process.platform !== 'win32')(
+  'Windows native high exit status persists as an unsigned code',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'opencode-pty-windows-exit-code-'))
+    roots.push(root)
+    const storage = new DaemonStorage(root)
+    const supervisor = new SessionSupervisor(storage)
+    const session = record(root, 'pty_windows_high_exit')
+    await storage.writeSession(session)
+    ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+      session.id,
+      session
+    )
+    const exited = workerSnapshot({
       status: 'exited',
       exitCode: 0xc0000005,
-      exitReason: { kind: 'code', code: 0xc0000005 },
-    },
-  ])
-})
+      exitReason: 'code',
+      exitedAt: new Date().toISOString(),
+      terminationConfirmed: true,
+      directChildExited: true,
+      stdoutEof: true,
+      stderrEof: true,
+      outputComplete: true,
+    })
+
+    await (
+      supervisor as unknown as {
+        finishNative: (record: SessionRecord, result: WorkerSnapshot) => Promise<unknown>
+      }
+    ).finishNative(session, exited)
+
+    expect(await storage.loadSessions()).toMatchObject([
+      {
+        id: session.id,
+        status: 'exited',
+        exitCode: 0xc0000005,
+        exitReason: { kind: 'code', code: 0xc0000005 },
+      },
+    ])
+  }
+)
 
 test('stale worker recovery is bounded and parallel', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-parallel-recovery-'))
@@ -4756,6 +5030,7 @@ test('daemon classifies storage failures', async () => {
     initialize: async () => {},
     reconcileWorkers: async () => {},
     flush: async () => {},
+    shutdown: async () => {},
     list: async () => {
       throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
     },
@@ -4791,6 +5066,7 @@ test('daemon classifies PTY failures as process failures', async () => {
     initialize: async () => {},
     reconcileWorkers: async () => {},
     flush: async () => {},
+    shutdown: async () => {},
     list: async () => [],
     spawn: async () => {
       throw new ProcessError('spawn failed')
@@ -4888,7 +5164,8 @@ test('plugin client starts its daemon from the configured data directory', async
   } finally {
     if (pid) process.kill(pid)
     if (pid) expect(await processGone(pid)).toBeTrue()
-    process.env.PTY_DAEMON_DIR = previousDirectory
+    if (previousDirectory === undefined) delete process.env.PTY_DAEMON_DIR
+    else process.env.PTY_DAEMON_DIR = previousDirectory
     if (previousWorkerPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousWorkerPath
   }
@@ -4929,6 +5206,7 @@ test('daemon client returns RPC sequence cursor and truncation metadata', async 
     })
   } finally {
     await server.stop()
-    process.env.PTY_DAEMON_DIR = previousDirectory
+    if (previousDirectory === undefined) delete process.env.PTY_DAEMON_DIR
+    else process.env.PTY_DAEMON_DIR = previousDirectory
   }
 })

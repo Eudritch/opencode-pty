@@ -223,12 +223,14 @@ async function startDaemon(installed: string) {
     stdout: 'ignore',
     stderr: 'pipe',
   })
+  daemonPids.add(child.pid)
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
-      return {
-        child,
-        descriptor: JSON.parse(await readFile(join(stateDirectory, 'daemon.json'), 'utf8')),
-      }
+      const descriptor = JSON.parse(
+        await readFile(join(stateDirectory, 'daemon.json'), 'utf8')
+      ) as { pid?: number; endpoint: string; token: string }
+      if (typeof descriptor.pid === 'number') daemonPids.add(descriptor.pid)
+      return { child, descriptor }
     } catch {
       if (child.exitCode !== null) {
         throw new Error(`Packaged daemon exited: ${await new Response(child.stderr).text()}`)
@@ -239,6 +241,32 @@ async function startDaemon(installed: string) {
   child.kill()
   await waitForExit(child, 'Packaged daemon')
   throw new Error('Packaged daemon did not start.')
+}
+
+// Every daemon pid this run has seen (spawned child and descriptor-recorded pid). Killed
+// process objects can leave the served daemon alive on Windows; a surviving daemon holds
+// the state directory locked and keeps CI shells blocked on inherited pipes.
+const daemonPids = new Set<number>()
+
+async function reapStrayDaemons() {
+  for (const pid of daemonPids) {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      continue
+    }
+    if (process.platform === 'win32') {
+      await runCommand(
+        ['taskkill.exe', '/PID', String(pid), '/T', '/F'],
+        `Reap stray daemon ${pid}`,
+        5000
+      ).catch(() => undefined)
+    } else {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    }
+  }
 }
 
 async function rpc(
@@ -600,6 +628,7 @@ try {
   } finally {
     if (daemon?.exitCode === null) daemon.kill('SIGKILL')
     if (daemon) await waitForExit(daemon, 'Packaged daemon cleanup').catch(() => undefined)
+    await reapStrayDaemons()
     await Promise.allSettled([removeTemporary(packageDirectory), removeTemporary(stateDirectory)])
   }
 }
