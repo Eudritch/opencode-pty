@@ -50,6 +50,20 @@ test('TUI owner derivation requires the active route session', () => {
   ).toBe(false)
 })
 
+test('TUI owner matching rejects empty inputs instead of throwing', () => {
+  const route = { name: 'session', params: { sessionID: 'session-1' } }
+  const owner = ownerForRoute(route, { id: 'session-1', directory: process.cwd() })
+  if (!owner) throw new Error('Expected route owner.')
+  expect(ownerMatchesRoute(route, '', owner)).toBe(false)
+  expect(ownerMatchesRoute(route, undefined as never, owner)).toBe(false)
+  expect(
+    ownerMatchesRoute({ name: 'session', params: { sessionID: '' } }, process.cwd(), {
+      ...owner,
+      parentSessionId: '',
+    })
+  ).toBe(false)
+})
+
 test('TUI scopes discard a stale route or project result', () => {
   const route = { name: 'session', params: { sessionID: 'session-1' } }
   const scope = scopeForRoute(route, process.cwd())

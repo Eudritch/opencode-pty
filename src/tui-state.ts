@@ -56,8 +56,9 @@ export function ownerMatchesRoute(
   owner: OwnerContext
 ): boolean {
   const sessionID = route.name === 'session' ? route.params?.sessionID : undefined
-  if (typeof sessionID !== 'string' || sessionID !== owner.parentSessionId || !activeDirectory)
+  if (typeof sessionID !== 'string' || !sessionID || sessionID !== owner.parentSessionId)
     return false
+  if (typeof activeDirectory !== 'string' || !activeDirectory) return false
   return ownerContext(sessionID, activeDirectory).projectDirectory === owner.projectDirectory
 }
 

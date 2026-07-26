@@ -101,6 +101,8 @@ async function workdirAuthorization(
   workdir: string | undefined,
   agent: string | undefined
 ): Promise<{ workdir: string; outside: boolean; action?: PermissionAction; pattern: string }> {
+  if (typeof directory !== 'string' || !directory)
+    throw new Error('PTY command denied: the plugin host did not provide a project directory.')
   let resolvedPaths: [string, string]
   try {
     resolvedPaths = await Promise.all([realpath(workdir ?? directory), realpath(directory)])
@@ -115,17 +117,23 @@ async function workdirAuthorization(
   return {
     workdir: resolvedWorkdir,
     outside,
-    action: outside ? evaluate(permissions, agent, 'external_directory', resolvedWorkdir) : undefined,
+    action: outside
+      ? evaluate(permissions, agent, 'external_directory', resolvedWorkdir)
+      : undefined,
     pattern: `${dirname(resolvedWorkdir).replace(/\\/g, '/')}/*`,
   }
 }
 
 async function worktreeBoundary(directory: string): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
-      timeout: 2_000,
-      windowsHide: true,
-    })
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', directory, 'rev-parse', '--show-toplevel'],
+      {
+        timeout: 2_000,
+        windowsHide: true,
+      }
+    )
     return await realpath(stdout.trim())
   } catch {
     return directory

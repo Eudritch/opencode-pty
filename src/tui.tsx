@@ -10,6 +10,7 @@ import {
   isApprovalClaim,
   ownerMatchesRoute,
   ownerForRoute,
+  redactPreview,
   sessionCard,
   scopeForRoute,
   scopeMatchesRoute,
@@ -244,8 +245,7 @@ function PtyPanel(props: { api: TuiPluginApi; sessionID: string }) {
         scope &&
         props.sessionID === scope.sessionID &&
         scopeIsCurrent(props.api, scope) &&
-        displayedOwner &&
-        isCurrentOwner(props.api, displayedOwner)
+        (!displayedOwner || isCurrentOwner(props.api, displayedOwner))
       ) {
         setState({ sessions: [], requests: [], grants: [], error: errorMessage(error) })
       }
@@ -271,7 +271,9 @@ function PtyPanel(props: { api: TuiPluginApi; sessionID: string }) {
       <text fg={props.api.theme.current.textMuted}>
         {() => `${state().sessions.length} sessions | ${state().requests.length} approvals`}
       </text>
-      <text fg={props.api.theme.current.error}>{() => state().error ?? ''}</text>
+      {() =>
+        state().error ? <text fg={props.api.theme.current.error}>{state().error}</text> : undefined
+      }
       {() => state().sessions.map((session) => <text>{sessionCard(session)}</text>)}
       {() =>
         state().requests.map((request) => (
@@ -284,8 +286,8 @@ function PtyPanel(props: { api: TuiPluginApi; sessionID: string }) {
 }
 
 function errorMessage(error: unknown): string {
-  void error
-  return 'PTY companion request failed.'
+  const detail = error instanceof Error ? redactPreview(error.message) : ''
+  return detail ? `PTY companion request failed: ${detail}` : 'PTY companion request failed.'
 }
 
 function sameOwner(
