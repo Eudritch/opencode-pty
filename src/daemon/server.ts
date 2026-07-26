@@ -12,6 +12,7 @@ import {
   type RpcResponse,
   MAX_EXEC_RUNTIME_SECONDS,
 } from './types.ts'
+import { DaemonError } from './errors.ts'
 import type { DaemonStorage } from './storage.ts'
 import { ProcessError, type SessionSupervisor } from './supervisor.ts'
 import { effectiveMaxOutputBytes } from './supervisor.ts'
@@ -35,6 +36,30 @@ const MIN_UI_LEASE_SECONDS = 2
 const MAX_UI_LEASE_SECONDS = 5
 
 class ValidationError extends Error {}
+
+function isStorageError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    typeof error.code === 'string' &&
+    /^E[A-Z]+$/.test(error.code)
+  )
+}
+
+export function classifyRpcFailure(error: unknown): RpcFailure['error']['code'] {
+  if (error instanceof ValidationError) return 'validation'
+  // Deliberate daemon errors carry their code; message substrings below are a legacy fallback
+  // that misclassifies internal errors mentioning 'limit', 'closed', or 'not found'.
+  if (error instanceof DaemonError) return error.code
+  if (isStorageError(error)) return 'storage'
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('not authorized')) return 'authorization'
+  if (message.includes('limit')) return 'limit'
+  if (error instanceof ProcessError) return 'process'
+  if (message.includes('not found')) return 'not_found'
+  if (message.includes('closed')) return 'session_closed'
+  return 'internal'
+}
 
 export class DaemonServer implements Disposable {
   private server: ReturnType<typeof Bun.serve> | null = null
@@ -98,7 +123,7 @@ export class DaemonServer implements Disposable {
 
   async stop(): Promise<void> {
     this.server?.stop()
-    await this.supervisor.shutdown?.(false)
+    await this.supervisor.shutdown()
     await this.supervisor.flush()
     await this.storage.removeDescriptor(this.token, this.processIdentity)
   }
@@ -145,22 +170,7 @@ export class DaemonServer implements Disposable {
       return Response.json({ id: rpcRequest.id, ok: true, result } satisfies RpcResponse<unknown>)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      const code =
-        error instanceof ValidationError
-          ? 'validation'
-          : this.isStorageError(error)
-            ? 'storage'
-            : message.includes('not authorized')
-              ? 'authorization'
-              : message.includes('limit')
-                ? 'limit'
-                : error instanceof ProcessError
-                  ? 'process'
-                  : message.includes('not found')
-                    ? 'not_found'
-                    : message.includes('closed')
-                      ? 'session_closed'
-                      : 'internal'
+      const code = classifyRpcFailure(error)
       return this.failure(
         rpcRequest.id,
         code,
@@ -416,7 +426,8 @@ export class DaemonServer implements Disposable {
     const value = this.objectPayload(payload)
     this.onlyFields(value, ['parentSessionId'])
     const parentSessionId = this.requiredString(value, 'parentSessionId')
-    if (parentSessionId !== owner.parentSessionId) throw new Error('Owner is not authorized.')
+    if (parentSessionId !== owner.parentSessionId)
+      throw new DaemonError('Owner is not authorized.', 'authorization')
     return this.supervisor.cleanupByParentSession(
       parentSessionId,
       owner.projectDirectory,
@@ -432,7 +443,7 @@ export class DaemonServer implements Disposable {
       request.approvalCapability !==
         this.approvalCapability(owner.parentSessionId, owner.projectDirectory)
     ) {
-      throw new Error('Owner is not authorized.')
+      throw new DaemonError('Owner is not authorized.', 'authorization')
     }
     return owner
   }
@@ -567,7 +578,7 @@ export class DaemonServer implements Disposable {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
       if (this.approvalClaimTokens.get(request.id) !== this.requiredString(value, 'claimToken')) {
-        throw new Error('Approval claim token is not authorized.')
+        throw new DaemonError('Approval claim token is not authorized.', 'authorization')
       }
       if (request.status !== 'claimed') return request
       request.status =
@@ -632,7 +643,7 @@ export class DaemonServer implements Disposable {
       const request = this.approvalOwned(ledger, owner, this.requiredString(value, 'id'))
       this.refreshApproval(request)
       if (request.digest !== this.approvalDigest(intent))
-        throw new Error('Approval is not authorized.')
+        throw new DaemonError('Approval is not authorized.', 'authorization')
       if (['rejected', 'cancelled', 'expired'].includes(request.status)) return request
       if (request.status === 'approved_once') {
         request.status = 'consumed'
@@ -706,7 +717,7 @@ export class DaemonServer implements Disposable {
           grant.parentSessionId === owner.parentSessionId &&
           grant.projectDirectory === owner.projectDirectory
       )
-      if (index < 0) throw new Error('Approval grant not found.')
+      if (index < 0) throw new DaemonError('Approval grant not found.', 'not_found')
       ledger.grants.splice(index, 1)
       return true
     })
@@ -730,7 +741,7 @@ export class DaemonServer implements Disposable {
   private async approvalCleanupByParentSession(payload: unknown, owner: OwnerContext) {
     const value = this.approvalPayload(payload, ['parentSessionId'])
     if (this.requiredString(value, 'parentSessionId') !== owner.parentSessionId)
-      throw new Error('Owner is not authorized.')
+      throw new DaemonError('Owner is not authorized.', 'authorization')
     await this.withApprovals(async (ledger) => {
       for (const request of ledger.requests) {
         if (
@@ -762,12 +773,12 @@ export class DaemonServer implements Disposable {
 
   private approvalOwned(ledger: ApprovalLedger, owner: OwnerContext, id: string): ApprovalRequest {
     const request = ledger.requests.find((entry) => entry.id === id)
-    if (!request) throw new Error('Approval request not found.')
+    if (!request) throw new DaemonError('Approval request not found.', 'not_found')
     if (
       request.parentSessionId !== owner.parentSessionId ||
       request.projectDirectory !== owner.projectDirectory
     )
-      throw new Error('Owner is not authorized.')
+      throw new DaemonError('Owner is not authorized.', 'authorization')
     return request
   }
 
@@ -909,7 +920,7 @@ export class DaemonServer implements Disposable {
     owner: OwnerContext
   ): Promise<unknown> {
     if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
-      throw new Error('Exec runtime limit exceeded.')
+      throw new DaemonError('Exec runtime limit exceeded.', 'limit')
     }
     return this.withSessionSlot(owner, () =>
       this.supervisor.nativeExec({
@@ -926,7 +937,7 @@ export class DaemonServer implements Disposable {
     owner: OwnerContext
   ): Promise<unknown> {
     if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
-      throw new Error('Exec runtime limit exceeded.')
+      throw new DaemonError('Exec runtime limit exceeded.', 'limit')
     }
     return this.withSessionSlot(owner, () =>
       this.supervisor.nativeExecStart({
@@ -958,13 +969,13 @@ export class DaemonServer implements Disposable {
       throw new ValidationError('Owner project directory must exist.')
     }
     if (owner.capability !== this.capability(owner.parentSessionId, projectDirectory)) {
-      throw new Error('Owner is not authorized.')
+      throw new DaemonError('Owner is not authorized.', 'authorization')
     }
     return { ...owner, projectDirectory }
   }
 
   private authorize(id: string, owner: OwnerContext): void {
-    if (!this.owns(id, owner)) throw new Error('Owner is not authorized.')
+    if (!this.owns(id, owner)) throw new DaemonError('Owner is not authorized.', 'authorization')
   }
 
   private owns(id: string, owner: OwnerContext): boolean {
@@ -990,7 +1001,8 @@ export class DaemonServer implements Disposable {
   private async withSessionSlot<T>(owner: OwnerContext, task: () => Promise<T>): Promise<T> {
     const key = `${owner.parentSessionId}\0${owner.projectDirectory}\0${owner.capability}`
     const pending = (this.pendingSessions.get(key) ?? 0) + 1
-    if (pending > this.maxSessionsPerOwner) throw new Error('Session limit exceeded.')
+    if (pending > this.maxSessionsPerOwner)
+      throw new DaemonError('Session limit exceeded.', 'limit')
     this.pendingSessions.set(key, pending)
     try {
       const owned = (await this.supervisor.list()).filter((session) => this.owns(session.id, owner))
@@ -998,7 +1010,7 @@ export class DaemonServer implements Disposable {
         owned.filter((session) => this.active(session.status)).length + pending >
         this.maxSessionsPerOwner
       )
-        throw new Error('Session limit exceeded.')
+        throw new DaemonError('Session limit exceeded.', 'limit')
       return await task()
     } finally {
       if (pending === 1) this.pendingSessions.delete(key)
@@ -1008,19 +1020,19 @@ export class DaemonServer implements Disposable {
 
   private useInput(owner: OwnerContext, data: string): void {
     const bytes = Buffer.byteLength(data)
-    if (bytes > MAX_INPUT_BYTES) throw new Error('Input size limit exceeded.')
+    if (bytes > MAX_INPUT_BYTES) throw new DaemonError('Input size limit exceeded.', 'limit')
     const now = Date.now()
     const key = `${owner.parentSessionId}\0${owner.projectDirectory}\0${owner.capability}`
     const usage = this.inputUsage.get(key)
     const current = !usage || now - usage.startedAt >= 60_000 ? { startedAt: now, bytes: 0 } : usage
     if (current.bytes + bytes > MAX_INPUT_BYTES_PER_MINUTE)
-      throw new Error('Input rate limit exceeded.')
+      throw new DaemonError('Input rate limit exceeded.', 'limit')
     current.bytes += bytes
     this.inputUsage.set(key, current)
   }
 
   private diagnostics(owner: OwnerContext): DaemonDiagnostics {
-    if (!owner.parentSessionId) throw new Error('Owner is not authorized.')
+    if (!owner.parentSessionId) throw new DaemonError('Owner is not authorized.', 'authorization')
     return {
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       pid: process.pid,
@@ -1247,15 +1259,6 @@ export class DaemonServer implements Disposable {
       )
     }
     return value as number
-  }
-
-  private isStorageError(error: unknown): boolean {
-    return (
-      error instanceof Error &&
-      'code' in error &&
-      typeof error.code === 'string' &&
-      /^E[A-Z]+$/.test(error.code)
-    )
   }
 
   private failure(

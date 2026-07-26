@@ -1,6 +1,8 @@
 import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
+import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
+import { DaemonError } from './errors.ts'
 import type { DaemonStorage } from './storage.ts'
 import type { SpawnFailure } from './types.ts'
 import {
@@ -20,7 +22,7 @@ import type { WorkerClient, WorkerSnapshot } from './worker-client.ts'
 import { WorkerClient as NativeWorkerClient, WorkerStartError } from './worker-client.ts'
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1000000
-const MAX_OUTPUT_BYTES = 64 * 1024 * 64
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 const MAX_REDACTION_SECRET_BYTES = 4096
 const TERMINATION_GRACE_MS = 250
 const TERMINATION_HARD_KILL_MS = 1000
@@ -40,6 +42,10 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
   'TERM',
   'LANG',
   'ComSpec',
+  'ProgramData',
+  'ALLUSERSPROFILE',
+  'PATHEXT',
+  'PUBLIC',
 ])
 const SENSITIVE_ENVIRONMENT_KEY =
   /(token|secret|password|credential|api[_-]?key|auth|cookie|(?:^|[_-])(?:ssh|tls)?[_-]?private[_-]?key(?:$|[_-])|(?:^|[_-])signing[_-]?key(?:$|[_-]))/i
@@ -141,8 +147,10 @@ function terminalDirectChild(
   )
 }
 
-function canonicalWorkdir(workdir: string | undefined): string {
-  return realpathSync(resolve(workdir ?? process.cwd()))
+// Sessions without an explicit workdir run in the owner's project directory, never in whatever
+// directory the daemon process happens to have been started from.
+function canonicalWorkdir(workdir: string | undefined, ownerProjectDirectory?: string): string {
+  return realpathSync(resolve(workdir ?? ownerProjectDirectory ?? process.cwd()))
 }
 
 function canonicalEnv(env: Record<string, string> | undefined): string {
@@ -183,8 +191,12 @@ export function runtimeEnvironment(
           ([key]) => isPath(key) || isSafe(key) || key.startsWith('LC_')
         )
       )
+  // Native worker knobs are daemon-controlled fault/readiness injection points; caller-supplied
+  // or inherited copies must never reach user commands.
   const environment = Object.fromEntries(
-    [...Object.entries(base), ...Object.entries(requested ?? {})].filter(([key]) => !isPath(key))
+    [...Object.entries(base), ...Object.entries(requested ?? {})].filter(
+      ([key]) => !isPath(key) && !/^OPENCODE_PTY_NATIVE_WORKER_/.test(key)
+    )
   ) as Record<string, string>
   // ponytail: command lookup gets only the daemon's PATH; callers cannot redirect an allowed bare command.
   if (trustedPath !== undefined) environment.PATH = trustedPath
@@ -279,7 +291,7 @@ export class SessionSupervisor {
       record.directChildExited ??= record.terminationConfirmed
       record.pendingCleanup ??= false
       this.records.set(record.id, record)
-      if (record.worker && record.worker.protocolVersion !== 5) {
+      if (record.worker && record.worker.protocolVersion !== NATIVE_WORKER_PROTOCOL_VERSION) {
         record.status = 'lost'
         record.terminationConfirmed = false
         record.exitReason = {
@@ -332,6 +344,9 @@ export class SessionSupervisor {
       void this.monitorNative(record, worker)
       return
     }
+    // The worker is unreachable as a session but may still be running; PTY workers have no
+    // deadline, so a best-effort termination is the only thing preventing immortal orphans.
+    await this.terminateOrphanWorker(record)
     const output = await this.storage.readOutput(record.id)
     record.status = 'lost'
     record.exitReason = { kind: 'unknown' }
@@ -368,7 +383,7 @@ export class SessionSupervisor {
       mode: 'pty',
       name: options.name,
       idempotencyKey: options.idempotencyKey,
-      workdir: canonicalWorkdir(options.workdir),
+      workdir: canonicalWorkdir(options.workdir, options.ownerProjectDirectory),
       ownerProjectDirectory: canonicalWorkdir(options.ownerProjectDirectory ?? options.workdir),
       ownerCapabilityHash: options.ownerCapabilityHash ?? '',
       lifecycle: options.lifecycle ?? 'conversation',
@@ -447,7 +462,8 @@ export class SessionSupervisor {
     await this.flush()
     const worker = this.nativeWorkers.get(id)
     const record = this.recordFor(id)
-    if (!worker || record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
+    if (!worker || record.status !== 'running')
+      throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
     try {
       await worker.write(data)
       return { acceptedBytes: Buffer.byteLength(data), acceptedCharacters: [...data].length }
@@ -468,7 +484,8 @@ export class SessionSupervisor {
     this.validateWait(condition, timeoutSeconds)
     const worker = this.nativeWorkers.get(id)
     const record = this.recordFor(id)
-    if (!worker || record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
+    if (!worker || record.status !== 'running')
+      throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
     let afterSequence: number
     try {
       // The worker returns the cursor at the input acceptance boundary. On Windows this is before
@@ -490,9 +507,10 @@ export class SessionSupervisor {
     await this.flush()
     const record = this.recordFor(id)
     if (record.mode !== 'pty') throw new Error(`Session '${id}' is not a PTY.`)
-    if (record.status !== 'running') throw new Error(`PTY session '${id}' is closed.`)
+    if (record.status !== 'running')
+      throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
     const worker = this.nativeWorkers.get(id)
-    if (!worker) throw new Error(`PTY session '${id}' is closed.`)
+    if (!worker) throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
     return worker.resize(cols, rows)
   }
 
@@ -556,7 +574,7 @@ export class SessionSupervisor {
       command: options.command,
       args,
       mode: 'exec',
-      workdir: canonicalWorkdir(options.workdir),
+      workdir: canonicalWorkdir(options.workdir, options.ownerProjectDirectory),
       ownerProjectDirectory: canonicalWorkdir(options.ownerProjectDirectory ?? options.workdir),
       ownerCapabilityHash: options.ownerCapabilityHash ?? '',
       lifecycle: options.lifecycle ?? 'conversation',
@@ -762,7 +780,7 @@ export class SessionSupervisor {
       command: options.command,
       args,
       mode: 'exec',
-      workdir: canonicalWorkdir(options.workdir),
+      workdir: canonicalWorkdir(options.workdir, options.ownerProjectDirectory),
       ownerProjectDirectory: canonicalWorkdir(options.ownerProjectDirectory ?? options.workdir),
       ownerCapabilityHash: options.ownerCapabilityHash ?? '',
       lifecycle: options.lifecycle ?? 'conversation',
@@ -1274,7 +1292,7 @@ export class SessionSupervisor {
       }
     }
     const record = this.records.get(id)
-    if (!record) throw new Error(`PTY session '${id}' not found.`)
+    if (!record) throw new DaemonError(`PTY session '${id}' not found.`, 'not_found')
     return {
       requested: false,
       terminationConfirmed: record.terminationConfirmed,
@@ -1290,6 +1308,9 @@ export class SessionSupervisor {
     if (!record) return false
     await this.nativeFinalizations.get(id)
     if (record.status === 'lost') {
+      // Deleting worker.json makes a still-live worker permanently unreconnectable, so attempt a
+      // best-effort termination first.
+      await this.terminateOrphanWorker(record)
       return this.deleteNativeSession(record)
     }
     if (!this.isTerminal(record)) return false
@@ -1359,13 +1380,25 @@ export class SessionSupervisor {
     await this.persistQueue
   }
 
-  async shutdown(final = false): Promise<void> {
-    if (final) {
-      await Promise.all(
-        [...this.records.values()].map((record) => this.stop(record.id).catch(() => undefined))
+  async shutdown(): Promise<void> {
+    // Workers deliberately survive a daemon stop; they are reconciled on the next daemon start.
+  }
+
+  // Best-effort termination of a worker this daemon can no longer reconnect or control. Failures
+  // are recorded but never block reconciliation or cleanup.
+  private async terminateOrphanWorker(record: SessionRecord): Promise<void> {
+    if (!record.worker) return
+    try {
+      const result = await NativeWorkerClient.terminateOrphan(
+        join(this.storage.rootDirectory, 'sessions', record.id)
       )
-      await Promise.all(
-        [...this.nativeWorkers.values()].map((worker) => worker.shutdown().catch(() => undefined))
+      if (result.detail)
+        console.warn(
+          `Orphaned PTY worker termination for ${JSON.stringify(record.id)} (${result.outcome}): ${result.detail}.`
+        )
+    } catch (error) {
+      console.warn(
+        `Orphaned PTY worker termination for ${JSON.stringify(record.id)} failed: ${String(error)}.`
       )
     }
   }
@@ -1439,7 +1472,7 @@ export class SessionSupervisor {
         activeStatus(record) &&
         record.mode === 'pty' &&
         record.parentSessionId === options.parentSessionId &&
-        record.workdir === canonicalWorkdir(options.workdir) &&
+        record.workdir === canonicalWorkdir(options.workdir, options.ownerProjectDirectory) &&
         record.idempotencyKey === options.idempotencyKey
     )
     if (!existing) return undefined
@@ -1477,7 +1510,7 @@ export class SessionSupervisor {
       throw new Error('Output wait requires exactly one of literal or regex.')
     }
     if (condition.literal && Buffer.byteLength(condition.literal) > 4096) {
-      throw new Error('Output wait literal exceeds the size limit.')
+      throw new DaemonError('Output wait literal exceeds the size limit.', 'limit')
     }
     if (condition.regex) safeRegex(condition.regex)
   }
@@ -1657,7 +1690,7 @@ export class SessionSupervisor {
 
   private recordFor(id: string): SessionRecord {
     const record = this.records.get(id)
-    if (!record) throw new Error(`PTY session '${id}' not found.`)
+    if (!record) throw new DaemonError(`PTY session '${id}' not found.`, 'not_found')
     return record
   }
 

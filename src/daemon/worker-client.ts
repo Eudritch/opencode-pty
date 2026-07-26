@@ -6,6 +6,7 @@ import {
   nativeWorkerPackageName,
   nativeWorkerTarget,
 } from '../shared/native-worker-targets.ts'
+import { processStartIdentity } from './storage.ts'
 import type { ContainmentReport, SpawnCleanup, TerminationResult } from './types.ts'
 
 function readyTimeout(value: string | undefined): number {
@@ -14,6 +15,10 @@ function readyTimeout(value: string | undefined): number {
 }
 
 const MAX_READY_FRAME_BYTES = 1024 * 1024
+const ORPHAN_SHUTDOWN_TIMEOUT_MS = 2000
+// Daemon-controlled fault/readiness injection knobs; they are stripped from session environments
+// and honored only from the daemon's own process environment.
+const NATIVE_WORKER_KNOB = /^OPENCODE_PTY_NATIVE_WORKER_/
 
 export interface WorkerDescriptor {
   pid: number
@@ -125,7 +130,9 @@ function workerCommand(): string[] {
 export function workerLaunchOptions(command: string[]) {
   return {
     cmd: command,
-    detached: process.platform === 'win32',
+    // Workers must survive signals delivered to the daemon's process group (for example Ctrl+C to
+    // the plugin host) on every platform; durability is the whole point of the worker.
+    detached: true,
     windowsHide: true,
     stdin: 'pipe' as const,
     stdout: 'pipe' as const,
@@ -151,34 +158,10 @@ async function processIdentity(pid: number): Promise<string | null> {
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW === '1')
     throw new Error('injected worker identity probe failure')
   if (process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_FAIL === '1') return null
+  // macOS worker identity is deliberately unused: Bun owns the fresh child handle (see exited()).
   if (process.platform === 'darwin') return null
-  if (process.platform !== 'win32') {
-    try {
-      const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
-      const fields = stat
-        .slice(stat.lastIndexOf(')') + 1)
-        .trim()
-        .split(/\s+/)
-      return fields[19] ? `posix:${pid}:${fields[19]}` : null
-    } catch {
-      return null
-    }
-  }
-  const probe = Bun.spawn({
-    cmd: [
-      'powershell.exe',
-      '-NoProfile',
-      '-NonInteractive',
-      '-Command',
-      `$process = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($process) { [Console]::Write("windows:${pid}:$($process.StartTime.ToFileTimeUtc())") }`,
-    ],
-    stdout: 'pipe',
-    stderr: 'ignore',
-    windowsHide: true,
-  })
-  const output = (await new Response(probe.stdout).text()).trim()
-  await probe.exited
-  return output || null
+  // storage.ts resolves the absolute %SystemRoot% PowerShell path and enforces a 5s budget.
+  return processStartIdentity(pid)
 }
 
 async function exited(
@@ -270,10 +253,22 @@ export class WorkerClient {
     const workerControlToken =
       crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '')
     const workerId = crypto.randomUUID()
+    // Fault and readiness knobs come exclusively from the daemon's own environment; session
+    // environments are stripped of every native worker knob so callers can never inject faults.
+    const readyDelay = process.env.OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS
     const payload = Buffer.from(
       JSON.stringify({
         ...bootstrap,
-        fault: bootstrap.env.OPENCODE_PTY_NATIVE_WORKER_FAULT,
+        env: {
+          ...Object.fromEntries(
+            Object.entries(bootstrap.env).filter(([key]) => !NATIVE_WORKER_KNOB.test(key))
+          ),
+          // The worker consumes the ready delay from its bootstrap environment.
+          ...(readyDelay === undefined
+            ? {}
+            : { OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS: readyDelay }),
+        },
+        fault: process.env.OPENCODE_PTY_NATIVE_WORKER_FAULT,
         workerControlToken,
         workerId,
       }),
@@ -325,7 +320,10 @@ export class WorkerClient {
               : {}),
             message: receipt.message,
           }
-      } catch {}
+      } catch {
+        // No authenticated spawn-failure receipt exists; that is the normal path for most
+        // failures, so fall through to the descriptor- and handle-based strategies.
+      }
       if (client) return client.rollback()
       try {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
@@ -344,25 +342,35 @@ export class WorkerClient {
             method: 'rollback',
           }
         }
-      } catch {}
+      } catch {
+        // worker.json may legitimately be absent or unverified this early; the descriptor is only
+        // one optional cleanup route, so its failure carries no evidence worth reporting.
+      }
       try {
         const input = child.stdin
         if (input && typeof input !== 'number') await input.end()
-      } catch {}
+      } catch {
+        // Closing the bootstrap pipe of an already-dead worker fails; the pipe being gone is the
+        // outcome this close was after.
+      }
       if (!identity) {
         let terminationConfirmed = await exited(child, null)
+        let killFailure: string | undefined
         if (!terminationConfirmed) {
           try {
             child.kill()
-          } catch {}
+          } catch (error) {
+            killFailure = String(error)
+          }
           terminationConfirmed = await exited(child, null)
         }
         return {
           requested: true,
           terminationConfirmed,
           method: 'rollback',
-          message:
-            'Worker identity could not be verified; bootstrap was closed before command start.',
+          message: `Worker identity could not be verified; bootstrap was closed before command start.${
+            killFailure ? ` Kill failed: ${killFailure}` : ''
+          }`,
         }
       }
       try {
@@ -393,7 +401,7 @@ export class WorkerClient {
       const stdout = { reader: child.stdout.getReader(), buffered: Buffer.alloc(0) }
       const ready = await readReady(
         stdout,
-        readyTimeout(bootstrap.env.OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS)
+        readyTimeout(process.env.OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS)
       )
       if (ready) {
         const descriptor = await WorkerClient.read(join(bootstrap.sessionDirectory, 'worker.json'))
@@ -546,11 +554,16 @@ export class WorkerClient {
         message: 'Worker rollback channel is not owned by this daemon.',
       }
     }
+    let controlFailure: string | undefined
     try {
       await this.control('rollback')
       const input = this.owned.child.stdin
       if (input && typeof input !== 'number') await input.end()
-    } catch {}
+    } catch (error) {
+      // A failed rollback frame means no receipt can arrive; keep draining stdout for a receipt
+      // already in flight, but surface the control failure in the unconfirmed outcome below.
+      controlFailure = String(error)
+    }
     let output = ''
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {
@@ -576,7 +589,53 @@ export class WorkerClient {
       requested: true,
       terminationConfirmed: false,
       method: 'rollback',
-      message: 'Worker exited without an authenticated direct-child rollback receipt.',
+      message: controlFailure
+        ? `Worker rollback control failed: ${controlFailure}`
+        : 'Worker exited without an authenticated direct-child rollback receipt.',
+    }
+  }
+
+  /**
+   * Best-effort termination of a worker that can no longer be reconnected. Prefers an
+   * authenticated shutdown RPC against the persisted descriptor; falls back to killing the
+   * descriptor's pid only after its start identity is re-verified. Returns a diagnostic detail
+   * instead of throwing wherever the outcome is merely unconfirmed.
+   */
+  static async terminateOrphan(
+    sessionDirectory: string
+  ): Promise<{ outcome: 'shutdown' | 'killed' | 'skipped'; detail?: string }> {
+    let descriptor: WorkerDescriptor
+    try {
+      descriptor = await WorkerClient.read(join(sessionDirectory, 'worker.json'))
+    } catch {
+      // Without a readable descriptor there is no authenticated endpoint and no verified pid to
+      // act on; nothing further can be attempted safely.
+      return { outcome: 'skipped' }
+    }
+    let shutdownFailure: string
+    try {
+      await new WorkerClient(descriptor).call('shutdown', {}, ORPHAN_SHUTDOWN_TIMEOUT_MS)
+      return { outcome: 'shutdown' }
+    } catch (error) {
+      shutdownFailure = String(error)
+    }
+    const identity = await processStartIdentity(descriptor.pid).catch(() => null)
+    if (identity === null || identity !== descriptor.processIdentity)
+      return {
+        outcome: 'skipped',
+        detail: `shutdown RPC failed (${shutdownFailure}) and pid ${descriptor.pid} did not match the descriptor identity`,
+      }
+    try {
+      process.kill(descriptor.pid, 'SIGKILL')
+    } catch (error) {
+      return {
+        outcome: 'skipped',
+        detail: `shutdown RPC failed (${shutdownFailure}); kill failed: ${String(error)}`,
+      }
+    }
+    return {
+      outcome: 'killed',
+      detail: `shutdown RPC failed (${shutdownFailure}); killed identity-verified pid ${descriptor.pid}`,
     }
   }
 
