@@ -291,7 +291,7 @@ export class DaemonStorage {
   private async initializeRoot(): Promise<void> {
     if (process.platform === 'win32') {
       await mkdir(this.root, { recursive: true, mode: 0o700 })
-      await this.protectWindowsPath(this.root, true)
+      await this.protectWindowsPath(this.root)
       await Promise.all([
         mkdir(join(this.root, SESSIONS_DIRECTORY), { recursive: true, mode: 0o700 }),
         mkdir(join(this.root, QUARANTINE_DIRECTORY), { recursive: true, mode: 0o700 }),
@@ -1310,7 +1310,7 @@ export class DaemonStorage {
     if (process.platform !== 'win32') await chmod(path, 0o600)
   }
 
-  private async protectWindowsPath(path: string, recursive: boolean): Promise<void> {
+  private async protectWindowsPath(path: string): Promise<void> {
     const sid = await this.currentWindowsUserSid()
     const command = windowsProcessIdentityCommand(process.pid)
     if (!command)
@@ -1363,7 +1363,8 @@ function Test-PrivateDacl($item) {
   }
 }
 $items = @(Get-Item -LiteralPath $path -Force)
-if (${recursive ? '$true' : '$false'}) { $items += @(Get-ChildItem -LiteralPath $path -Force -Recurse) }
+try { Test-PrivateDacl $items[0]; exit 0 } catch {}
+$items += @(Get-ChildItem -LiteralPath $path -Force -Recurse)
 foreach ($item in $items) { Set-PrivateDacl $item }
 foreach ($item in $items) { Test-PrivateDacl $item }`,
       ],
