@@ -936,6 +936,43 @@ fn windows_creation_flags(has_attributes: bool, pty: bool) -> u32 {
         }
 }
 
+#[cfg(windows)]
+#[repr(C)]
+struct AllocConsoleOptions {
+    mode: u32,
+    use_show_window: i32,
+    show_window: u16,
+}
+
+#[cfg(windows)]
+fn allocate_console_without_window() -> bool {
+    unsafe extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> HANDLE;
+        fn GetProcAddress(module: HANDLE, procedure_name: *const u8) -> *const std::ffi::c_void;
+    }
+    type AllocConsoleWithOptions =
+        unsafe extern "system" fn(*const AllocConsoleOptions, *mut u32) -> i32;
+
+    let Ok(kernel32_name) = wide("kernel32.dll") else {
+        return false;
+    };
+    let kernel32 = unsafe { GetModuleHandleW(kernel32_name.as_ptr()) };
+    if kernel32.is_null() {
+        return false;
+    }
+    let procedure = unsafe { GetProcAddress(kernel32, b"AllocConsoleWithOptions\0".as_ptr()) };
+    if procedure.is_null() {
+        return false;
+    }
+    let allocate: AllocConsoleWithOptions = unsafe { std::mem::transmute(procedure) };
+    let options = AllocConsoleOptions {
+        mode: 2, // ALLOC_CONSOLE_MODE_NO_WINDOW
+        use_show_window: 0,
+        show_window: 0,
+    };
+    unsafe { allocate(&options, null_mut()) >= 0 }
+}
+
 /// Points this process's std handles at its own console for the duration of a
 /// ConPTY child spawn, restoring the originals on drop.
 ///
@@ -980,15 +1017,18 @@ impl PseudoConsoleStdioGuard {
             Some((conout, conin))
         };
         let (conout, conin) = open_both().or_else(|| {
-            // Headless contexts have no console to open; attach one and hide its window.
-            unsafe {
-                if AllocConsole() != 0 {
-                    let window = windows_sys::Win32::System::Console::GetConsoleWindow();
-                    if !window.is_null() {
-                        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                            window,
-                            windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
-                        );
+            // Windows 11 24H2 can allocate a console without starting Windows Terminal.
+            if !allocate_console_without_window() {
+                // Older Windows can only allocate then hide a console window.
+                unsafe {
+                    if AllocConsole() != 0 {
+                        let window = windows_sys::Win32::System::Console::GetConsoleWindow();
+                        if !window.is_null() {
+                            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                                window,
+                                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                            );
+                        }
                     }
                 }
             }
@@ -2973,6 +3013,12 @@ mod tests {
             windows_creation_flags(true, true),
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT
         );
+        let options = AllocConsoleOptions {
+            mode: 2,
+            use_show_window: 0,
+            show_window: 0,
+        };
+        assert_eq!(options.mode, 2); // ALLOC_CONSOLE_MODE_NO_WINDOW
     }
 
     #[cfg(unix)]
