@@ -29,21 +29,13 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, DuplicateHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        CloseHandle, DuplicateHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::SECURITY_ATTRIBUTES,
-    Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        ReadFile, WriteFile,
-    },
+    Storage::FileSystem::{ReadFile, WriteFile},
     System::{
-        Console::{
-            AllocConsole, COORD, ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, HPCON,
-            ResizePseudoConsole, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-            SetConsoleCtrlHandler, SetStdHandle,
-        },
+        Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole, SetConsoleCtrlHandler},
         IO::CancelSynchronousIo,
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -937,131 +929,6 @@ fn windows_creation_flags(has_attributes: bool, pty: bool) -> u32 {
 }
 
 #[cfg(windows)]
-#[repr(C)]
-struct AllocConsoleOptions {
-    mode: u32,
-    use_show_window: i32,
-    show_window: u16,
-}
-
-#[cfg(windows)]
-fn allocate_console_without_window() -> bool {
-    unsafe extern "system" {
-        fn GetModuleHandleW(module_name: *const u16) -> HANDLE;
-        fn GetProcAddress(module: HANDLE, procedure_name: *const u8) -> *const std::ffi::c_void;
-    }
-    type AllocConsoleWithOptions =
-        unsafe extern "system" fn(*const AllocConsoleOptions, *mut u32) -> i32;
-
-    let Ok(kernel32_name) = wide("kernel32.dll") else {
-        return false;
-    };
-    let kernel32 = unsafe { GetModuleHandleW(kernel32_name.as_ptr()) };
-    if kernel32.is_null() {
-        return false;
-    }
-    let procedure = unsafe { GetProcAddress(kernel32, b"AllocConsoleWithOptions\0".as_ptr()) };
-    if procedure.is_null() {
-        return false;
-    }
-    let allocate: AllocConsoleWithOptions = unsafe { std::mem::transmute(procedure) };
-    let options = AllocConsoleOptions {
-        mode: 2, // ALLOC_CONSOLE_MODE_NO_WINDOW
-        use_show_window: 0,
-        show_window: 0,
-    };
-    unsafe { allocate(&options, null_mut()) >= 0 }
-}
-
-/// Points this process's std handles at its own console for the duration of a
-/// ConPTY child spawn, restoring the originals on drop.
-///
-/// CreateProcessW with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE only rebinds the
-/// child's stdio to the new pseudoconsole when the parent's std handles are
-/// console handles at the moment of the call. When they are pipes (as under a
-/// test harness or daemon), the child's stdio stays unusable and conhost's VT
-/// renderer never emits a byte (observed on Windows 11 build 26200; same
-/// bracket winpty-rs ships).
-#[cfg(windows)]
-struct PseudoConsoleStdioGuard {
-    saved: [(u32, HANDLE); 3],
-    _conout: WinHandle,
-    _conin: WinHandle,
-}
-
-#[cfg(windows)]
-impl PseudoConsoleStdioGuard {
-    fn engage() -> Option<Self> {
-        fn open_console(name: &str, desired_access: u32, share_mode: u32) -> Option<WinHandle> {
-            let path = wide(name).ok()?;
-            WinHandle::new(unsafe {
-                CreateFileW(
-                    path.as_ptr(),
-                    desired_access,
-                    share_mode,
-                    null(),
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    null_mut(),
-                )
-            })
-            .ok()
-        }
-        let open_both = || {
-            let conout = open_console(
-                "CONOUT$",
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-            )?;
-            let conin = open_console("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ)?;
-            Some((conout, conin))
-        };
-        let (conout, conin) = open_both().or_else(|| {
-            // Windows 11 24H2 can allocate a console without starting Windows Terminal.
-            if !allocate_console_without_window() {
-                // Older Windows can only allocate then hide a console window.
-                unsafe {
-                    if AllocConsole() != 0 {
-                        let window = windows_sys::Win32::System::Console::GetConsoleWindow();
-                        if !window.is_null() {
-                            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                                window,
-                                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
-                            );
-                        }
-                    }
-                }
-            }
-            open_both()
-        })?;
-        let saved = [
-            (STD_OUTPUT_HANDLE, unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }),
-            (STD_ERROR_HANDLE, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
-            (STD_INPUT_HANDLE, unsafe { GetStdHandle(STD_INPUT_HANDLE) }),
-        ];
-        unsafe {
-            SetStdHandle(STD_OUTPUT_HANDLE, conout.raw());
-            SetStdHandle(STD_ERROR_HANDLE, conout.raw());
-            SetStdHandle(STD_INPUT_HANDLE, conin.raw());
-        }
-        Some(Self {
-            saved,
-            _conout: conout,
-            _conin: conin,
-        })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for PseudoConsoleStdioGuard {
-    fn drop(&mut self) {
-        for (slot, handle) in self.saved {
-            unsafe { SetStdHandle(slot, handle) };
-        }
-    }
-}
-
-#[cfg(windows)]
 fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
     let job = windows_job()?;
     let plan = windows_spawn_plan(
@@ -1183,16 +1050,9 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         startup.StartupInfo.hStdOutput = child_stdout.as_ref().expect("exec stdout").raw();
         startup.StartupInfo.hStdError = child_stderr.as_ref().expect("exec stderr").raw();
     }
-    // For the pty branch dwFlags stays 0: console attachment wires the child's stdio to the
-    // pseudoconsole, provided our own std handles are console handles during CreateProcessW
-    // (see PseudoConsoleStdioGuard).
+    // ConPTY supplies the child's terminal handles through the pseudoconsole attribute.
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = windows_creation_flags(attribute_list.is_some(), pty.is_some());
-    let stdio_guard = if pty.is_some() {
-        PseudoConsoleStdioGuard::engage()
-    } else {
-        None
-    };
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -1207,7 +1067,6 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             &mut process,
         )
     };
-    drop(stdio_guard);
     drop(child_stdin);
     drop(child_stdout);
     drop(child_stderr);
@@ -2998,7 +2857,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_child_creation_hides_exec_and_frees_conpty_console_choice() {
+    fn windows_child_creation_hides_exec_without_overriding_conpty() {
         assert_eq!(
             windows_creation_flags(false, false),
             CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
@@ -3013,12 +2872,6 @@ mod tests {
             windows_creation_flags(true, true),
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT
         );
-        let options = AllocConsoleOptions {
-            mode: 2,
-            use_show_window: 0,
-            show_window: 0,
-        };
-        assert_eq!(options.mode, 2); // ALLOC_CONSOLE_MODE_NO_WINDOW
     }
 
     #[cfg(unix)]
