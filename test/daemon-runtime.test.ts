@@ -12,10 +12,16 @@ import {
   runtimeEnvironment,
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
-import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
+import {
+  DAEMON_PROTOCOL_VERSION,
+  SESSION_RECORD_VERSION,
+  type SessionRecord,
+} from '../src/daemon/types.ts'
 import { NATIVE_WORKER_PROTOCOL_VERSION } from '../src/shared/native-worker-targets.ts'
 
 const roots: string[] = []
+const OWNER_HASH = 'a'.repeat(64)
+const RUNTIME_OWNER_HASH = 'b'.repeat(64)
 const nativeWorkerPath =
   process.env.PTY_NATIVE_WORKER_PATH ??
   join(
@@ -37,6 +43,7 @@ function record(
 ): SessionRecord {
   const now = new Date().toISOString()
   return {
+    recordVersion: SESSION_RECORD_VERSION,
     id,
     title: id,
     command: 'test',
@@ -44,7 +51,7 @@ function record(
     mode: 'pty',
     workdir: root,
     ownerProjectDirectory: root,
-    ownerCapabilityHash: '',
+    ownerCapabilityHash: OWNER_HASH,
     lifecycle: 'conversation',
     environment: { kind: 'safe', keys: [], fingerprint: '', sensitive: false },
     status,
@@ -177,6 +184,7 @@ test('sessions without an explicit workdir run in the owner project directory', 
     args: ['-e', 'console.log(process.cwd())'],
     parentSessionId: 'parent',
     ownerProjectDirectory,
+    ownerCapabilityHash: RUNTIME_OWNER_HASH,
     timeoutSeconds: 30,
   })
   const info = await supervisor.get(result.session.id)
@@ -202,6 +210,8 @@ test('worker fault injection is daemon-controlled, never caller-controlled', asy
     env: { OPENCODE_PTY_NATIVE_WORKER_FAULT: 'descriptor_write' },
     parentSessionId: 'parent',
     workdir: root,
+    ownerProjectDirectory: root,
+    ownerCapabilityHash: RUNTIME_OWNER_HASH,
     timeoutSeconds: 30,
   })
   expect(benign.exitCode).toBe(0)
@@ -216,6 +226,8 @@ test('worker fault injection is daemon-controlled, never caller-controlled', asy
         ...printFault,
         parentSessionId: 'parent',
         workdir: root,
+        ownerProjectDirectory: root,
+        ownerCapabilityHash: RUNTIME_OWNER_HASH,
         timeoutSeconds: 30,
       })
     ).rejects.toThrow('native_worker_unavailable')
@@ -225,7 +237,7 @@ test('worker fault injection is daemon-controlled, never caller-controlled', asy
   }
 }, 30_000)
 
-test('cleanup shuts down a lost native worker before deleting its state', async () => {
+test('cleanup retains a lost native worker without terminal evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-runtime-orphan-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -265,11 +277,11 @@ test('cleanup shuts down a lost native worker before deleting its state', async 
       })
     )
     const supervisor = new SessionSupervisor(storage)
-    await supervisor.initialize()
+    await supervisor.initialize(false)
 
-    expect(await supervisor.cleanup('pty_orphan')).toBeTrue()
+    expect(await supervisor.cleanup('pty_orphan')).toBeFalse()
     expect(operations).toEqual([{ operation: 'shutdown', authorization: `Bearer ${token}` }])
-    expect(existsSync(join(root, 'sessions', 'pty_orphan'))).toBeFalse()
+    expect(existsSync(join(root, 'sessions', 'pty_orphan'))).toBeTrue()
   } finally {
     workerEndpoint.stop(true)
   }

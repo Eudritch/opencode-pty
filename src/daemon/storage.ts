@@ -1,13 +1,25 @@
-import { chmod, link, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises'
+import {
+  chmod,
+  link,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  unlink,
+} from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
-import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import {
   DAEMON_PROTOCOL_VERSION,
   type DaemonDescriptor,
   type ApprovalLedger,
   type ExitReason,
+  type LegacyTombstone,
   OUTPUT_JOURNAL_VERSION,
   type OutputChunk,
+  SESSION_RECORD_VERSION,
   type SessionRecord,
 } from './types.ts'
 
@@ -25,9 +37,18 @@ const OUTPUT_SEGMENT_BYTES = 64 * 1024
 const WINDOWS_PROBE_TIMEOUT_MS = 5000
 const WINDOWS_RENAME_RETRIES = 100
 const WINDOWS_RENAME_RETRY_MS = 25
+const CAPABILITY_HASH = /^[a-f0-9]{64}$/
 
 class InvalidSessionError extends Error {}
 class InvalidJournalError extends InvalidSessionError {}
+class UnsupportedSessionError extends Error {}
+
+interface DecodedSession {
+  record: SessionRecord
+  forceMetadataWrite: boolean
+  importLegacyOutput: boolean
+  removeLegacyOutput: boolean
+}
 
 interface StartLock {
   token: string
@@ -193,6 +214,14 @@ function validText(value: unknown): value is string {
     return false
   }
   return true
+}
+
+function nonemptyText(value: unknown): value is string {
+  return validText(value) && value.length > 0
+}
+
+function validCapabilityHash(value: unknown): value is string {
+  return typeof value === 'string' && CAPABILITY_HASH.test(value)
 }
 
 function validTimestamp(value: unknown): value is string {
@@ -726,7 +755,7 @@ export class DaemonStorage {
   }
 
   async writeSession(record: SessionRecord): Promise<void> {
-    if (!this.validSession(record, record.id))
+    if (!this.validSession(record, record.id, 1))
       throw new Error('Refusing to persist invalid PTY session.')
     const directory = this.sessionDirectory(record.id)
     await this.privateDirectory(directory)
@@ -846,10 +875,6 @@ export class DaemonStorage {
     await rm(this.sessionDirectory(id), { recursive: true, force: true })
   }
 
-  async removeWorkerDescriptor(id: string): Promise<void> {
-    await rm(join(this.sessionDirectory(id), 'worker.json'), { force: true })
-  }
-
   async loadSessions(): Promise<SessionRecord[]> {
     try {
       const entries = await readdir(join(this.root, SESSIONS_DIRECTORY), { withFileTypes: true })
@@ -872,8 +897,13 @@ export class DaemonStorage {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
         throw new InvalidSessionError()
       }
-      if (!this.validSession(record, id)) throw new InvalidSessionError()
-      return await this.migrateSession(record)
+      const decoded = await this.decodeSession(record, id)
+      return await this.migrateSession(
+        decoded.record,
+        decoded.forceMetadataWrite,
+        decoded.importLegacyOutput,
+        decoded.removeLegacyOutput
+      )
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       if (error instanceof InvalidSessionError) {
@@ -885,11 +915,139 @@ export class DaemonStorage {
         )
         return null
       }
+      if (error instanceof UnsupportedSessionError) {
+        console.warn(`Skipped PTY session ${JSON.stringify(id)}: ${error.message}`)
+        return null
+      }
       throw error
     }
   }
 
-  private validSession(record: unknown, id: string): record is SessionRecord {
+  private async decodeSession(record: unknown, id: string): Promise<DecodedSession> {
+    if (!record || typeof record !== 'object') throw new InvalidSessionError()
+    const version = (record as { recordVersion?: unknown }).recordVersion
+    if (version === undefined) return this.decodeV0Session(record, id)
+    if (version === SESSION_RECORD_VERSION) {
+      if (!this.validSession(record, id, 1)) throw new InvalidSessionError()
+      return {
+        record,
+        forceMetadataWrite: false,
+        importLegacyOutput: false,
+        removeLegacyOutput: record.legacyOutputCleanupPending === true,
+      }
+    }
+    if (validNonnegativeInteger(version)) {
+      throw new UnsupportedSessionError(
+        `Unsupported PTY session record version ${version}; it was left unchanged.`
+      )
+    }
+    throw new InvalidSessionError()
+  }
+
+  private async decodeV0Session(record: unknown, id: string): Promise<DecodedSession> {
+    if (!record || typeof record !== 'object') throw new InvalidSessionError()
+    const source = record as Partial<SessionRecord>
+    // V0 ownership was optional, but an absent or malformed tuple can never be mapped to a
+    // current owner. Preserve it for an operator instead of quarantining or inventing ownership.
+    if (
+      source.parentSessionId === null ||
+      source.ownerProjectDirectory === null ||
+      source.ownerCapabilityHash === null
+    ) {
+      throw new UnsupportedSessionError(
+        `Legacy PTY session '${id}' lacks a complete owner identity and was left unchanged.`
+      )
+    }
+    if (!this.validSession(record, id, 0)) throw new InvalidSessionError()
+    if (
+      !nonemptyText(source.parentSessionId) ||
+      !nonemptyText(source.ownerProjectDirectory) ||
+      !validCapabilityHash(source.ownerCapabilityHash)
+    ) {
+      throw new UnsupportedSessionError(
+        `Legacy PTY session '${id}' lacks a complete owner identity and was left unchanged.`
+      )
+    }
+    const storedOwnerProjectDirectory = source.ownerProjectDirectory
+    let ownerProjectDirectory: string
+    try {
+      ownerProjectDirectory = await realpath(storedOwnerProjectDirectory)
+    } catch {
+      throw new UnsupportedSessionError(
+        `Legacy PTY session '${id}' has an unverifiable owner project directory and was left unchanged.`
+      )
+    }
+    if (ownerProjectDirectory !== storedOwnerProjectDirectory) {
+      throw new UnsupportedSessionError(
+        `Legacy PTY session '${id}' has a noncanonical owner project directory and was left unchanged.`
+      )
+    }
+    const mode = source.mode ?? 'pty'
+    const lifecycle = source.lifecycle ?? 'conversation'
+    const terminationConfirmed = source.terminationConfirmed === true
+    const directChildExited = source.directChildExited === true
+    const terminal =
+      ['exited', 'timed_out', 'output_limited', 'spawn_failed'].includes(String(source.status)) &&
+      terminationConfirmed &&
+      directChildExited &&
+      this.containmentDrained(source.containment)
+    const lastKnown = this.legacyLastKnown(source.status as SessionRecord['status'])
+    const legacyTombstone: LegacyTombstone | undefined = terminal
+      ? undefined
+      : { sourceRecordVersion: 0, lastKnown }
+    const converted: SessionRecord = {
+      ...source,
+      recordVersion: SESSION_RECORD_VERSION,
+      mode,
+      ownerProjectDirectory,
+      ownerCapabilityHash: source.ownerCapabilityHash,
+      lifecycle: terminal ? lifecycle : 'conversation',
+      environment: source.environment ?? {
+        kind: 'safe',
+        keys: [],
+        fingerprint: '',
+        sensitive: false,
+      },
+      status: terminal ? (source.status as SessionRecord['status']) : 'lost',
+      parentSessionId: source.parentSessionId,
+      timedOut: source.timedOut === true,
+      terminationRequested: source.terminationRequested === true,
+      terminationConfirmed: terminal && terminationConfirmed,
+      directChildExited: terminal && directChildExited,
+      pendingCleanup: terminal ? source.pendingCleanup : true,
+      outputJournalVersion: OUTPUT_JOURNAL_VERSION,
+      ...(terminal && source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION
+        ? { legacyOutputCleanupPending: true }
+        : {}),
+      ...(legacyTombstone ? { legacyTombstone } : {}),
+    } as SessionRecord
+    if (!this.validSession(converted, id, 1)) throw new InvalidSessionError()
+    return {
+      record: converted,
+      forceMetadataWrite: true,
+      importLegacyOutput: source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION,
+      removeLegacyOutput: terminal && source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION,
+    }
+  }
+
+  private legacyLastKnown(status: SessionRecord['status']): LegacyTombstone['lastKnown'] {
+    if (status === 'starting') return 'creating'
+    if (status === 'running') return 'running'
+    if (status === 'stopping') return 'stopping'
+    if (status === 'lost') return 'unreachable'
+    return 'terminal'
+  }
+
+  private containmentDrained(containment: SessionRecord['containment']): boolean {
+    return Boolean(
+      containment &&
+        ['posix_best_effort_empty', 'windows_job_empty', 'not_applicable'].includes(
+          containment.status
+        )
+    )
+  }
+
+  private validSession(record: unknown, id: string, version: 0 | 1): record is SessionRecord {
     if (!record || typeof record !== 'object') return false
     const value = record as Partial<SessionRecord>
     const validOptionalText = (item: unknown) => item === undefined || validText(item)
@@ -931,6 +1089,17 @@ export class DaemonStorage {
         value.keys.every(validText) &&
         validText(value.fingerprint) &&
         typeof value.sensitive === 'boolean'
+      )
+    }
+    const validLegacyTombstone = (tombstone: unknown): boolean => {
+      if (tombstone === undefined) return true
+      if (!tombstone || typeof tombstone !== 'object') return false
+      const value = tombstone as Record<string, unknown>
+      return (
+        value.sourceRecordVersion === 0 &&
+        ['creating', 'running', 'stopping', 'terminal', 'unreachable'].includes(
+          String(value.lastKnown)
+        )
       )
     }
     const validExecOutput = (output: unknown): boolean => {
@@ -976,8 +1145,18 @@ export class DaemonStorage {
         validText(value.endpoint) &&
         validNonnegativeInteger(value.protocolVersion) &&
         value.protocolVersion >= 1 &&
-        value.protocolVersion <= NATIVE_WORKER_PROTOCOL_VERSION &&
         (value.tokenFingerprint === undefined || validText(value.tokenFingerprint))
+      )
+    }
+    const validWorkerPrestart = (authority: unknown): boolean => {
+      if (authority === undefined) return true
+      if (!authority || typeof authority !== 'object') return false
+      const value = authority as Record<string, unknown>
+      return (
+        validText(value.workerId) &&
+        validCapabilityHash(value.tokenFingerprint) &&
+        validNonnegativeInteger(value.protocolVersion) &&
+        value.protocolVersion >= 1
       )
     }
     const validContainment = (containment: unknown): boolean => {
@@ -1035,6 +1214,8 @@ export class DaemonStorage {
       )
     }
     if (
+      (version === 0 && value.recordVersion !== undefined) ||
+      (version === 1 && value.recordVersion !== SESSION_RECORD_VERSION) ||
       value.id !== id ||
       !validText(value.title) ||
       !validText(value.command) ||
@@ -1044,9 +1225,13 @@ export class DaemonStorage {
       !validOptionalText(value.name) ||
       !validOptionalText(value.idempotencyKey) ||
       !validText(value.workdir) ||
-      !validOptionalText(value.ownerProjectDirectory) ||
-      !validOptionalText(value.ownerCapabilityHash) ||
-      !validOptionalText(value.parentSessionId) ||
+      (version === 1
+        ? !nonemptyText(value.ownerProjectDirectory) ||
+          !validCapabilityHash(value.ownerCapabilityHash) ||
+          !nonemptyText(value.parentSessionId)
+        : !validOptionalText(value.ownerProjectDirectory) ||
+          !validOptionalText(value.ownerCapabilityHash) ||
+          !validOptionalText(value.parentSessionId)) ||
       !validOptionalText(value.parentAgent) ||
       !SESSION_STATUSES.has(value.status ?? '') ||
       !validNonnegativeInteger(value.pid) ||
@@ -1058,10 +1243,13 @@ export class DaemonStorage {
       !validOptionalInteger(value.timeoutSeconds) ||
       (value.timeoutSeconds !== undefined && value.timeoutSeconds === 0) ||
       typeof value.timedOut !== 'boolean' ||
-      (value.terminationRequested !== undefined &&
-        typeof value.terminationRequested !== 'boolean') ||
-      (value.terminationConfirmed !== undefined &&
-        typeof value.terminationConfirmed !== 'boolean') ||
+      (version === 1
+        ? typeof value.terminationRequested !== 'boolean' ||
+          typeof value.terminationConfirmed !== 'boolean'
+        : (value.terminationRequested !== undefined &&
+            typeof value.terminationRequested !== 'boolean') ||
+          (value.terminationConfirmed !== undefined &&
+            typeof value.terminationConfirmed !== 'boolean')) ||
       (value.pendingCleanup !== undefined && typeof value.pendingCleanup !== 'boolean') ||
       (value.directChildExited !== undefined && typeof value.directChildExited !== 'boolean') ||
       !validOptionalInteger(value.exitCode) ||
@@ -1075,15 +1263,26 @@ export class DaemonStorage {
       typeof value.outputTruncated !== 'boolean' ||
       !validNonnegativeInteger(value.lineCount) ||
       typeof value.outputHasPartialLine !== 'boolean' ||
-      (value.outputJournalVersion !== undefined &&
-        value.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) ||
-      (value.mode !== undefined && value.mode !== 'pty' && value.mode !== 'exec') ||
-      (value.lifecycle !== undefined &&
-        value.lifecycle !== 'conversation' &&
-        value.lifecycle !== 'persistent') ||
+      (version === 1
+        ? value.outputJournalVersion !== OUTPUT_JOURNAL_VERSION
+        : value.outputJournalVersion !== undefined &&
+          value.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) ||
+      (version === 1
+        ? value.mode !== 'pty' && value.mode !== 'exec'
+        : value.mode !== undefined && value.mode !== 'pty' && value.mode !== 'exec') ||
+      (version === 1
+        ? value.lifecycle !== 'conversation' && value.lifecycle !== 'persistent'
+        : value.lifecycle !== undefined &&
+          value.lifecycle !== 'conversation' &&
+          value.lifecycle !== 'persistent') ||
       !validEnvironment(value.environment) ||
+      (version === 1 && value.environment === undefined) ||
       !validExecOutput(value.execOutput) ||
       !validWorker(value.worker) ||
+      !validWorkerPrestart(value.workerPrestart) ||
+      (value.workerStartAttempted !== undefined &&
+        (typeof value.workerStartAttempted !== 'boolean' ||
+          (value.worker === undefined && value.workerPrestart === undefined))) ||
       !validContainment(value.containment) ||
       !validTermination(value.termination) ||
       !validOptionalText(value.storageFailure) ||
@@ -1093,7 +1292,41 @@ export class DaemonStorage {
           !value.diagnostics.every(
             (diagnostic) => validText(diagnostic) && [...diagnostic].length <= 512
           ))) ||
-      !validWait(value.lastWaitResult)
+      !validWait(value.lastWaitResult) ||
+      !validLegacyTombstone(value.legacyTombstone) ||
+      (value.legacyOutputCleanupPending !== undefined &&
+        typeof value.legacyOutputCleanupPending !== 'boolean') ||
+      (version === 0 && value.legacyTombstone !== undefined)
+    ) {
+      return false
+    }
+    if (value.legacyTombstone !== undefined) {
+      if (
+        value.status !== 'lost' ||
+        value.lifecycle !== 'conversation' ||
+        value.pendingCleanup !== true ||
+        value.terminationConfirmed !== false ||
+        value.directChildExited === true
+      ) {
+        return false
+      }
+    }
+    if (value.worker !== undefined && value.workerPrestart !== undefined) {
+      const worker = value.worker
+      const authority = value.workerPrestart
+      if (
+        worker.startIdentity !== authority.workerId ||
+        worker.protocolVersion !== authority.protocolVersion ||
+        worker.tokenFingerprint !== authority.tokenFingerprint
+      ) {
+        return false
+      }
+    }
+    if (
+      value.legacyOutputCleanupPending === true &&
+      (value.legacyTombstone !== undefined ||
+        !['exited', 'timed_out', 'output_limited', 'spawn_failed'].includes(value.status ?? '') ||
+        value.terminationConfirmed !== true)
     ) {
       return false
     }
@@ -1130,9 +1363,14 @@ export class DaemonStorage {
     }
   }
 
-  private async migrateSession(record: SessionRecord): Promise<SessionRecord> {
+  private async migrateSession(
+    record: SessionRecord,
+    forceMetadataWrite = false,
+    importLegacyOutput = false,
+    removeLegacyOutput = false
+  ): Promise<SessionRecord> {
     let chunks = await this.readOutputChunks(record.id)
-    if (record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION && chunks.length === 0) {
+    if (importLegacyOutput && chunks.length === 0) {
       let legacyOutput = ''
       try {
         legacyOutput = await readFile(this.legacyOutputPath(record.id), 'utf8')
@@ -1170,16 +1408,24 @@ export class DaemonStorage {
     ) {
       throw new InvalidJournalError('retained chunk cursor does not match session cursor')
     }
-    const migrated = this.reconcileSession(record, chunks)
-    if (
-      record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION ||
-      !this.sameJournalState(record, migrated)
-    ) {
+    let migrated = this.reconcileSession(record, chunks)
+    if (forceMetadataWrite || !this.sameJournalState(record, migrated)) {
       await this.writeSession(migrated)
     }
-    if (record.outputJournalVersion !== OUTPUT_JOURNAL_VERSION) {
-      // The v1 source is disposable only after its journal and metadata are durable.
-      await rm(this.legacyOutputPath(record.id), { force: true })
+    if (removeLegacyOutput) {
+      try {
+        // A terminal V0 import can discard its source only after V1 metadata is durable.
+        await rm(this.legacyOutputPath(record.id), { force: true })
+        if (migrated.legacyOutputCleanupPending) {
+          const { legacyOutputCleanupPending: _, ...cleared } = migrated
+          migrated = cleared
+          await this.writeSession(migrated)
+        }
+      } catch (error) {
+        console.warn(
+          `Retained legacy PTY output for ${JSON.stringify(record.id)}: ${String(error)}.`
+        )
+      }
     }
     return migrated
   }

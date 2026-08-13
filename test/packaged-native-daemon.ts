@@ -224,7 +224,8 @@ async function startDaemon(installed: string) {
     stderr: 'pipe',
   })
   daemonPids.add(child.pid)
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  const deadline = Date.now() + 25_000
+  while (Date.now() < deadline) {
     try {
       const descriptor = JSON.parse(
         await readFile(join(stateDirectory, 'daemon.json'), 'utf8')
@@ -240,7 +241,7 @@ async function startDaemon(installed: string) {
   }
   child.kill()
   await waitForExit(child, 'Packaged daemon')
-  throw new Error('Packaged daemon did not start.')
+  throw new Error(`Packaged daemon did not start: ${await new Response(child.stderr).text()}`)
 }
 
 // Every daemon pid this run has seen (spawned child and descriptor-recorded pid). Killed
@@ -451,6 +452,7 @@ try {
       command: process.execPath,
       args: ['-e', "console.log('packed-native'); setInterval(() => {}, 1000)"],
       timeoutSeconds: 10,
+      lifecycle: 'persistent',
     },
     owner,
     executeAbort.signal

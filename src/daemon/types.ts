@@ -2,6 +2,8 @@ export const DAEMON_PROTOCOL_VERSION = 8
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
+export const SESSION_RECORD_VERSION = 1
+
 export const MAX_EXEC_RUNTIME_SECONDS = 3600
 export const MAX_EXEC_WAIT_SECONDS = MAX_EXEC_RUNTIME_SECONDS + 5
 
@@ -190,7 +192,21 @@ export interface WorkerReference {
   executable?: string
 }
 
+// Persisted before spawning a worker. It can authenticate only a receipt proving no start frame
+// was accepted; reconnecting, signaling, and ordinary worker RPC still require WorkerReference.
+export interface WorkerPrestartAuthority {
+  workerId: string
+  tokenFingerprint: string
+  protocolVersion: number
+}
+
+export interface LegacyTombstone {
+  sourceRecordVersion: 0
+  lastKnown: 'creating' | 'running' | 'stopping' | 'terminal' | 'unreachable'
+}
+
 export interface SessionRecord {
+  recordVersion: typeof SESSION_RECORD_VERSION
   id: string
   title: string
   description?: string
@@ -232,11 +248,20 @@ export interface SessionRecord {
   outputJournalVersion: typeof OUTPUT_JOURNAL_VERSION
   execOutput?: ExecOutput
   worker?: WorkerReference
+  workerPrestart?: WorkerPrestartAuthority
+  // False only while a persisted worker reference or pre-start authority exists and no start
+  // frame has been sent.
+  // Missing is legacy/unknown and must never authorize pre-start receipt cleanup.
+  workerStartAttempted?: boolean
   containment?: ContainmentReport
   termination?: TerminationResult
   storageFailure?: string
   diagnostics?: string[]
   lastWaitResult?: WaitResult
+  // A V0 record that was live or unproven at upgrade time can only be read or reaped.
+  legacyTombstone?: LegacyTombstone
+  // A proven V0 terminal record imported output.log and must retry deleting that source file.
+  legacyOutputCleanupPending?: boolean
 }
 
 export interface OutputChunk {

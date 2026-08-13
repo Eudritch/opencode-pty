@@ -1,4 +1,4 @@
-import { access, readFile, rm } from 'node:fs/promises'
+import { access, readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import {
@@ -7,7 +7,12 @@ import {
   nativeWorkerTarget,
 } from '../shared/native-worker-targets.ts'
 import { processStartIdentity } from './storage.ts'
-import type { ContainmentReport, SpawnCleanup, TerminationResult } from './types.ts'
+import type {
+  ContainmentReport,
+  SpawnCleanup,
+  TerminationResult,
+  WorkerPrestartAuthority,
+} from './types.ts'
 
 function readyTimeout(value: string | undefined): number {
   const timeout = Number(value ?? 5000)
@@ -16,6 +21,7 @@ function readyTimeout(value: string | undefined): number {
 
 const MAX_READY_FRAME_BYTES = 1024 * 1024
 const ORPHAN_SHUTDOWN_TIMEOUT_MS = 2000
+const TOKEN_FINGERPRINT = /^[a-f0-9]{64}$/
 // Daemon-controlled fault/readiness injection knobs; they are stripped from session environments
 // and honored only from the daemon's own process environment.
 const NATIVE_WORKER_KNOB = /^OPENCODE_PTY_NATIVE_WORKER_/
@@ -39,6 +45,11 @@ export interface WorkerReference {
   executable?: string
 }
 
+export interface PreparedWorker {
+  client: WorkerClient
+  reference: WorkerReference
+}
+
 export interface WorkerBootstrap {
   command: string
   args: string[]
@@ -60,7 +71,11 @@ export interface WorkerBootstrap {
 export class WorkerStartError extends Error {
   constructor(
     message: string,
-    readonly cleanup: SpawnCleanup
+    readonly cleanup: SpawnCleanup,
+    // Present only after the ready descriptor was authenticated but before any start frame.
+    readonly prestartReference?: WorkerReference,
+    // Set only for a handled failure before Bun.spawn could create a worker process.
+    readonly noWorkerSpawned = false
   ) {
     super(message)
   }
@@ -83,6 +98,72 @@ function validDescriptor(value: unknown): value is WorkerDescriptor {
 
 function tokenFingerprint(token: string): string {
   return new Bun.CryptoHasher('sha256').update(token).digest('hex')
+}
+
+function workerReference(descriptor: WorkerDescriptor, executable?: string): WorkerReference {
+  return {
+    pid: descriptor.pid,
+    startIdentity: descriptor.startIdentity,
+    processIdentity: descriptor.processIdentity,
+    endpoint: descriptor.endpoint,
+    tokenFingerprint: tokenFingerprint(descriptor.token),
+    protocolVersion: descriptor.protocolVersion,
+    ...(executable ? { executable } : {}),
+  }
+}
+
+function descriptorMatchesReference(
+  descriptor: WorkerDescriptor,
+  reference: WorkerReference
+): boolean {
+  return (
+    reference.protocolVersion === NATIVE_WORKER_PROTOCOL_VERSION &&
+    typeof reference.tokenFingerprint === 'string' &&
+    TOKEN_FINGERPRINT.test(reference.tokenFingerprint) &&
+    descriptor.pid === reference.pid &&
+    descriptor.startIdentity === reference.startIdentity &&
+    descriptor.processIdentity === reference.processIdentity &&
+    descriptor.endpoint === reference.endpoint &&
+    tokenFingerprint(descriptor.token) === reference.tokenFingerprint
+  )
+}
+
+function verifiedPrestartNoChildReceipt(
+  value: unknown,
+  authority: WorkerReference | WorkerPrestartAuthority
+): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const receipt = value as Record<string, unknown>
+  const fields = [
+    'receiptVersion',
+    'kind',
+    'workerId',
+    'workerPid',
+    'workerProcessIdentity',
+    'workerEndpoint',
+    'workerProtocolVersion',
+    'workerControlToken',
+  ]
+  if (Object.keys(receipt).length !== fields.length || !fields.every((field) => field in receipt))
+    return false
+  const workerId = 'workerId' in authority ? authority.workerId : authority.startIdentity
+  const fingerprint = authority.tokenFingerprint
+  const common =
+    receipt.receiptVersion === 1 &&
+    receipt.kind === 'prestart_no_child' &&
+    receipt.workerId === workerId &&
+    receipt.workerProtocolVersion === NATIVE_WORKER_PROTOCOL_VERSION &&
+    authority.protocolVersion === NATIVE_WORKER_PROTOCOL_VERSION &&
+    typeof fingerprint === 'string' &&
+    TOKEN_FINGERPRINT.test(fingerprint) &&
+    typeof receipt.workerControlToken === 'string' &&
+    tokenFingerprint(receipt.workerControlToken) === fingerprint
+  if (!common || 'workerId' in authority) return common
+  return (
+    receipt.workerPid === authority.pid &&
+    receipt.workerProcessIdentity === authority.processIdentity &&
+    receipt.workerEndpoint === authority.endpoint
+  )
 }
 
 function workerCommand(): string[] {
@@ -236,6 +317,7 @@ export class WorkerClient {
       child: ReturnType<typeof Bun.spawn>
       stdout: WorkerStdout
       token: string
+      sessionDirectory: string
     }
   ) {}
 
@@ -246,42 +328,66 @@ export class WorkerClient {
     await input.write(frame({ operation, token: this.owned.token }))
   }
 
-  static async start(bootstrap: Omit<WorkerBootstrap, 'workerControlToken' | 'workerId'>): Promise<{
-    client: WorkerClient
-    reference: WorkerReference
-  }> {
+  static async prepare(
+    bootstrap: Omit<WorkerBootstrap, 'workerControlToken' | 'workerId'>,
+    persistPrestart?: (authority: WorkerPrestartAuthority) => Promise<void>
+  ): Promise<PreparedWorker> {
     const workerControlToken =
       crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '')
     const workerId = crypto.randomUUID()
     // Fault and readiness knobs come exclusively from the daemon's own environment; session
     // environments are stripped of every native worker knob so callers can never inject faults.
     const readyDelay = process.env.OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS
-    const payload = Buffer.from(
-      JSON.stringify({
-        ...bootstrap,
-        env: {
-          ...Object.fromEntries(
-            Object.entries(bootstrap.env).filter(([key]) => !NATIVE_WORKER_KNOB.test(key))
-          ),
-          // The worker consumes the ready delay from its bootstrap environment.
-          ...(readyDelay === undefined
-            ? {}
-            : { OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS: readyDelay }),
-        },
-        fault: process.env.OPENCODE_PTY_NATIVE_WORKER_FAULT,
-        workerControlToken,
+    let payload: Buffer
+    let command: string[]
+    let child: ReturnType<typeof Bun.spawn>
+    try {
+      payload = Buffer.from(
+        JSON.stringify({
+          ...bootstrap,
+          env: {
+            ...Object.fromEntries(
+              Object.entries(bootstrap.env).filter(([key]) => !NATIVE_WORKER_KNOB.test(key))
+            ),
+            // The worker consumes the ready delay from its bootstrap environment.
+            ...(readyDelay === undefined
+              ? {}
+              : { OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS: readyDelay }),
+          },
+          fault: process.env.OPENCODE_PTY_NATIVE_WORKER_FAULT,
+          workerControlToken,
+          workerId,
+        }),
+        'utf8'
+      )
+      if (payload.byteLength > 1024 * 1024)
+        throw new Error('native_worker_unavailable: bootstrap too large.')
+      command = workerCommand()
+      await persistPrestart?.({
         workerId,
-      }),
-      'utf8'
-    )
-    if (payload.byteLength > 1024 * 1024)
-      throw new Error('native_worker_unavailable: bootstrap too large.')
-    const command = workerCommand()
-    const child = Bun.spawn({
-      ...workerLaunchOptions(command),
-    })
+        tokenFingerprint: tokenFingerprint(workerControlToken),
+        protocolVersion: NATIVE_WORKER_PROTOCOL_VERSION,
+      })
+      child = Bun.spawn({
+        ...workerLaunchOptions(command),
+      })
+    } catch (error) {
+      if (error instanceof WorkerStartError) throw error
+      throw new WorkerStartError(
+        error instanceof Error ? error.message : String(error),
+        {
+          requested: false,
+          terminationConfirmed: true,
+          method: 'none',
+          directChildStarted: false,
+        },
+        undefined,
+        true
+      )
+    }
     let identity: string | null = null
     let client: WorkerClient | undefined
+    let prestartReference: WorkerReference | undefined
     const cleanup = async (): Promise<SpawnCleanup> => {
       try {
         const receipt = JSON.parse(
@@ -300,11 +406,22 @@ export class WorkerClient {
           receipt.workerId === workerId &&
           receipt.workerPid === child.pid &&
           receipt.workerProcessIdentity === identity &&
+          Object.keys(receipt).length === 8 &&
+          [
+            'workerId',
+            'workerPid',
+            'workerProcessIdentity',
+            'workerControlToken',
+            'directChildStarted',
+            'directChildPid',
+            'terminationConfirmed',
+            'message',
+          ].every((field) => field in receipt) &&
           receipt.workerControlToken === workerControlToken &&
           typeof receipt.directChildStarted === 'boolean' &&
           (receipt.directChildStarted
             ? Number.isSafeInteger(receipt.directChildPid) && (receipt.directChildPid as number) > 0
-            : receipt.directChildPid === null || receipt.directChildPid === undefined) &&
+            : receipt.directChildPid === null) &&
           typeof receipt.terminationConfirmed === 'boolean' &&
           typeof receipt.message === 'string'
         )
@@ -398,7 +515,10 @@ export class WorkerClient {
       if (!input || typeof input === 'number')
         throw new Error('native_worker_unavailable: worker input unavailable.')
       await input.write(frame(JSON.parse(payload.toString('utf8'))))
-      const stdout = { reader: child.stdout.getReader(), buffered: Buffer.alloc(0) }
+      const output = child.stdout
+      if (!output || typeof output === 'number')
+        throw new Error('native_worker_unavailable: worker output unavailable.')
+      const stdout = { reader: output.getReader(), buffered: Buffer.alloc(0) }
       const ready = await readReady(
         stdout,
         readyTimeout(process.env.OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS)
@@ -413,38 +533,16 @@ export class WorkerClient {
         ) {
           throw new Error('native_worker_unavailable: worker descriptor verification failed.')
         }
-        client = new WorkerClient(descriptor, { child, stdout, token: workerControlToken })
-        await client.control('start')
-        const health = await client.health()
-        if (
-          health.protocolVersion !== descriptor.protocolVersion ||
-          health.pid !== descriptor.pid ||
-          health.processIdentity !== descriptor.processIdentity
-        )
-          throw new Error(
-            'native_worker_unavailable: authenticated worker identity verification failed.'
-          )
-        identity = descriptor.processIdentity
-        for (let attempt = 0; attempt < 50; attempt += 1) {
-          try {
-            await client.snapshot()
-            return {
-              client,
-              reference: {
-                pid: descriptor.pid,
-                startIdentity: descriptor.startIdentity,
-                processIdentity: descriptor.processIdentity,
-                endpoint: descriptor.endpoint,
-                tokenFingerprint: tokenFingerprint(descriptor.token),
-                protocolVersion: descriptor.protocolVersion,
-                executable: command[0],
-              },
-            }
-          } catch {
-            await Bun.sleep(20)
-          }
+        client = new WorkerClient(descriptor, {
+          child,
+          stdout,
+          token: workerControlToken,
+          sessionDirectory: bootstrap.sessionDirectory,
+        })
+        return {
+          client,
+          reference: workerReference(descriptor, command[0]),
         }
-        throw new Error('native_worker_unavailable: worker command did not start.')
       }
       let descriptor: WorkerDescriptor | null = null
       for (let attempt = 0; attempt < 40 && !descriptor; attempt += 1) {
@@ -455,18 +553,47 @@ export class WorkerClient {
       }
       if (!descriptor)
         throw new Error('native_worker_unavailable: worker descriptor is unavailable.')
+      if (
+        descriptor.pid !== child.pid ||
+        descriptor.token !== workerControlToken ||
+        descriptor.startIdentity !== workerId ||
+        (identity !== null && descriptor.processIdentity !== identity)
+      ) {
+        throw new Error('native_worker_unavailable: worker descriptor verification failed.')
+      }
+      prestartReference = workerReference(descriptor, command[0])
       throw new Error('native_worker_unavailable: worker did not become ready.')
     } catch (error) {
+      if (error instanceof WorkerStartError) throw error
       const outcome = await cleanup()
-      await rm(join(bootstrap.sessionDirectory, 'worker.json'), { force: true }).catch(
-        () => undefined
-      )
-      await rm(join(bootstrap.sessionDirectory, 'spawn-failure.json'), { force: true }).catch(
-        () => undefined
-      )
       throw new WorkerStartError(
         `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(outcome)}`,
-        outcome
+        outcome,
+        prestartReference
+      )
+    }
+  }
+
+  static async start(
+    bootstrap: Omit<WorkerBootstrap, 'workerControlToken' | 'workerId'>
+  ): Promise<PreparedWorker> {
+    let prepared: PreparedWorker | undefined
+    try {
+      prepared = await WorkerClient.prepare(bootstrap)
+      await prepared.client.start()
+      return prepared
+    } catch (error) {
+      if (error instanceof WorkerStartError) throw error
+      if (!prepared) throw error
+      const cleanup = await prepared.client.rollback().catch((rollbackError) => ({
+        requested: false,
+        terminationConfirmed: false,
+        method: 'none' as const,
+        message: String(rollbackError),
+      }))
+      throw new WorkerStartError(
+        `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(cleanup)}`,
+        cleanup
       )
     }
   }
@@ -475,6 +602,7 @@ export class WorkerClient {
     sessionDirectory: string,
     reference: WorkerReference
   ): Promise<WorkerClient | null> {
+    if (reference.protocolVersion !== NATIVE_WORKER_PROTOCOL_VERSION) return null
     try {
       const descriptor = await WorkerClient.read(join(sessionDirectory, 'worker.json'))
       if (
@@ -500,8 +628,152 @@ export class WorkerClient {
     }
   }
 
+  static async hasVerifiedPrestartNoChildReceipt(
+    sessionDirectory: string,
+    authority: WorkerReference | WorkerPrestartAuthority
+  ): Promise<boolean> {
+    try {
+      return verifiedPrestartNoChildReceipt(
+        JSON.parse(await readFile(join(sessionDirectory, 'prestart-no-child.json'), 'utf8')),
+        authority
+      )
+    } catch {
+      return false
+    }
+  }
+
+  static async hasVerifiedNoChildSpawnFailureReceipt(
+    sessionDirectory: string,
+    reference: WorkerReference
+  ): Promise<boolean> {
+    if (reference.protocolVersion !== NATIVE_WORKER_PROTOCOL_VERSION) return false
+    try {
+      const descriptor = await WorkerClient.read(join(sessionDirectory, 'worker.json'))
+      if (!descriptorMatchesReference(descriptor, reference)) return false
+      const receipt = JSON.parse(
+        await readFile(join(sessionDirectory, 'spawn-failure.json'), 'utf8')
+      ) as unknown
+      if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return false
+      const fields = [
+        'workerId',
+        'workerPid',
+        'workerProcessIdentity',
+        'workerControlToken',
+        'directChildStarted',
+        'directChildPid',
+        'terminationConfirmed',
+        'message',
+      ]
+      const value = receipt as Record<string, unknown>
+      return (
+        Object.keys(value).length === fields.length &&
+        fields.every((field) => field in value) &&
+        value.workerId === reference.startIdentity &&
+        value.workerPid === reference.pid &&
+        value.workerProcessIdentity === reference.processIdentity &&
+        typeof value.workerControlToken === 'string' &&
+        tokenFingerprint(value.workerControlToken) === reference.tokenFingerprint &&
+        value.directChildStarted === false &&
+        value.directChildPid === null &&
+        value.terminationConfirmed === true &&
+        typeof value.message === 'string'
+      )
+    } catch {
+      return false
+    }
+  }
+
   async snapshot(): Promise<WorkerSnapshot> {
     return this.call('snapshot')
+  }
+
+  async start(): Promise<WorkerSnapshot> {
+    try {
+      await this.control('start')
+      const health = await this.health()
+      if (
+        health.protocolVersion !== this.descriptor.protocolVersion ||
+        health.pid !== this.descriptor.pid ||
+        health.processIdentity !== this.descriptor.processIdentity
+      )
+        throw new Error(
+          'native_worker_unavailable: authenticated worker identity verification failed.'
+        )
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          return await this.snapshot()
+        } catch {
+          await Bun.sleep(20)
+        }
+      }
+      throw new Error('native_worker_unavailable: worker command did not start.')
+    } catch (error) {
+      let cleanup = await this.spawnFailureCleanup()
+      if (!cleanup) {
+        const rollback = await this.rollback()
+        for (let attempt = 0; attempt < 10 && !cleanup; attempt += 1) {
+          await Bun.sleep(20)
+          cleanup = await this.spawnFailureCleanup()
+        }
+        cleanup ??= rollback
+      }
+      throw new WorkerStartError(
+        `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(cleanup)}`,
+        cleanup
+      )
+    }
+  }
+
+  private async spawnFailureCleanup(): Promise<SpawnCleanup | null> {
+    if (!this.owned) return null
+    try {
+      const receipt = JSON.parse(
+        await readFile(join(this.owned.sessionDirectory, 'spawn-failure.json'), 'utf8')
+      ) as {
+        workerId?: unknown
+        workerPid?: unknown
+        workerProcessIdentity?: unknown
+        workerControlToken?: unknown
+        directChildStarted?: unknown
+        directChildPid?: unknown
+        terminationConfirmed?: unknown
+        message?: unknown
+      }
+      if (
+        Object.keys(receipt).length !== 8 ||
+        ![
+          'workerId',
+          'workerPid',
+          'workerProcessIdentity',
+          'workerControlToken',
+          'directChildStarted',
+          'directChildPid',
+          'terminationConfirmed',
+          'message',
+        ].every((field) => field in receipt) ||
+        receipt.workerId !== this.descriptor.startIdentity ||
+        receipt.workerPid !== this.descriptor.pid ||
+        receipt.workerProcessIdentity !== this.descriptor.processIdentity ||
+        receipt.workerControlToken !== this.owned.token ||
+        typeof receipt.directChildStarted !== 'boolean' ||
+        (receipt.directChildStarted
+          ? !Number.isSafeInteger(receipt.directChildPid) || (receipt.directChildPid as number) <= 0
+          : receipt.directChildPid !== null) ||
+        typeof receipt.terminationConfirmed !== 'boolean' ||
+        typeof receipt.message !== 'string'
+      )
+        return null
+      return {
+        requested: receipt.directChildStarted,
+        terminationConfirmed: receipt.terminationConfirmed,
+        method: receipt.directChildStarted ? 'rollback' : 'none',
+        directChildStarted: receipt.directChildStarted,
+        ...(receipt.directChildStarted ? { directChildPid: receipt.directChildPid as number } : {}),
+        message: receipt.message,
+      }
+    } catch {
+      return null
+    }
   }
 
   async finalSnapshot(): Promise<WorkerSnapshot> {
@@ -583,6 +855,25 @@ export class WorkerClient {
           method: 'rollback',
           ...(Number.isSafeInteger(pid) && pid > 0 ? { directChildPid: pid } : {}),
         }
+      }
+    }
+    const reference: WorkerReference = {
+      pid: this.descriptor.pid,
+      startIdentity: this.descriptor.startIdentity,
+      processIdentity: this.descriptor.processIdentity,
+      endpoint: this.descriptor.endpoint,
+      tokenFingerprint: tokenFingerprint(this.descriptor.token),
+      protocolVersion: this.descriptor.protocolVersion,
+    }
+    if (
+      await WorkerClient.hasVerifiedPrestartNoChildReceipt(this.owned.sessionDirectory, reference)
+    ) {
+      return {
+        requested: false,
+        terminationConfirmed: true,
+        method: 'none',
+        directChildStarted: false,
+        message: 'Worker confirmed that no start frame created a child.',
       }
     }
     return {

@@ -10,7 +10,8 @@ Usage:
 - The `command` parameter is required (e.g., "npm", "python", "bash")
 - The `args` parameter is required: arguments for the command (e.g., ["run", "dev"]); pass [] when there are none
 - Use `workdir` to set the working directory (defaults to the plugin project directory, validated against the git worktree boundary)
-- Use `env` to set additional environment variables
+- Use `env` to set additional environment variables only when an explicit local `bash` allow rule permits the command
+- Use `inheritEnv` only when an explicit local `bash` allow rule permits the command
 - Use `title` to give the session a human-readable name
 - The `description` parameter is required: a clear, concise 5-10 word description
 - `notifyOnExit` is not supported by the durable daemon and is rejected when set. Omit it.

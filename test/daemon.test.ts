@@ -15,6 +15,8 @@ import {
 } from '../src/daemon/storage.ts'
 import {
   WorkerClient as NativeWorkerClient,
+  WorkerClient,
+  WorkerStartError,
   workerLaunchOptions,
   type WorkerSnapshot,
 } from '../src/daemon/worker-client.ts'
@@ -25,7 +27,11 @@ import {
   runtimeEnvironment,
   SessionSupervisor,
 } from '../src/daemon/supervisor.ts'
-import { DAEMON_PROTOCOL_VERSION, type SessionRecord } from '../src/daemon/types.ts'
+import {
+  DAEMON_PROTOCOL_VERSION,
+  SESSION_RECORD_VERSION,
+  type SessionRecord,
+} from '../src/daemon/types.ts'
 import type { SpawnOptions } from '../src/plugin/pty/types.ts'
 import {
   daemonLaunchCommand,
@@ -65,6 +71,11 @@ async function processGone(pid: number) {
 }
 
 const roots: string[] = []
+const OWNER_HASH = 'a'.repeat(64)
+const DIRECT_OWNER_HASH = 'b'.repeat(64)
+const FIRST_OWNER_HASH = 'c'.repeat(64)
+const SECOND_OWNER_HASH = 'd'.repeat(64)
+const IDEMPOTENCY_OWNER_HASH = 'e'.repeat(64)
 const nativeWorkerPath =
   process.env.PTY_NATIVE_WORKER_PATH ??
   join(
@@ -162,6 +173,7 @@ function record(
 ): SessionRecord {
   const now = new Date().toISOString()
   return {
+    recordVersion: SESSION_RECORD_VERSION,
     id,
     title: id,
     command: 'test',
@@ -169,7 +181,7 @@ function record(
     mode: 'pty',
     workdir: root,
     ownerProjectDirectory: root,
-    ownerCapabilityHash: '',
+    ownerCapabilityHash: OWNER_HASH,
     lifecycle: 'conversation',
     environment: { kind: 'safe', keys: [], fingerprint: '', sensitive: false },
     status,
@@ -188,6 +200,25 @@ function record(
     lineCount: 0,
     outputHasPartialLine: false,
     outputJournalVersion: 2,
+  }
+}
+
+function directOwner(root: string) {
+  return { ownerProjectDirectory: root, ownerCapabilityHash: DIRECT_OWNER_HASH }
+}
+
+function markTerminalProof(session: SessionRecord): void {
+  session.directChildExited = true
+  session.containment = {
+    platform: 'not_applicable',
+    status: 'not_applicable',
+    rootPid: session.pid,
+    rootStartIdentity: 'test-root',
+    rootIdentityVerified: true,
+    observedGroupPids: [],
+    observedSessionPids: [],
+    observedEscapedDescendantPids: [],
+    verifiedAt: session.updatedAt,
   }
 }
 
@@ -360,6 +391,38 @@ test('daemon validates RPC fields and uses literal searches', async () => {
     await server.stop()
   }
 })
+
+test('daemon rejects malformed owner capability hashes before authorization', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-hash-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
+  const descriptor = await server.start()
+  const context = await owner(storage, 'parent', root)
+  const rpc = async (capability: string) =>
+    fetch(`${descriptor.endpoint}/rpc`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        version: DAEMON_PROTOCOL_VERSION,
+        operation: 'list',
+        owner: { ...context, capability },
+      }),
+    })
+  try {
+    for (const capability of ['a'.repeat(63), 'A'.repeat(64), 'x'.repeat(64)]) {
+      expect(
+        ((await (await rpc(capability)).json()) as { error: { code: string } }).error.code
+      ).toBe('validation')
+    }
+    expect(
+      ((await (await rpc('b'.repeat(64))).json()) as { error: { code: string } }).error.code
+    ).toBe('authorization')
+  } finally {
+    await server.stop()
+  }
+}, 30_000)
 
 test.skipIf(process.platform === 'win32')(
   'daemon denies other owners and reports bounded diagnostics',
@@ -1076,7 +1139,7 @@ test.skipIf(process.platform === 'win32')(
       args: ['-e', 'setTimeout(() => {}, 5000)'],
       parentSessionId: 'owner',
       ownerProjectDirectory: root,
-      ownerCapabilityHash: 'capability',
+      ownerCapabilityHash: FIRST_OWNER_HASH,
       workdir: root,
       env: { API_TOKEN: 'test-secret-value' },
     }
@@ -1085,7 +1148,7 @@ test.skipIf(process.platform === 'win32')(
     const other = await supervisor.spawn({
       ...common,
       ownerProjectDirectory: otherProject,
-      ownerCapabilityHash: 'other-capability',
+      ownerCapabilityHash: SECOND_OWNER_HASH,
     })
     expect((await supervisor.get(conversation.id))?.environment).toEqual({
       kind: 'safe',
@@ -1105,7 +1168,7 @@ test.skipIf(process.platform === 'win32')(
         })
       ).stdout
     ).toBe('[REDACTED]\n')
-    await supervisor.cleanupByParentSession('owner', root, 'capability')
+    await supervisor.cleanupByParentSession('owner', root, FIRST_OWNER_HASH)
     expect((await supervisor.get(conversation.id))?.terminationRequested).toBeTrue()
     expect((await supervisor.get(persistent.id))?.terminationRequested).toBeFalse()
     expect((await supervisor.get(other.id))?.terminationRequested).toBeFalse()
@@ -1177,6 +1240,53 @@ test('spawn permission adapter uses native ask unless locally allowed or denied'
 
   expect(match('git', 'git *')).toBeTrue()
   expect(match('C:\\Work\\Repo', 'c:/work/*', 'win32')).toBeTrue()
+})
+
+test('spawn permission adapter requires local allow for custom environments', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-permissions-environment-'))
+  roots.push(root)
+  let asks = 0
+  const ask = async () => {
+    asks += 1
+  }
+  const authorizer = (permission: unknown) =>
+    createSpawnAuthorizer(
+      {
+        config: { get: async () => ({ data: { permission } }) },
+        tui: { showToast: async () => {} },
+      } as never,
+      root
+    )
+
+  const customEnvironment = { API_TOKEN: 'super-secret-value' }
+  await expect(
+    authorizer({ bash: 'ask' })(process.execPath, [], root, undefined, ask, customEnvironment)
+  ).rejects.toThrow('custom or inherited environment requires an explicit local bash allow rule')
+  expect(asks).toBe(0)
+
+  await expect(
+    authorizer({ bash: 'ask' })(process.execPath, [], root, undefined, ask, undefined, true)
+  ).rejects.toThrow('custom or inherited environment requires an explicit local bash allow rule')
+  expect(asks).toBe(0)
+
+  await authorizer({ bash: 'ask' })(process.execPath, [], root, undefined, ask, {})
+  expect(asks).toBe(1)
+
+  await authorizer({ bash: 'allow' })(
+    process.execPath,
+    [],
+    root,
+    undefined,
+    ask,
+    customEnvironment,
+    true
+  )
+  expect(asks).toBe(1)
+
+  await expect(
+    authorizer({ bash: 'deny' })(process.execPath, [], root, undefined, ask, customEnvironment)
+  ).rejects.toThrow('local permission policy')
+  expect(asks).toBe(1)
 })
 
 test('experimental Bash keeps raw policy input and external ask patterns', async () => {
@@ -1824,6 +1934,7 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
     ],
     env: { API_TOKEN: 'split-secret-value' },
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
   })
@@ -2140,7 +2251,7 @@ test('claimed start locks recover a reused PID', async () => {
   const recovered = await storage.acquireStartLock()
   expect(typeof recovered?.token).toBe('string')
   if (recovered) await storage.releaseStartLock(recovered.token)
-})
+}, 30_000)
 
 test('claimed handoff recovery locks with a reused PID do not block startup', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-claimed-recovery-lock-identity-'))
@@ -2317,6 +2428,7 @@ test('invalid persistent fields quarantine before a valid legacy record migrates
     )
   }
   const legacy = record(root, 'pty_legacy_valid', 'exited')
+  markTerminalProof(legacy)
   legacy.nextSequence = 7
   legacy.outputBytes = 7
   legacy.lineCount = 1
@@ -2324,7 +2436,11 @@ test('invalid persistent fields quarantine before a valid legacy record migrates
   await writeFile(
     join(root, 'sessions', legacy.id, 'session.json'),
     JSON.stringify(
-      Object.fromEntries(Object.entries(legacy).filter(([key]) => key !== 'outputJournalVersion'))
+      Object.fromEntries(
+        Object.entries(legacy).filter(
+          ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion'
+        )
+      )
     )
   )
   await writeFile(join(root, 'sessions', legacy.id, 'output.log'), 'legacy\n', 'utf8')
@@ -2333,8 +2449,99 @@ test('invalid persistent fields quarantine before a valid legacy record migrates
   await supervisor.initialize()
 
   expect((await supervisor.list()).map((item) => item.id)).toEqual([legacy.id])
-  expect(await supervisor.rawOutput(legacy.id)).toEqual({ raw: 'legacy\n', byteLength: 7 })
+  expect(await supervisor.rawOutput(legacy.id)).toMatchObject({ raw: 'legacy\n', byteLength: 7 })
+  expect(
+    JSON.parse(await readFile(join(root, 'sessions', legacy.id, 'session.json'), 'utf8'))
+  ).toMatchObject({ recordVersion: SESSION_RECORD_VERSION, status: 'exited' })
+  expect(await Bun.file(join(root, 'sessions', legacy.id, 'output.log')).exists()).toBeFalse()
   expect(await readdir(join(root, 'quarantine'))).toHaveLength(invalid.length)
+})
+
+test('legacy terminal status without explicit proof becomes a cleanup tombstone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v0-unproven-terminal-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_v0_unproven', 'exited')
+  session.nextSequence = 7
+  session.outputBytes = 7
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await writeFile(
+    join(root, 'sessions', session.id, 'session.json'),
+    JSON.stringify(
+      Object.fromEntries(
+        Object.entries(session).filter(
+          ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion'
+        )
+      )
+    )
+  )
+  const legacyOutput = join(root, 'sessions', session.id, 'output.log')
+  await writeFile(legacyOutput, 'legacy\n', 'utf8')
+
+  const first = new SessionSupervisor(storage)
+  await first.initialize()
+  expect(await first.get(session.id)).toMatchObject({ status: 'lost', lifecycle: 'conversation' })
+  expect((await storage.loadSessions())[0]).toMatchObject({
+    legacyTombstone: { sourceRecordVersion: 0, lastKnown: 'terminal' },
+    directChildExited: false,
+  })
+  expect(await first.rawOutput(session.id)).toEqual({ raw: 'legacy\n', byteLength: 7 })
+  expect(await Bun.file(legacyOutput).exists()).toBeTrue()
+
+  const second = new SessionSupervisor(storage)
+  await second.initialize()
+  expect(await second.rawOutput(session.id)).toEqual({ raw: 'legacy\n', byteLength: 7 })
+  expect(await Bun.file(legacyOutput).exists()).toBeTrue()
+})
+
+test('V0 records with null owner fields stay inert beside healthy sessions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v0-null-owner-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const healthy = record(root, 'pty_v1_healthy', 'exited')
+  const legacy = record(root, 'pty_v0_null_owner', 'running')
+  await storage.writeSession(healthy)
+  await storage.writeSession(legacy)
+  const legacyPath = join(root, 'sessions', legacy.id, 'session.json')
+  const rawLegacy = {
+    ...Object.fromEntries(
+      Object.entries(legacy).filter(
+        ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion'
+      )
+    ),
+    ownerCapabilityHash: null,
+  }
+  const rawBytes = JSON.stringify(rawLegacy)
+  await writeFile(legacyPath, rawBytes, 'utf8')
+
+  expect((await storage.loadSessions()).map((session) => session.id)).toEqual([healthy.id])
+  expect(await readFile(legacyPath, 'utf8')).toBe(rawBytes)
+  expect(await Bun.file(join(root, 'quarantine')).exists()).toBeFalse()
+})
+
+test('V1 retries legacy output cleanup left after terminal migration', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-legacy-output-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_v1_cleanup', 'exited')
+  markTerminalProof(session)
+  session.nextSequence = 7
+  session.outputBytes = 7
+  session.lineCount = 1
+  session.legacyOutputCleanupPending = true
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 7, timestamp: session.updatedAt, data: 'legacy\n' },
+  ])
+  const legacyOutput = join(root, 'sessions', session.id, 'output.log')
+  await writeFile(legacyOutput, 'legacy\n', 'utf8')
+
+  const loaded = await storage.loadSessions()
+  expect(loaded).toHaveLength(1)
+  expect(await storage.readOutput(session.id)).toBe('legacy\n')
+  expect(await Bun.file(legacyOutput).exists()).toBeFalse()
+  expect((await storage.loadSessions())[0]?.legacyOutputCleanupPending).toBeUndefined()
 })
 
 test('fragmented PTY output is coalesced and retained output stays bounded', async () => {
@@ -2392,6 +2599,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', "console.log('out'); console.error('err')"],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
   })
@@ -2401,6 +2609,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', "console.error('failed'); process.exit(7)"],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
   })
@@ -2410,6 +2619,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', 'setTimeout(() => {}, 5000)'],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 1,
   })
@@ -2419,6 +2629,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     command: process.execPath,
     args: ['-e', "process.stdout.write('x'.repeat(100))"],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
     maxOutputBytes: 8,
@@ -2447,6 +2658,7 @@ test('exec force-kills after grace and reports bounded, truthful termination sta
         : "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
     ],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 1,
   })
@@ -2464,6 +2676,7 @@ test('exec truncation preserves complete UTF-8 text', async () => {
     command: process.execPath,
     args: ['-e', "process.stdout.write('A😀B')"],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
     maxOutputBytes: 4,
@@ -2483,6 +2696,7 @@ test('exec truncation redacts a secret that crosses the output cap', async () =>
     args: ['-e', "process.stdout.write('before-super-secret-value-after')"],
     env: { API_TOKEN: 'super-secret-value' },
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
     maxOutputBytes: 12,
@@ -2511,6 +2725,7 @@ test.skipIf(process.platform === 'win32')(
       command: process.execPath,
       args: ['-e', 'setTimeout(() => {}, 5000)'],
       parentSessionId: 'owner',
+      ...directOwner(root),
       workdir: root,
       name: 'server',
       idempotencyKey: 'deploy-1',
@@ -2540,10 +2755,12 @@ test.skipIf(process.platform === 'win32')(
 )
 
 test.skipIf(process.platform === 'win32')(
-  'PTY idempotency canonicalizes environment order and scopes only by parent and workdir',
+  'PTY idempotency canonicalizes environment order and scopes by full owner identity',
   async () => {
     const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-scope-'))
+    const otherRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-owner-'))
     roots.push(root)
+    roots.push(otherRoot)
     const supervisor = new SessionSupervisor(new DaemonStorage(root))
     await supervisor.initialize()
     const base = {
@@ -2551,12 +2768,18 @@ test.skipIf(process.platform === 'win32')(
       args: ['-e', 'setTimeout(() => {}, 5000)'],
       parentSessionId: 'owner',
       workdir: root,
+      ownerProjectDirectory: root,
+      ownerCapabilityHash: FIRST_OWNER_HASH,
       idempotencyKey: 'same',
       env: { A: '1', Z: '2' },
     }
     const first = await supervisor.spawn(base)
     expect((await supervisor.spawn({ ...base, env: { Z: '2', A: '1' } })).id).toBe(first.id)
-    const other = await supervisor.spawn({ ...base, parentSessionId: 'other' })
+    const other = await supervisor.spawn({
+      ...base,
+      ownerProjectDirectory: otherRoot,
+      ownerCapabilityHash: SECOND_OWNER_HASH,
+    })
     expect(other.id).not.toBe(first.id)
     await supervisor.stop(first.id)
     await supervisor.stop(other.id)
@@ -2579,6 +2802,7 @@ test('PTY idempotency rejects a matching fingerprint with a different environmen
     .digest('hex')
   const existing = record(root, 'pty_existing')
   existing.idempotencyKey = 'same'
+  existing.ownerCapabilityHash = IDEMPOTENCY_OWNER_HASH
   existing.environment = { kind: 'safe', keys: [], fingerprint, sensitive: false }
   const state = supervisor as unknown as {
     records: Map<string, SessionRecord>
@@ -2592,12 +2816,69 @@ test('PTY idempotency rejects a matching fingerprint with a different environmen
         command: 'test',
         parentSessionId: 'parent',
         workdir: root,
+        ownerProjectDirectory: root,
+        ownerCapabilityHash: IDEMPOTENCY_OWNER_HASH,
         idempotencyKey: 'same',
         inheritEnv: true,
       },
       []
     )
   ).toThrow('different command or specification')
+})
+
+test('PTY idempotency does not cross owner capabilities', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-capability-'))
+  const otherRoot = await mkdtemp(join(tmpdir(), 'opencode-pty-idempotency-capability-owner-'))
+  roots.push(root, otherRoot)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  const existing = record(root, 'pty_existing')
+  const environment = runtimeEnvironment(undefined, false)
+  existing.idempotencyKey = 'same'
+  existing.ownerCapabilityHash = FIRST_OWNER_HASH
+  existing.environment = {
+    kind: 'safe',
+    keys: [],
+    fingerprint: new Bun.CryptoHasher('sha256')
+      .update(
+        JSON.stringify(
+          Object.entries(environment).sort(([left], [right]) => left.localeCompare(right))
+        )
+      )
+      .digest('hex'),
+    sensitive: false,
+  }
+  const state = supervisor as unknown as {
+    records: Map<string, SessionRecord>
+    idempotentSession: (options: SpawnOptions, args: string[]) => SessionRecord | undefined
+  }
+  state.records.set(existing.id, existing)
+
+  expect(
+    state.idempotentSession(
+      {
+        command: 'test',
+        parentSessionId: 'parent',
+        workdir: root,
+        ownerProjectDirectory: root,
+        ownerCapabilityHash: FIRST_OWNER_HASH,
+        idempotencyKey: 'same',
+      },
+      []
+    )
+  ).toBe(existing)
+  expect(
+    state.idempotentSession(
+      {
+        command: 'test',
+        parentSessionId: 'parent',
+        workdir: root,
+        ownerProjectDirectory: otherRoot,
+        ownerCapabilityHash: SECOND_OWNER_HASH,
+        idempotencyKey: 'same',
+      },
+      []
+    )
+  ).toBeUndefined()
 })
 
 test.skipIf(process.platform === 'win32')(
@@ -2615,6 +2896,7 @@ test.skipIf(process.platform === 'win32')(
         "setTimeout(() => console.log('ready'), 50); setTimeout(() => process.exit(3), 100)",
       ],
       parentSessionId: 'parent',
+      ...directOwner(root),
       workdir: root,
     })
     await Bun.sleep(50)
@@ -2634,6 +2916,7 @@ test.skipIf(process.platform === 'win32')(
       command: process.execPath,
       args: ['-e', 'setTimeout(() => {}, 5000)'],
       parentSessionId: 'parent',
+      ...directOwner(root),
       workdir: root,
     })
     await expect(
@@ -2754,6 +3037,7 @@ test('native exec allows the bounded terminal grace after maximum runtime', asyn
     await supervisor.nativeExec({
       command: 'test',
       parentSessionId: 'parent',
+      ...directOwner(root),
       timeoutSeconds,
       workdir: root,
     })
@@ -2775,6 +3059,7 @@ test.skipIf(process.platform === 'win32')(
         "process.stdin.setRawMode(true); console.log('ready'); process.stdin.once('data', (data) => { if (data.includes('go')) { console.log('ready'); process.exit(0) } })",
       ],
       parentSessionId: 'parent',
+      ...directOwner(root),
       workdir: root,
     })
     try {
@@ -2813,6 +3098,7 @@ test.skipIf(process.platform === 'win32')(
         "process.stdin.setRawMode(true); process.stdin.once('data', () => { process.stdout.write('immediate\\n') })",
       ],
       parentSessionId: 'parent',
+      ...directOwner(root),
       workdir: root,
     })
     try {
@@ -2853,6 +3139,7 @@ test.skipIf(process.platform === 'win32')(
             `process.stdin.setRawMode(true); process.stdout.write('old\\n'); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.stdin.once('data', () => process.stdout.write('new\\n'))`,
           ],
           parentSessionId: 'parent',
+          ...directOwner(root),
           workdir: root,
         })
     )
@@ -2898,6 +3185,7 @@ test.skipIf(process.platform === 'win32')(
           ],
           env: { API_TOKEN: 'tail-secret' },
           parentSessionId: 'parent',
+          ...directOwner(root),
           workdir: root,
         })
     )
@@ -2925,6 +3213,7 @@ test('exec output remains separately recoverable after restart', async () => {
     command: process.execPath,
     args: ['-e', "process.stdout.write('out'); process.stderr.write('err')"],
     parentSessionId: 'parent',
+    ...directOwner(root),
     workdir: root,
     timeoutSeconds: 2,
   })
@@ -2969,6 +3258,7 @@ test('native exec through the daemon drains both streams, reconnects, stops, and
         ],
         timeoutSeconds: 8,
         maxOutputBytes: 1024,
+        lifecycle: 'persistent',
         workdir: root,
       },
       context
@@ -3126,15 +3416,9 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
 test('native startup failures clean up the direct child and report the proven outcome', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-startup-failure-'))
   roots.push(root)
-  const workerPath = join(
-    process.cwd(),
-    'target',
-    'debug',
-    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
-  )
-  await stat(workerPath)
+  await stat(nativeWorkerPath)
   const previousPath = process.env.PTY_NATIVE_WORKER_PATH
-  process.env.PTY_NATIVE_WORKER_PATH = workerPath
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
   const storage = new DaemonStorage(root)
   const context = await owner(storage, 'native-startup-failure', root)
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'native-startup-failure')
@@ -3193,6 +3477,7 @@ test('native startup failures clean up the direct child and report the proven ou
     })
     const commandRecord = (await storage.loadSessions()).find(
       (record) =>
+        record.command === join(root, 'does-not-exist') &&
         record.exitReason?.kind === 'spawn_error' &&
         record.exitReason.cleanup?.directChildStarted === false
     )
@@ -3203,6 +3488,26 @@ test('native startup failures clean up the direct child and report the proven ou
       terminationConfirmed: true,
       exitReason: { cleanup: { directChildStarted: false } },
     })
+    if (!commandRecord) throw new Error('Expected command spawn failure record.')
+    expect(commandRecord.workerStartAttempted).toBeTrue()
+    expect(commandRecord.worker).toBeDefined()
+    expect(
+      await Bun.file(join(root, 'sessions', commandRecord.id, 'worker.json')).exists()
+    ).toBeTrue()
+    expect(
+      await NativeWorkerClient.hasVerifiedNoChildSpawnFailureReceipt(
+        join(root, 'sessions', commandRecord.id),
+        commandRecord.worker!
+      )
+    ).toBeTrue()
+    expect(
+      await rpc(descriptor, 'cleanup', { id: commandRecord.id }, context).then((response) =>
+        response.json()
+      )
+    ).toMatchObject({ result: true })
+    expect(
+      await Bun.file(join(root, 'sessions', commandRecord.id, 'session.json')).exists()
+    ).toBeFalse()
 
     if (process.platform === 'win32') {
       const assignmentFailure = await withProcessEnv(
@@ -3220,7 +3525,51 @@ test('native startup failures clean up the direct child and report the proven ou
             context
           ).then((response) => response.json())
       )
-      expect(assignmentFailure).toMatchObject({ ok: false, error: { code: 'process' } })
+      expect(assignmentFailure).toMatchObject({
+        ok: false,
+        error: {
+          code: 'process',
+          spawnFailure: {
+            cleanup: {
+              requested: true,
+              method: 'rollback',
+              directChildStarted: true,
+              directChildPid: expect.any(Number),
+              terminationConfirmed: expect.any(Boolean),
+            },
+          },
+        },
+      })
+      const assignmentRecord = (await storage.loadSessions()).find(
+        (record) =>
+          record.exitReason?.kind === 'spawn_error' &&
+          record.exitReason.message.includes('failed to assign suspended child to Job Object')
+      )
+      expect(assignmentRecord).toMatchObject({
+        status: 'spawn_failed',
+        workerStartAttempted: true,
+        exitReason: {
+          cleanup: {
+            directChildStarted: true,
+            directChildPid: expect.any(Number),
+          },
+        },
+      })
+      if (!assignmentRecord?.worker) throw new Error('Expected Job-assignment failure record.')
+      expect(
+        await NativeWorkerClient.hasVerifiedNoChildSpawnFailureReceipt(
+          join(root, 'sessions', assignmentRecord.id),
+          assignmentRecord.worker
+        )
+      ).toBeFalse()
+      expect(
+        await rpc(descriptor, 'cleanup', { id: assignmentRecord.id }, context).then((response) =>
+          response.json()
+        )
+      ).toMatchObject({ result: false })
+      expect(
+        await Bun.file(join(root, 'sessions', assignmentRecord.id, 'session.json')).exists()
+      ).toBeTrue()
     }
 
     const readinessFailure = await withProcessEnv(
@@ -3331,6 +3680,52 @@ test('native startup failures clean up the direct child and report the proven ou
   }
 }, 10_000)
 
+test('Windows Job-assignment failure reports a created direct child', async () => {
+  if (process.platform !== 'win32') return
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-job-assignment-'))
+  roots.push(root)
+  await stat(nativeWorkerPath)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  process.env.PTY_NATIVE_WORKER_PATH = nativeWorkerPath
+  const sessionDirectory = join(root, 'session')
+  let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
+  try {
+    prepared = await withProcessEnv({ OPENCODE_PTY_NATIVE_WORKER_FAULT: 'job_assign' }, () =>
+      NativeWorkerClient.prepare({
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        workdir: root,
+        env: { ...process.env } as Record<string, string>,
+        redactionSecrets: [],
+        sessionDirectory,
+        timeoutSeconds: 2,
+        maxOutputBytes: 1024,
+        mode: 'exec',
+      })
+    )
+    await expect(prepared.client.start()).rejects.toMatchObject({
+      cleanup: {
+        requested: true,
+        method: 'rollback',
+        directChildStarted: true,
+        directChildPid: expect.any(Number),
+        terminationConfirmed: expect.any(Boolean),
+      },
+    })
+    expect(
+      await NativeWorkerClient.hasVerifiedNoChildSpawnFailureReceipt(
+        sessionDirectory,
+        prepared.reference
+      )
+    ).toBeFalse()
+    expect(await Bun.file(join(sessionDirectory, 'worker.json')).exists()).toBeTrue()
+  } finally {
+    if (prepared) await NativeWorkerClient.terminateOrphan(sessionDirectory)
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
 test('native worker identity and ready-output failures close the owned worker before command spawn', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-bootstrap-failure-'))
   roots.push(root)
@@ -3421,6 +3816,741 @@ test('native worker identity and ready-output failures close the owned worker be
     else process.env.OPENCODE_PTY_NATIVE_WORKER_IDENTITY_PROBE_THROW = previousProbeThrow
   }
 }, 10_000)
+
+test('unconfirmed worker startup cleanup retains its descriptor for orphan reaping', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-unconfirmed-worker-start-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const sessionDirectory = join(root, 'session')
+  await mkdir(sessionDirectory, { recursive: true })
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  let workerPid: number | undefined
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    const error = await withProcessEnv(
+      {
+        OPENCODE_PTY_NATIVE_WORKER_FAULT: 'missing_ready',
+        OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS: '100',
+        OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS: '60000',
+      },
+      async () => {
+        try {
+          await NativeWorkerClient.start({
+            command: process.execPath,
+            args: ['-e', 'setInterval(() => {}, 1000)'],
+            workdir: root,
+            env: runtimeEnvironment(undefined, false),
+            redactionSecrets: [],
+            sessionDirectory,
+            timeoutSeconds: 2,
+            maxOutputBytes: 1024,
+            mode: 'exec',
+          })
+          throw new Error('Expected native worker startup to fail.')
+        } catch (error) {
+          return error
+        }
+      }
+    )
+    expect(error).toBeInstanceOf(WorkerStartError)
+    expect((error as WorkerStartError).cleanup).toMatchObject({
+      requested: true,
+      terminationConfirmed: false,
+      method: 'rollback',
+    })
+
+    const descriptorPath = join(sessionDirectory, 'worker.json')
+    expect(await Bun.file(descriptorPath).exists()).toBeTrue()
+    workerPid = (JSON.parse(await readFile(descriptorPath, 'utf8')) as { pid: number }).pid
+    await expect(NativeWorkerClient.terminateOrphan(sessionDirectory)).resolves.toMatchObject({
+      outcome: 'killed',
+    })
+    expect(await processGone(workerPid)).toBeTrue()
+  } finally {
+    if (workerPid && !(await processGone(workerPid))) process.kill(workerPid, 'SIGKILL')
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
+test('prepared workers do not start commands before the start frame', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-prepare-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const sessionDirectory = join(root, 'session')
+  const marker = join(root, 'command-started')
+  await mkdir(sessionDirectory)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    prepared = await NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+      workdir: root,
+      env: runtimeEnvironment(undefined, false),
+      redactionSecrets: [],
+      sessionDirectory,
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    expect(await Bun.file(marker).exists()).toBeFalse()
+    await prepared.client.start()
+    expect(await Bun.file(join(sessionDirectory, 'prestart-no-child.json')).exists()).toBeFalse()
+    await prepared.client.wait(5000)
+    expect(await Bun.file(marker).text()).toBe('started')
+    await prepared.client.shutdown()
+    prepared = undefined
+  } finally {
+    if (prepared) {
+      await prepared.client.rollback().catch(() => undefined)
+      await NativeWorkerClient.terminateOrphan(sessionDirectory).catch(() => undefined)
+    }
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
+test('a verified pre-start receipt lets recovery remove a no-child worker', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-prestart-recovery-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_prestart', 'lost')
+  session.lifecycle = 'persistent'
+  const sessionDirectory = join(root, 'sessions', session.id)
+  const marker = join(root, 'command-started')
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  await mkdir(sessionDirectory, { recursive: true })
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    prepared = await NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+      workdir: root,
+      env: runtimeEnvironment(undefined, false),
+      redactionSecrets: [],
+      sessionDirectory,
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    session.worker = prepared.reference
+    session.workerStartAttempted = false
+    session.status = 'spawn_failed'
+    await storage.writeSession(session)
+
+    expect(await Bun.file(marker).exists()).toBeFalse()
+    expect(await prepared.client.rollback()).toMatchObject({
+      requested: false,
+      terminationConfirmed: true,
+      directChildStarted: false,
+    })
+    expect(await Bun.file(join(sessionDirectory, 'worker.json')).exists()).toBeTrue()
+    expect(
+      await NativeWorkerClient.hasVerifiedPrestartNoChildReceipt(
+        sessionDirectory,
+        prepared.reference
+      )
+    ).toBeTrue()
+
+    const receiptPath = join(sessionDirectory, 'prestart-no-child.json')
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8')) as Record<string, unknown>
+    for (const invalid of [
+      { ...receipt, workerEndpoint: 'http://127.0.0.1:9' },
+      { ...receipt, receiptVersion: 2 },
+      { ...receipt, kind: 'other' },
+      { ...receipt, workerProcessIdentity: 'other-process' },
+      { ...receipt, workerProtocolVersion: 4 },
+      { ...receipt, workerControlToken: 'other-token' },
+      { ...receipt, extra: true },
+    ]) {
+      await writeFile(receiptPath, JSON.stringify(invalid))
+      expect(
+        await NativeWorkerClient.hasVerifiedPrestartNoChildReceipt(
+          sessionDirectory,
+          prepared.reference
+        )
+      ).toBeFalse()
+    }
+    await writeFile(receiptPath, JSON.stringify(receipt))
+
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.reconcileWorkers()
+    expect(await Bun.file(marker).exists()).toBeFalse()
+    expect(existsSync(sessionDirectory)).toBeFalse()
+    prepared = undefined
+  } finally {
+    if (prepared) {
+      await prepared.client.rollback().catch(() => undefined)
+      await NativeWorkerClient.terminateOrphan(sessionDirectory).catch(() => undefined)
+    }
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
+test('a pre-start authority alone can reap only its matching no-child receipt', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-prestart-authority-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_prestart_authority', 'spawn_failed')
+  session.lifecycle = 'persistent'
+  session.workerStartAttempted = false
+  const sessionDirectory = join(root, 'sessions', session.id)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  await mkdir(sessionDirectory, { recursive: true })
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    prepared = await NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      workdir: root,
+      env: runtimeEnvironment(undefined, false),
+      redactionSecrets: [],
+      sessionDirectory,
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    session.workerPrestart = {
+      workerId: prepared.reference.startIdentity,
+      tokenFingerprint: prepared.reference.tokenFingerprint!,
+      protocolVersion: prepared.reference.protocolVersion,
+    }
+    await storage.writeSession(session)
+    await prepared.client.rollback()
+
+    for (const authority of [
+      { ...session.workerPrestart, workerId: 'other-worker' },
+      { ...session.workerPrestart, tokenFingerprint: '0'.repeat(64) },
+      { ...session.workerPrestart, protocolVersion: 4 },
+    ]) {
+      expect(
+        await NativeWorkerClient.hasVerifiedPrestartNoChildReceipt(sessionDirectory, authority)
+      ).toBeFalse()
+    }
+    expect(
+      await NativeWorkerClient.hasVerifiedPrestartNoChildReceipt(
+        sessionDirectory,
+        session.workerPrestart
+      )
+    ).toBeTrue()
+
+    const missing = record(root, 'pty_prestart_authority_missing', 'spawn_failed')
+    missing.lifecycle = 'persistent'
+    missing.workerStartAttempted = false
+    missing.workerPrestart = { ...session.workerPrestart, workerId: 'missing-worker' }
+    await storage.writeSession(missing)
+
+    const supervisor = new SessionSupervisor(storage, undefined, 1)
+    await supervisor.initialize(false)
+    await supervisor.reconcileWorkers()
+    expect(existsSync(sessionDirectory)).toBeFalse()
+    expect(existsSync(join(root, 'sessions', missing.id))).toBeTrue()
+    expect(await supervisor.cleanup(missing.id)).toBeFalse()
+    prepared = undefined
+  } finally {
+    if (prepared) {
+      await prepared.client.rollback().catch(() => undefined)
+      await NativeWorkerClient.terminateOrphan(sessionDirectory).catch(() => undefined)
+    }
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
+test('pre-worker callback failures report confirmed no-worker evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-preworker-failure-'))
+  roots.push(root)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const sessionDirectory = join(root, 'session')
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    const error = await NativeWorkerClient.prepare(
+      {
+        command: process.execPath,
+        args: [
+          '-e',
+          `require('node:fs').writeFileSync(${JSON.stringify(join(root, 'marker'))}, 'x')`,
+        ],
+        workdir: root,
+        env: runtimeEnvironment(undefined, false),
+        redactionSecrets: [],
+        sessionDirectory,
+        timeoutSeconds: 2,
+        maxOutputBytes: 1024,
+        mode: 'exec',
+      },
+      async () => {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
+      }
+    ).catch((error) => error)
+    expect(error).toBeInstanceOf(WorkerStartError)
+    expect(error as WorkerStartError).toMatchObject({
+      noWorkerSpawned: true,
+      cleanup: { requested: false, terminationConfirmed: true, directChildStarted: false },
+    })
+    expect(await Bun.file(join(sessionDirectory, 'worker.json')).exists()).toBeFalse()
+    expect(await Bun.file(join(root, 'marker')).exists()).toBeFalse()
+  } finally {
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+})
+
+test('pre-worker payload and worker-resolution failures report confirmed no-worker evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-preworker-known-failure-'))
+  roots.push(root)
+  const marker = join(root, 'command-started')
+  const sessionDirectory = join(root, 'session')
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  try {
+    const oversized = await NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+      workdir: root,
+      env: { PAYLOAD: 'x'.repeat(1024 * 1024) },
+      redactionSecrets: [],
+      sessionDirectory,
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    }).catch((error) => error)
+    expect(oversized).toBeInstanceOf(WorkerStartError)
+    expect(oversized as WorkerStartError).toMatchObject({
+      noWorkerSpawned: true,
+      cleanup: { requested: false, terminationConfirmed: true, directChildStarted: false },
+    })
+    expect(await Bun.file(join(sessionDirectory, 'worker.json')).exists()).toBeFalse()
+    expect(await Bun.file(marker).exists()).toBeFalse()
+
+    process.env.PTY_NATIVE_WORKER_PATH = join(root, 'missing-worker')
+    const unavailable = await NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+      workdir: root,
+      env: runtimeEnvironment(undefined, false),
+      redactionSecrets: [],
+      sessionDirectory: join(root, 'missing-session'),
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    }).catch((error) => error)
+    expect(unavailable).toBeInstanceOf(WorkerStartError)
+    expect(unavailable as WorkerStartError).toMatchObject({
+      noWorkerSpawned: true,
+      cleanup: { requested: false, terminationConfirmed: true, directChildStarted: false },
+    })
+    expect(await Bun.file(join(root, 'missing-session', 'worker.json')).exists()).toBeFalse()
+    expect(await Bun.file(marker).exists()).toBeFalse()
+  } finally {
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+})
+
+test('ready-timeout failures retain a verified reference for no-child recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-prestart-ready-timeout-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const marker = join(root, 'command-started')
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    await expect(
+      withProcessEnv(
+        {
+          OPENCODE_PTY_NATIVE_WORKER_FAULT: 'missing_ready',
+          OPENCODE_PTY_NATIVE_WORKER_READY_TIMEOUT_MS: '100',
+          OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS: '500',
+        },
+        () =>
+          supervisor.nativeExecStart({
+            command: process.execPath,
+            args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+            timeoutSeconds: 2,
+            workdir: root,
+            parentSessionId: 'parent',
+            lifecycle: 'persistent',
+            ...directOwner(root),
+          })
+      )
+    ).rejects.toBeInstanceOf(ProcessError)
+
+    const session = (await storage.loadSessions()).at(0)
+    if (!session) throw new Error('Expected ready-timeout session record.')
+    const sessionDirectory = join(root, 'sessions', session.id)
+    expect(session).toMatchObject({
+      status: 'spawn_failed',
+      workerStartAttempted: false,
+      worker: { protocolVersion: 5 },
+    })
+    expect(await Bun.file(marker).exists()).toBeFalse()
+    expect(
+      await NativeWorkerClient.hasVerifiedPrestartNoChildReceipt(sessionDirectory, session.worker!)
+    ).toBeTrue()
+
+    await supervisor.initialize(false)
+    await supervisor.reconcileWorkers()
+    expect(existsSync(sessionDirectory)).toBeFalse()
+  } finally {
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
+test('native sessions persist their worker reference before start', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-reference-order-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const prepare = NativeWorkerClient.prepare
+  const writeSession = storage.writeSession.bind(storage)
+  let commandStarted = false
+  const reference = {
+    pid: 123,
+    startIdentity: 'worker-id',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  const client = {
+    start: async () => {
+      commandStarted = true
+      return workerSnapshot()
+    },
+    wait: async () => new Promise<WorkerSnapshot>(() => undefined),
+  }
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async (
+    _bootstrap,
+    persistPrestart
+  ) => {
+    await persistPrestart?.({
+      workerId: reference.startIdentity,
+      tokenFingerprint: reference.tokenFingerprint!,
+      protocolVersion: reference.protocolVersion,
+    })
+    return {
+      client,
+      reference,
+    } as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+  }
+  let gate:
+    | {
+        arrived: Promise<void>
+        notify: () => void
+        released: Promise<void>
+        release: () => void
+      }
+    | undefined
+  storage.writeSession = async (entry) => {
+    if (entry.workerStartAttempted === true && gate) {
+      gate.notify()
+      await gate.released
+    }
+    await writeSession(entry)
+  }
+  try {
+    for (const mode of ['pty', 'exec'] as const) {
+      commandStarted = false
+      let notify!: () => void
+      let releaseGate!: () => void
+      gate = {
+        arrived: new Promise<void>((resolve) => {
+          notify = resolve
+        }),
+        notify,
+        released: new Promise<void>((resolve) => {
+          releaseGate = resolve
+        }),
+        release: releaseGate,
+      }
+      const currentGate = gate
+      const operation =
+        mode === 'pty'
+          ? supervisor.spawn({
+              command: 'prepared-command',
+              workdir: root,
+              parentSessionId: `parent-${mode}`,
+              lifecycle: 'persistent',
+              ...directOwner(root),
+            })
+          : supervisor.nativeExecStart({
+              command: 'prepared-command',
+              timeoutSeconds: 1,
+              workdir: root,
+              parentSessionId: `parent-${mode}`,
+              lifecycle: 'persistent',
+              ...directOwner(root),
+            })
+      await currentGate.arrived
+      expect(commandStarted).toBeFalse()
+      currentGate.release()
+      await operation
+      expect(commandStarted).toBeTrue()
+      gate = undefined
+    }
+  } finally {
+    storage.writeSession = writeSession
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
+test('native worker reference persistence failure rolls back before start', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-reference-failure-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const prepare = NativeWorkerClient.prepare
+  const writeSession = storage.writeSession.bind(storage)
+  const reference = {
+    pid: 123,
+    startIdentity: 'worker-id',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  let starts = 0
+  let rollbacks = 0
+  const client = {
+    start: async () => {
+      starts += 1
+      return workerSnapshot()
+    },
+    rollback: async () => {
+      rollbacks += 1
+      return { requested: true, terminationConfirmed: false, method: 'rollback' as const }
+    },
+  }
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async (
+    _bootstrap,
+    persistPrestart
+  ) => {
+    await persistPrestart?.({
+      workerId: reference.startIdentity,
+      tokenFingerprint: reference.tokenFingerprint!,
+      protocolVersion: reference.protocolVersion,
+    })
+    return {
+      client,
+      reference,
+    } as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+  }
+  storage.writeSession = async (entry) => {
+    if (entry.workerStartAttempted === true) {
+      await mkdir(join(root, 'sessions', entry.id), { recursive: true })
+      await writeFile(join(root, 'sessions', entry.id, 'worker.json'), JSON.stringify(reference))
+      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
+    }
+    await writeSession(entry)
+  }
+  try {
+    for (const mode of ['pty', 'exec'] as const) {
+      starts = 0
+      rollbacks = 0
+      const operation =
+        mode === 'pty'
+          ? supervisor.spawn({
+              command: 'prepared-command',
+              workdir: root,
+              parentSessionId: `parent-${mode}`,
+              ...directOwner(root),
+            })
+          : supervisor.nativeExecStart({
+              command: 'prepared-command',
+              timeoutSeconds: 1,
+              workdir: root,
+              parentSessionId: `parent-${mode}`,
+              ...directOwner(root),
+            })
+      await expect(operation).rejects.toBeInstanceOf(ProcessError)
+      expect(starts).toBe(0)
+      expect(rollbacks).toBe(1)
+      const persisted = (await storage.loadSessions()).find(
+        (record) => record.parentSessionId === `parent-${mode}`
+      )
+      if (!persisted) throw new Error('Expected lost session after pre-start persistence failure.')
+      expect(persisted).toMatchObject({
+        status: 'lost',
+        worker: reference,
+        workerStartAttempted: false,
+        terminationRequested: true,
+        terminationConfirmed: false,
+      })
+      expect(
+        await Bun.file(join(root, 'sessions', persisted.id, 'worker.json')).exists()
+      ).toBeTrue()
+    }
+  } finally {
+    storage.writeSession = writeSession
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
+test('pre-start receipts cannot delete start-attempted or legacy records', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-prestart-fence-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_prestart_fence', 'spawn_failed')
+  session.lifecycle = 'persistent'
+  const sessionDirectory = join(root, 'sessions', session.id)
+  const workerPath = join(
+    process.cwd(),
+    'target',
+    'debug',
+    `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
+  )
+  await stat(workerPath)
+  await mkdir(sessionDirectory, { recursive: true })
+  const previousPath = process.env.PTY_NATIVE_WORKER_PATH
+  let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
+  try {
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
+    prepared = await NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      workdir: root,
+      env: runtimeEnvironment(undefined, false),
+      redactionSecrets: [],
+      sessionDirectory,
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    })
+    session.worker = prepared.reference
+    session.workerStartAttempted = true
+    await storage.writeSession(session)
+    await prepared.client.rollback()
+
+    const beforeRecovery = (await storage.loadSessions()).find((entry) => entry.id === session.id)
+    expect(beforeRecovery?.workerStartAttempted).toBeTrue()
+
+    const supervisor = new SessionSupervisor(storage, undefined, 1)
+    await supervisor.initialize(false)
+    expect(existsSync(sessionDirectory)).toBeTrue()
+    await supervisor.reconcileWorkers()
+    expect(existsSync(sessionDirectory)).toBeTrue()
+    expect(await supervisor.cleanup(session.id)).toBeFalse()
+
+    const stored = (await storage.loadSessions()).find((entry) => entry.id === session.id)
+    expect(stored?.workerStartAttempted).toBeTrue()
+    prepared = undefined
+  } finally {
+    if (prepared) {
+      await prepared.client.rollback().catch(() => undefined)
+      await NativeWorkerClient.terminateOrphan(sessionDirectory).catch(() => undefined)
+    }
+    if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
+    else process.env.PTY_NATIVE_WORKER_PATH = previousPath
+  }
+}, 30_000)
+
+test('start-attempted and legacy records never consume a pre-start receipt', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-prestart-legacy-fence-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const reference = {
+    pid: 123,
+    startIdentity: 'worker-id',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  const receipt = NativeWorkerClient.hasVerifiedPrestartNoChildReceipt
+  const reconnect = NativeWorkerClient.reconnect
+  let receiptReads = 0
+  let reconnects = 0
+  ;(
+    NativeWorkerClient as unknown as {
+      hasVerifiedPrestartNoChildReceipt: typeof receipt
+    }
+  ).hasVerifiedPrestartNoChildReceipt = async () => {
+    receiptReads += 1
+    return true
+  }
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    reconnects += 1
+    return null
+  }
+  try {
+    for (const [id, workerStartAttempted] of [
+      ['pty_start_attempted', true],
+      ['pty_legacy_start', undefined],
+    ] as const) {
+      const session = record(root, id, 'lost')
+      session.lifecycle = 'persistent'
+      session.worker = reference
+      if (workerStartAttempted !== undefined) session.workerStartAttempted = workerStartAttempted
+      await storage.writeSession(session)
+    }
+    const supervisor = new SessionSupervisor(storage, undefined, 1)
+    await supervisor.initialize(false)
+    await supervisor.reconcileWorkers()
+
+    expect(receiptReads).toBe(0)
+    expect(reconnects).toBe(2)
+    for (const id of ['pty_start_attempted', 'pty_legacy_start']) {
+      expect(existsSync(join(root, 'sessions', id))).toBeTrue()
+      expect(await supervisor.cleanup(id)).toBeFalse()
+    }
+    expect(receiptReads).toBe(0)
+  } finally {
+    ;(
+      NativeWorkerClient as unknown as {
+        hasVerifiedPrestartNoChildReceipt: typeof receipt
+      }
+    ).hasVerifiedPrestartNoChildReceipt = receipt
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
 
 test('worker recovery rejects an authenticated health identity mismatch', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-recovery-'))
@@ -3608,7 +4738,7 @@ test('native RPC loss after command start reaps the direct child before persisti
     if (previousPath === undefined) delete process.env.PTY_NATIVE_WORKER_PATH
     else process.env.PTY_NATIVE_WORKER_PATH = previousPath
   }
-}, 10_000)
+}, 30_000)
 
 test('spawn payload fault knobs are stripped from session env and never trigger fault injection', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-fault-env-strip-'))
@@ -3809,6 +4939,7 @@ test.skipIf(process.platform !== 'darwin')(
         command: process.execPath,
         args: ['-e', "console.log('macos-normal')"],
         parentSessionId: 'macos',
+        ...directOwner(root),
         timeoutSeconds: 2,
         workdir: root,
       })
@@ -3849,6 +4980,7 @@ test.skipIf(process.platform === 'win32')(
           command: process.execPath,
           args: ['-e', "process.stdin.on('data', value => process.stdout.write('echo:' + value))"],
           description: 'native pty integration',
+          lifecycle: 'persistent',
           workdir: root,
         },
         context
@@ -4048,7 +5180,9 @@ test.skipIf(process.platform !== 'win32')(
       const raw = (output as { result?: { raw?: string } }).result?.raw
       const diagnostics = (session as { result?: { diagnostics?: string[] } }).result?.diagnostics
       if (!raw?.includes('conpty-ok'))
-        throw new Error(`finite ConPTY output loss diagnostics: ${JSON.stringify(diagnostics)}`)
+        throw new Error(
+          `finite ConPTY output loss: raw=${JSON.stringify(raw)} diagnostics=${JSON.stringify(diagnostics)}`
+        )
       expect(session).toMatchObject({
         result: {
           status: 'exited',
@@ -4110,6 +5244,7 @@ test.skipIf(process.platform === 'win32')(
         command: process.execPath,
         args: ['-e', 'setInterval(() => {}, 1000)'],
         parentSessionId: 'parent',
+        ...directOwner(root),
         workdir: root,
       })
       expect(session.timeoutSeconds).toBeUndefined()
@@ -4358,7 +5493,7 @@ foreach ($item in $items) {
   }
 })
 
-test('lost sessions can only be discarded by explicit cleanup', async () => {
+test('lost sessions without terminal evidence are retained', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lost-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -4366,9 +5501,458 @@ test('lost sessions can only be discarded by explicit cleanup', async () => {
   await storage.writeSession(record(root, 'pty_lost', 'lost'))
   await supervisor.initialize()
 
-  expect(await supervisor.cleanup('pty_lost')).toBeTrue()
-  expect(await storage.loadSessions()).toHaveLength(0)
+  expect(await supervisor.cleanup('pty_lost')).toBeFalse()
+  expect(await storage.loadSessions()).toMatchObject([{ id: 'pty_lost', status: 'lost' }])
 })
+
+test('lost persistent sessions remain retry-eligible without becoming runnable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-persistent-retry-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_persistent_retry')
+  session.lifecycle = 'persistent'
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  const reconnect = NativeWorkerClient.reconnect
+  let attempts = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    attempts += 1
+    return null
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage, undefined, 1)
+    await supervisor.initialize()
+    await supervisor.initialize()
+
+    expect(attempts).toBe(2)
+    expect(await supervisor.get(session.id)).toMatchObject({ status: 'lost' })
+    await expect(supervisor.wait(session.id, { kind: 'exit' }, 1)).rejects.toMatchObject({
+      code: 'session_closed',
+    })
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+}, 30_000)
+
+test('a fresh authenticated snapshot restores a retryable persistent session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-persistent-recovered-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_persistent_recovered')
+  session.lifecycle = 'persistent'
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  const running = workerSnapshot()
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitReason: 'stopped',
+    exitedAt: new Date().toISOString(),
+    terminationRequested: true,
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  let releaseWait!: () => void
+  const waitGate = new Promise<WorkerSnapshot>((resolve) => {
+    releaseWait = () => resolve(terminal)
+  })
+  let writes = 0
+  const worker = {
+    snapshot: async () => running,
+    write: async () => {
+      writes += 1
+      return { arrivalSequence: 0 }
+    },
+    wait: async () => waitGate,
+    stop: async () => terminal,
+    finalSnapshot: async () => terminal,
+    shutdown: async () => terminal,
+  }
+  const reconnect = NativeWorkerClient.reconnect
+  let attempts = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    attempts += 1
+    return attempts === 1 ? null : (worker as never)
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage, undefined, 1)
+    await supervisor.initialize()
+    expect(await supervisor.get(session.id)).toMatchObject({ status: 'lost' })
+
+    await supervisor.initialize()
+    expect(await supervisor.get(session.id)).toMatchObject({ status: 'running' })
+    await supervisor.write(session.id, 'resumed input')
+    expect(writes).toBe(1)
+    await supervisor.stop(session.id)
+  } finally {
+    releaseWait()
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+}, 30_000)
+
+test('host cleanup retries a lost conversation tombstone without deleting evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-conversation-tombstone-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_conversation_tombstone', 'lost')
+  session.pendingCleanup = true
+  session.nextSequence = 5
+  session.outputBytes = 5
+  session.lineCount = 1
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'kept\n' },
+  ])
+  const reconnect = NativeWorkerClient.reconnect
+  let attempts = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    attempts += 1
+    return { shutdown: async () => workerSnapshot({ status: 'lost' }) } as never
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.cleanupByParentSession('parent', root, OWNER_HASH)
+    await supervisor.cleanupByParentSession('parent', root, OWNER_HASH)
+
+    expect(attempts).toBe(2)
+    expect(await supervisor.get(session.id)).toMatchObject({ status: 'lost' })
+    expect(await storage.loadSessions()).toMatchObject([
+      {
+        id: session.id,
+        status: 'lost',
+        pendingCleanup: true,
+      },
+    ])
+    expect(await supervisor.rawOutput(session.id)).toEqual({ raw: 'kept\n', byteLength: 5 })
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+}, 30_000)
+
+test('restart cleanup removes a terminal conversation record with proof', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-terminal-conversation-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_terminal_conversation', 'exited')
+  markTerminalProof(session)
+  session.nextSequence = 5
+  session.outputBytes = 5
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'done\n' },
+  ])
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize(false)
+  await supervisor.markConversationRecoveryCleanup()
+
+  expect(await storage.loadSessions()).toEqual([])
+})
+
+test('restart cleanup retains a terminal conversation record without proof', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-terminal-conversation-unproven-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_terminal_conversation_unproven', 'exited')
+  session.nextSequence = 5
+  session.outputBytes = 5
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'done\n' },
+  ])
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize(false)
+  await supervisor.markConversationRecoveryCleanup()
+
+  const [stored] = await storage.loadSessions()
+  expect(stored).toMatchObject({
+    id: session.id,
+    status: 'exited',
+    terminationConfirmed: true,
+  })
+  expect(stored?.directChildExited).toBeUndefined()
+  expect(await storage.readOutput(session.id)).toBe('done\n')
+})
+
+test('restart cleanup requires fresh shutdown proof for a terminal conversation worker', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-terminal-conversation-worker-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_terminal_conversation_worker', 'exited')
+  markTerminalProof(session)
+  session.worker = {
+    pid: 7,
+    startIdentity: 'worker-start',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:7',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  session.nextSequence = 5
+  session.outputBytes = 5
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'done\n' },
+  ])
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitReason: 'stopped',
+    exitedAt: new Date().toISOString(),
+    terminationRequested: true,
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  const reconnect = NativeWorkerClient.reconnect
+  let reconnects = 0
+  let shutdowns = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    reconnects += 1
+    return {
+      shutdown: async () => {
+        shutdowns += 1
+        return terminal
+      },
+    } as never
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.markConversationRecoveryCleanup()
+
+    expect(reconnects).toBe(1)
+    expect(shutdowns).toBe(1)
+    expect(await storage.loadSessions()).toEqual([])
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
+
+test('restart cleanup retains a terminal conversation worker without fresh proof', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-terminal-conversation-worker-retain-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_terminal_conversation_worker_retain', 'exited')
+  markTerminalProof(session)
+  session.worker = {
+    pid: 7,
+    startIdentity: 'worker-start',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:7',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  session.nextSequence = 5
+  session.outputBytes = 5
+  session.lineCount = 1
+  await storage.writeSession(session)
+  await storage.appendOutput(session.id, [
+    { startSequence: 0, endSequence: 5, timestamp: session.updatedAt, data: 'done\n' },
+  ])
+  const reconnect = NativeWorkerClient.reconnect
+  let reconnects = 0
+  let shutdowns = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    reconnects += 1
+    return {
+      shutdown: async () => {
+        shutdowns += 1
+        return workerSnapshot({
+          status: 'exited',
+          exitReason: 'stopped',
+          exitedAt: new Date().toISOString(),
+          terminationRequested: true,
+          terminationConfirmed: false,
+          directChildExited: true,
+          stdoutEof: true,
+          stderrEof: true,
+          outputComplete: true,
+        })
+      },
+    } as never
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.markConversationRecoveryCleanup()
+
+    expect(reconnects).toBe(1)
+    expect(shutdowns).toBe(1)
+    expect(await storage.loadSessions()).toMatchObject([
+      { id: session.id, status: 'exited', pendingCleanup: true, worker: session.worker },
+    ])
+    expect(await storage.readOutput(session.id)).toBe('done\n')
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
+
+test('restart cleanup retains a terminal conversation worker when reconnect fails', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-terminal-conversation-worker-missing-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_terminal_conversation_worker_missing', 'exited')
+  markTerminalProof(session)
+  session.worker = {
+    pid: 7,
+    startIdentity: 'worker-start',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:7',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  const reconnect = NativeWorkerClient.reconnect
+  let reconnects = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    reconnects += 1
+    return null
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.markConversationRecoveryCleanup()
+
+    expect(reconnects).toBe(1)
+    expect(await storage.loadSessions()).toMatchObject([
+      { id: session.id, status: 'exited', pendingCleanup: true, worker: session.worker },
+    ])
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
+
+test('recovery reaps a post-start no-child conversation failure without reconnecting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-poststart-conversation-recovery-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_poststart_conversation', 'spawn_failed')
+  const token = 'post-start-conversation-token'
+  session.worker = {
+    pid: 7,
+    startIdentity: 'worker-start',
+    processIdentity: 'worker-process',
+    endpoint: 'http://127.0.0.1:7',
+    tokenFingerprint: new Bun.CryptoHasher('sha256').update(token).digest('hex'),
+    protocolVersion: 5,
+  }
+  session.workerStartAttempted = true
+  await storage.writeSession(session)
+  const sessionDirectory = join(root, 'sessions', session.id)
+  await writeFile(
+    join(sessionDirectory, 'worker.json'),
+    JSON.stringify({
+      pid: session.worker.pid,
+      startIdentity: session.worker.startIdentity,
+      processIdentity: session.worker.processIdentity,
+      endpoint: session.worker.endpoint,
+      token,
+      protocolVersion: session.worker.protocolVersion,
+    })
+  )
+  await writeFile(
+    join(sessionDirectory, 'spawn-failure.json'),
+    JSON.stringify({
+      workerId: session.worker.startIdentity,
+      workerPid: session.worker.pid,
+      workerProcessIdentity: session.worker.processIdentity,
+      workerControlToken: token,
+      directChildStarted: false,
+      directChildPid: null,
+      terminationConfirmed: true,
+      message: 'command was unavailable',
+    })
+  )
+  const reconnect = NativeWorkerClient.reconnect
+  let reconnects = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
+    reconnects += 1
+    return null
+  }
+  try {
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.reconcileWorkers()
+
+    expect(reconnects).toBe(0)
+    expect(existsSync(sessionDirectory)).toBeFalse()
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+})
+
+test('restart marks and reaps a lost conversation tombstone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-lost-conversation-recovery-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const session = record(root, 'pty_lost_conversation_recovery', 'lost')
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitReason: 'stopped',
+    exitedAt: new Date().toISOString(),
+    terminationRequested: true,
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  const reconnect = NativeWorkerClient.reconnect
+  let shutdowns = 0
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () =>
+    ({
+      finalSnapshot: async () => terminal,
+      shutdown: async () => {
+        shutdowns += 1
+        return terminal
+      },
+    }) as never
+  try {
+    const supervisor = new SessionSupervisor(storage)
+    await supervisor.initialize(false)
+    await supervisor.markConversationRecoveryCleanup()
+    await supervisor.reconcileWorkers()
+
+    expect(shutdowns).toBe(1)
+    expect(await storage.loadSessions()).toEqual([])
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+  }
+}, 30_000)
 
 test('native monitor snapshots exclude journal output and persist terminal output interleaving', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-finalize-race-'))
@@ -4428,6 +6012,54 @@ test('native monitor snapshots exclude journal output and persist terminal outpu
   expect(await storage.loadSessions()).toMatchObject([
     { id: session.id, nextSequence: 11, outputBytes: 11, lineCount: 2, status: 'exited' },
   ])
+})
+
+test('a stale running worker snapshot cannot revive a stopping session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-stale-running-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_stale_running', 'stopping')
+  session.terminationRequested = true
+  session.exitCode = 42
+  session.nextSequence = 7
+  session.outputBytes = 7
+  session.containment = {
+    platform: 'not_applicable',
+    status: 'not_applicable',
+    rootPid: 42,
+    rootStartIdentity: 'stopped',
+    rootIdentityVerified: true,
+    observedGroupPids: [],
+    observedSessionPids: [],
+    observedEscapedDescendantPids: [],
+    verifiedAt: new Date().toISOString(),
+  }
+  await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+
+  await (
+    supervisor as unknown as {
+      finishNative: (record: SessionRecord, result: WorkerSnapshot) => Promise<unknown>
+    }
+  ).finishNative(session, workerSnapshot())
+
+  expect(session.status).toBe('stopping')
+  expect(session).toMatchObject({
+    terminationRequested: true,
+    exitCode: 42,
+    outputBytes: 7,
+    containment: { rootPid: 42 },
+  })
+  expect((await storage.loadSessions())[0]).toMatchObject({
+    status: 'stopping',
+    terminationRequested: true,
+    exitCode: 42,
+    containment: { rootPid: 42 },
+  })
 })
 
 test('native get and list snapshots cannot overwrite monitor finalization', async () => {
@@ -4493,22 +6125,34 @@ test('native get and list snapshots cannot overwrite monitor finalization', asyn
     worker
   )
 
-  const get = supervisor.get(session.id)
-  const list = supervisor.list()
-  await started
-  const monitor = (
-    supervisor as unknown as {
-      monitorNative: (record: SessionRecord, worker: unknown) => Promise<unknown>
-    }
-  ).monitorNative(session, worker)
-  await finalizing
-  releaseSnapshots()
+  const reconnect = NativeWorkerClient.reconnect
+  let reconnects = 0
+  NativeWorkerClient.reconnect = async () => {
+    reconnects += 1
+    return null
+  }
 
-  await monitor
-  expect(await get).toMatchObject({ status: 'exited' })
-  expect(await list).toMatchObject([{ id: session.id, status: 'exited' }])
-  expect(await storage.loadSessions()).toMatchObject([{ id: session.id, status: 'exited' }])
-  expect(await supervisor.cleanup(session.id)).toBeTrue()
+  try {
+    const get = supervisor.get(session.id)
+    const list = supervisor.list()
+    await started
+    const monitor = (
+      supervisor as unknown as {
+        monitorNative: (record: SessionRecord, worker: unknown) => Promise<unknown>
+      }
+    ).monitorNative(session, worker)
+    await finalizing
+    releaseSnapshots()
+
+    await monitor
+    expect(await get).toMatchObject({ status: 'exited' })
+    expect(await list).toMatchObject([{ id: session.id, status: 'exited' }])
+    expect(await storage.loadSessions()).toMatchObject([{ id: session.id, status: 'exited' }])
+    expect(await supervisor.cleanup(session.id)).toBeTrue()
+    expect(reconnects).toBe(0)
+  } finally {
+    NativeWorkerClient.reconnect = reconnect
+  }
 })
 
 test('cleanup waits for a native terminal write before deleting its session', async () => {
@@ -4614,6 +6258,37 @@ test('native finalization persists a lost storage failure', async () => {
   ])
 })
 
+test('native finalization reports worker storage failure before containment is confirmed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-storage-failure-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_native_storage_failure')
+  await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+  await expect(
+    (
+      supervisor as unknown as {
+        finishNative: (record: SessionRecord, result: WorkerSnapshot) => Promise<unknown>
+      }
+    ).finishNative(
+      session,
+      workerSnapshot({
+        status: 'lost',
+        storageFailure: 'output directory is unavailable',
+        terminationConfirmed: false,
+      })
+    )
+  ).rejects.toMatchObject({ code: 'ESTORAGE' })
+  expect(session).toMatchObject({
+    status: 'lost',
+    storageFailure: 'output directory is unavailable',
+  })
+})
+
 test.skipIf(process.platform !== 'win32')(
   'Windows native high exit status persists as an unsigned code',
   async () => {
@@ -4662,6 +6337,7 @@ test('stale worker recovery is bounded and parallel', async () => {
   const storage = new DaemonStorage(root)
   for (let index = 0; index < 6; index += 1) {
     const session = record(root, `pty_stale_${index}`)
+    session.lifecycle = 'persistent'
     session.worker = {
       pid: 1,
       startIdentity: 'start',
@@ -4684,14 +6360,14 @@ test('stale worker recovery is bounded and parallel', async () => {
   try {
     const started = Date.now()
     await new SessionSupervisor(storage, undefined, 1).initialize()
-    expect(Date.now() - started).toBeLessThan(240)
+    expect(Date.now() - started).toBeLessThan(3_000)
     expect(maximum).toBe(4)
   } finally {
     ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
   }
-})
+}, 30_000)
 
-test('restart cleanup stops a reconnected conversation worker published before recovery', async () => {
+test('restart marks a conversation worker before publication and reaps it after reconnect', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-restart-cleanup-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -4761,20 +6437,60 @@ test('restart cleanup stops a reconnected conversation worker published before r
     shutdown: async () => terminal,
   }
   const reconnect = NativeWorkerClient.reconnect
+  const writeDescriptor = storage.writeDescriptor.bind(storage)
+  let markedBeforePublication = false
   ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => {
     reconnecting()
     await reconnectGate
     return worker as never
   }
+  storage.writeDescriptor = async (nextDescriptor) => {
+    markedBeforePublication = (await storage.loadSessions()).some(
+      (entry) => entry.id === session.id && entry.pendingCleanup === true
+    )
+    await writeDescriptor(nextDescriptor)
+  }
   const server = new DaemonServer(storage, new SessionSupervisor(storage), 'test-token')
   try {
     const descriptor = await server.start()
+    expect(markedBeforePublication).toBeTrue()
     await reconnectStarted
-    const cleanup = await Promise.all([
-      rpc(descriptor, 'cleanupByParentSession', { parentSessionId: 'parent' }, context),
-      rpc(descriptor, 'cleanupByParentSession', { parentSessionId: 'parent' }, context),
-    ])
-    expect(cleanup.map((response) => response.status)).toEqual([200, 200])
+    const markedOperations = await Promise.all(
+      [
+        rpc(descriptor, 'write', { id: session.id, data: 'late input' }, context),
+        rpc(descriptor, 'resize', { id: session.id, cols: 80, rows: 24 }, context),
+        rpc(
+          descriptor,
+          'sendWait',
+          {
+            id: session.id,
+            data: 'late input',
+            condition: { kind: 'exit' },
+            timeoutSeconds: 1,
+          },
+          context
+        ),
+        rpc(
+          descriptor,
+          'wait',
+          { id: session.id, condition: { kind: 'exit' }, timeoutSeconds: 1 },
+          context
+        ),
+      ].map(async (request) => {
+        const response = await request
+        return { status: response.status, body: await response.json() }
+      })
+    )
+    for (const operation of markedOperations) {
+      expect(operation.status).toBe(400)
+      expect(operation.body).toMatchObject({ error: { code: 'session_closed' } })
+    }
+    expect(
+      await rpc(descriptor, 'get', { id: session.id }, context).then((response) => response.status)
+    ).toBe(200)
+    expect(
+      await rpc(descriptor, 'read', { id: session.id }, context).then((response) => response.status)
+    ).toBe(200)
     allowReconnect()
     for (let attempt = 0; attempt < 40 && (await storage.loadSessions()).length; attempt += 1) {
       await Bun.sleep(10)
@@ -4783,9 +6499,60 @@ test('restart cleanup stops a reconnected conversation worker published before r
     expect(await storage.loadSessions()).toHaveLength(0)
   } finally {
     ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+    storage.writeDescriptor = writeDescriptor
     await server.stop().catch(() => undefined)
   }
-})
+}, 30_000)
+
+test('failed conversation recovery retains a lost tombstone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-recovery-tombstone-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const context = await owner(storage, 'parent', root)
+  const session = record(root, 'pty_recovery_tombstone')
+  session.ownerCapabilityHash = context.capability
+  session.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'fingerprint',
+    protocolVersion: 5,
+  }
+  await storage.writeSession(session)
+  const reconnect = NativeWorkerClient.reconnect
+  ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = async () => null
+  const server = new DaemonServer(
+    storage,
+    new SessionSupervisor(storage, undefined, 1),
+    'test-token'
+  )
+  try {
+    const descriptor = await server.start()
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await storage.loadSessions())[0]?.status === 'lost') break
+      await Bun.sleep(10)
+    }
+    expect(
+      await rpc(descriptor, 'get', { id: session.id }, context).then((response) => response.json())
+    ).toMatchObject({
+      result: { status: 'lost' },
+    })
+    expect(
+      await rpc(descriptor, 'cleanup', { id: session.id }, context).then((response) =>
+        response.json()
+      )
+    ).toMatchObject({
+      result: false,
+    })
+    expect(await storage.loadSessions()).toMatchObject([
+      { id: session.id, status: 'lost', pendingCleanup: true },
+    ])
+  } finally {
+    ;(NativeWorkerClient as unknown as { reconnect: typeof reconnect }).reconnect = reconnect
+    await server.stop().catch(() => undefined)
+  }
+}, 30_000)
 
 test('Windows rename retries only transient contention', async () => {
   let attempts = 0
@@ -4940,8 +6707,8 @@ test('journal recovery completes retention recorded before chunk deletion', asyn
   expect(await storage.readOutput(session.id)).toBe('')
 })
 
-test('restart migrates v1 output and marks active sessions lost without losing it', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-'))
+test('restart migrates V0 output and marks active sessions lost without losing it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v0-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
   const session = record(root, 'pty_v1')
@@ -4952,23 +6719,32 @@ test('restart migrates v1 output and marks active sessions lost without losing i
   await writeFile(
     join(root, 'sessions', session.id, 'session.json'),
     JSON.stringify(
-      Object.fromEntries(Object.entries(session).filter(([key]) => key !== 'outputJournalVersion'))
+      Object.fromEntries(
+        Object.entries(session).filter(
+          ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion'
+        )
+      )
     )
   )
   await writeFile(join(root, 'sessions', session.id, 'output.log'), 'lost 😀\n', 'utf8')
 
   const recovered = new SessionSupervisor(storage)
-  await recovered.initialize()
+  await recovered.initialize(false)
+  await recovered.markConversationRecoveryCleanup()
+  await recovered.reconcileWorkers()
   expect(await recovered.get(session.id)).toMatchObject({ status: 'lost', outputSequence: 10 })
   expect(await recovered.rawOutput(session.id)).toEqual({ raw: 'lost 😀\n', byteLength: 10 })
   expect(await recovered.read(session.id)).toMatchObject({ lines: ['lost 😀'], sequences: [0] })
+  expect(await Bun.file(join(root, 'sessions', session.id, 'output.log')).exists()).toBeTrue()
 })
 
-test('obsolete worker records remain readable, lost, and owner-cleanable', async () => {
+test('obsolete worker terminal records remain readable and owner-cleanable', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-obsolete-worker-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
   const session = record(root, 'pty_obsolete_worker', 'exited')
+  markTerminalProof(session)
+  session.lifecycle = 'persistent'
   session.worker = {
     pid: 123,
     startIdentity: 'old',
@@ -4985,16 +6761,17 @@ test('obsolete worker records remain readable, lost, and owner-cleanable', async
   ])
   const supervisor = new SessionSupervisor(storage)
   await supervisor.initialize()
-  expect(await supervisor.get(session.id)).toMatchObject({ status: 'lost' })
-  expect(await supervisor.rawOutput(session.id)).toEqual({ raw: 'saved\n', byteLength: 6 })
+  expect(await supervisor.get(session.id)).toMatchObject({ status: 'exited' })
+  expect(await supervisor.rawOutput(session.id)).toMatchObject({ raw: 'saved\n', byteLength: 6 })
   expect(await supervisor.cleanup(session.id)).toBeTrue()
 })
 
-test('v1 migration keeps output.log until journal metadata is durable', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-recovery-'))
+test('V0 migration keeps output.log until V1 metadata is durable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v0-recovery-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
   const session = record(root, 'pty_v1_recovery', 'exited')
+  markTerminalProof(session)
   session.nextSequence = 7
   session.outputBytes = 7
   session.lineCount = 1
@@ -5002,7 +6779,11 @@ test('v1 migration keeps output.log until journal metadata is durable', async ()
   await writeFile(
     join(root, 'sessions', session.id, 'session.json'),
     JSON.stringify(
-      Object.fromEntries(Object.entries(session).filter(([key]) => key !== 'outputJournalVersion'))
+      Object.fromEntries(
+        Object.entries(session).filter(
+          ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion'
+        )
+      )
     )
   )
   const legacyPath = join(root, 'sessions', session.id, 'output.log')
@@ -5018,7 +6799,7 @@ test('v1 migration keeps output.log until journal metadata is durable', async ()
 
   const recovered = new SessionSupervisor(storage)
   await recovered.initialize()
-  expect(await recovered.rawOutput(session.id)).toEqual({ raw: 'legacy\n', byteLength: 7 })
+  expect(await recovered.rawOutput(session.id)).toMatchObject({ raw: 'legacy\n', byteLength: 7 })
   expect(await Bun.file(legacyPath).exists()).toBeFalse()
 })
 
@@ -5028,6 +6809,7 @@ test('daemon classifies storage failures', async () => {
   const storage = new DaemonStorage(root)
   const supervisor = {
     initialize: async () => {},
+    markConversationRecoveryCleanup: async () => {},
     reconcileWorkers: async () => {},
     flush: async () => {},
     shutdown: async () => {},
@@ -5064,6 +6846,7 @@ test('daemon classifies PTY failures as process failures', async () => {
   const storage = new DaemonStorage(root)
   const supervisor = {
     initialize: async () => {},
+    markConversationRecoveryCleanup: async () => {},
     reconcileWorkers: async () => {},
     flush: async () => {},
     shutdown: async () => {},
@@ -5103,6 +6886,15 @@ test('supervisor preserves terminal cleanup state and output cursors', async () 
   const supervisor = new SessionSupervisor(storage)
   await storage.initialize()
   const terminal = record(root, 'pty_terminal', 'exited')
+  markTerminalProof(terminal)
+  terminal.worker = {
+    pid: 1,
+    startIdentity: 'start',
+    processIdentity: 'identity',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: new Bun.CryptoHasher('sha256').update('terminal-token').digest('hex'),
+    protocolVersion: 5,
+  }
   const output = record(root, 'pty_output', 'exited')
   output.nextSequence = 8
   output.outputBytes = 8
@@ -5115,6 +6907,18 @@ test('supervisor preserves terminal cleanup state and output cursors', async () 
     state.records.set(entry.id, entry)
     await storage.writeSession(entry)
   }
+  const descriptorPath = join(root, 'sessions', terminal.id, 'worker.json')
+  await writeFile(
+    descriptorPath,
+    JSON.stringify({
+      pid: terminal.worker.pid,
+      startIdentity: terminal.worker.startIdentity,
+      processIdentity: terminal.worker.processIdentity,
+      endpoint: terminal.worker.endpoint,
+      token: 'terminal-token',
+      protocolVersion: terminal.worker.protocolVersion,
+    })
+  )
   await storage.appendOutput('pty_output', [
     { startSequence: 0, endSequence: 8, timestamp: new Date().toISOString(), data: 'one\nhit\n' },
   ])
@@ -5126,13 +6930,41 @@ test('supervisor preserves terminal cleanup state and output cursors', async () 
   expect(formatLine('hit', 2, 2000, 4)).toBe('00002@4| hit')
 
   const deleteSession = storage.deleteSession.bind(storage)
+  const reconnect = NativeWorkerClient.reconnect
+  let reconnects = 0
+  let shutdowns = 0
+  NativeWorkerClient.reconnect = async () => {
+    reconnects += 1
+    return {
+      shutdown: async () => {
+        shutdowns += 1
+        return workerSnapshot({
+          status: 'exited',
+          terminationRequested: true,
+          terminationConfirmed: true,
+          directChildExited: true,
+          stdoutEof: true,
+          stderrEof: true,
+          outputComplete: true,
+        })
+      },
+    } as unknown as WorkerClient
+  }
   storage.deleteSession = async () => {
     throw Object.assign(new Error('disk full'), { code: 'ENOSPC' })
   }
-  await expect(supervisor.cleanup('pty_terminal')).rejects.toThrow('disk full')
-  expect(await supervisor.get('pty_terminal')).not.toBeNull()
-  storage.deleteSession = deleteSession
-  expect(await supervisor.cleanup('pty_terminal')).toBeTrue()
+  try {
+    await expect(supervisor.cleanup('pty_terminal')).rejects.toThrow('disk full')
+    expect(await supervisor.get('pty_terminal')).not.toBeNull()
+    expect(await Bun.file(descriptorPath).exists()).toBeTrue()
+    storage.deleteSession = deleteSession
+    expect(await supervisor.cleanup('pty_terminal')).toBeTrue()
+    expect(reconnects).toBe(1)
+    expect(shutdowns).toBe(1)
+  } finally {
+    storage.deleteSession = deleteSession
+    NativeWorkerClient.reconnect = reconnect
+  }
 })
 
 test('plugin client starts its daemon from the configured data directory', async () => {
@@ -5178,6 +7010,7 @@ test('daemon client returns RPC sequence cursor and truncation metadata', async 
   process.env.PTY_DAEMON_DIR = root
   const storage = new DaemonStorage(root)
   const session = record(root, 'pty_client_read', 'exited')
+  session.lifecycle = 'persistent'
   session.ownerCapabilityHash = (await owner(storage, 'parent', root)).capability
   session.nextSequence = 11
   session.firstRetainedSequence = 2

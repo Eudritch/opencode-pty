@@ -19,7 +19,9 @@ export type SpawnAuthorizer = (
   args: string[],
   workdir?: string,
   agent?: string,
-  ask?: PermissionAsker
+  ask?: PermissionAsker,
+  env?: Record<string, string>,
+  inheritEnv?: boolean
 ) => Promise<string>
 
 export type PermissionAsker = (request: {
@@ -42,15 +44,21 @@ export type BashAuthorizer = (
 
 const execFileAsync = promisify(execFile)
 
-// ponytail: SDK 1.3.13 cannot evaluate permissions, so only explicit local denies bypass ctx.ask.
+// ponytail: SDK 1.3.13 cannot bind approval metadata to execution options, so dynamic environments require local allow.
 export function createSpawnAuthorizer(client: PluginClient, directory: string): SpawnAuthorizer {
-  return async (command, args, workdir, agent, ask) => {
+  return async (command, args, workdir, agent, ask, env, inheritEnv) => {
     const permissions = await permissionConfig(client)
     const pattern = [command, ...args].join(' ')
     const action = evaluate(permissions, agent, 'bash', pattern)
     const resolved = await workdirAuthorization(permissions, directory, workdir, agent)
     if (action === 'deny' || resolved.action === 'deny')
       return deny(client, 'PTY command denied by local permission policy.')
+    if (action !== 'allow' && (inheritEnv === true || Object.keys(env ?? {}).length > 0)) {
+      return deny(
+        client,
+        'PTY command denied: custom or inherited environment requires an explicit local bash allow rule.'
+      )
+    }
     if (action !== 'allow') await requestApproval(ask, 'bash', pattern)
     if (resolved.outside && resolved.action !== 'allow')
       await requestApproval(ask, 'external_directory', resolved.pattern)

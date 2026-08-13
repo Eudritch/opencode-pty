@@ -12,8 +12,14 @@ export function createShellExec(authorizeSpawn: SpawnAuthorizer) {
       command: tool.schema.string().describe('Executable only, not shell syntax'),
       args: tool.schema.array(tool.schema.string()).describe('Structured argv arguments'),
       workdir: tool.schema.string().optional().describe('Working directory'),
-      env: tool.schema.record(tool.schema.string(), tool.schema.string()).optional(),
-      inheritEnv: tool.schema.boolean().optional(),
+      env: tool.schema
+        .record(tool.schema.string(), tool.schema.string())
+        .optional()
+        .describe('Additional variables; require an explicit local bash allow rule'),
+      inheritEnv: tool.schema
+        .boolean()
+        .optional()
+        .describe('Inherit daemon environment; requires an explicit local bash allow rule'),
       timeoutSeconds: tool.schema
         .number()
         .min(1)
@@ -30,7 +36,9 @@ export function createShellExec(authorizeSpawn: SpawnAuthorizer) {
         args.args,
         args.workdir,
         ctx.agent,
-        ctx.ask
+        ctx.ask,
+        args.env,
+        args.inheritEnv
       )
       const result = await manager.exec(
         {

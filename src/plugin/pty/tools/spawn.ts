@@ -15,11 +15,11 @@ export function createPtySpawn(authorizeSpawn: SpawnAuthorizer) {
       env: tool.schema
         .record(tool.schema.string(), tool.schema.string())
         .optional()
-        .describe('Additional environment variables; values are never persisted'),
+        .describe('Additional variables; require an explicit local bash allow rule'),
       inheritEnv: tool.schema
         .boolean()
         .optional()
-        .describe('Explicitly inherit the daemon environment; default uses a safe allowlist'),
+        .describe('Inherit daemon environment; requires an explicit local bash allow rule'),
       lifecycle: tool.schema
         .enum(['conversation', 'persistent'])
         .optional()
@@ -61,7 +61,9 @@ export function createPtySpawn(authorizeSpawn: SpawnAuthorizer) {
         args.args,
         args.workdir,
         ctx.agent,
-        ctx.ask
+        ctx.ask,
+        args.env,
+        args.inheritEnv
       )
 
       const sessionId = ctx.sessionID

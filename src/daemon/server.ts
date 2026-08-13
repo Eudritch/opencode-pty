@@ -14,7 +14,7 @@ import {
 } from './types.ts'
 import { DaemonError } from './errors.ts'
 import type { DaemonStorage } from './storage.ts'
-import { ProcessError, type SessionSupervisor } from './supervisor.ts'
+import { ProcessError, type ExecOptions, type SessionSupervisor } from './supervisor.ts'
 import { effectiveMaxOutputBytes } from './supervisor.ts'
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -64,7 +64,6 @@ export function classifyRpcFailure(error: unknown): RpcFailure['error']['code'] 
 export class DaemonServer implements Disposable {
   private server: ReturnType<typeof Bun.serve> | null = null
   private readonly inputUsage = new Map<string, { startedAt: number; bytes: number }>()
-  private readonly pendingSessions = new Map<string, number>()
   private approvalWrites: Promise<void> = Promise.resolve()
   private readonly approvalClaimTokens = new Map<string, string>()
   private readonly approvalWaiters = new Set<() => void>()
@@ -88,13 +87,15 @@ export class DaemonServer implements Disposable {
       throw new Error('PTY daemon start lock was lost.')
     }
     try {
-      await this.supervisor.initialize(false)
-      this.ownershipSecret = await this.storage.ownershipSecret()
-      this.processIdentity = await this.storage.requiredCurrentProcessStartIdentity(deadline)
-      this.token ||= crypto.randomUUID().replaceAll('-', '')
+      await this.storage.initialize()
       if (await this.storage.descriptorOwnerAlive(deadline)) {
         throw new Error('PTY daemon is already running.')
       }
+      await this.supervisor.initialize(false)
+      await this.supervisor.markConversationRecoveryCleanup()
+      this.ownershipSecret = await this.storage.ownershipSecret()
+      this.processIdentity = await this.storage.requiredCurrentProcessStartIdentity(deadline)
+      this.token ||= crypto.randomUUID().replaceAll('-', '')
       this.server = Bun.serve({
         hostname: '127.0.0.1',
         port: 0,
@@ -905,30 +906,29 @@ export class DaemonServer implements Disposable {
     options: Parameters<SessionSupervisor['spawn']>[0],
     owner: OwnerContext
   ): Promise<unknown> {
-    return this.withSessionSlot(owner, () =>
-      this.supervisor.spawn({
+    return this.supervisor.spawn(
+      {
         ...options,
         parentSessionId: owner.parentSessionId,
         ownerProjectDirectory: owner.projectDirectory,
         ownerCapabilityHash: owner.capability,
-      })
+      },
+      this.maxSessionsPerOwner
     )
   }
 
-  private async exec(
-    options: Parameters<SessionSupervisor['exec']>[0],
-    owner: OwnerContext
-  ): Promise<unknown> {
+  private async exec(options: ExecOptions, owner: OwnerContext): Promise<unknown> {
     if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
       throw new DaemonError('Exec runtime limit exceeded.', 'limit')
     }
-    return this.withSessionSlot(owner, () =>
-      this.supervisor.nativeExec({
+    return this.supervisor.nativeExec(
+      {
         ...options,
         parentSessionId: owner.parentSessionId,
         ownerProjectDirectory: owner.projectDirectory,
         ownerCapabilityHash: owner.capability,
-      })
+      },
+      this.maxSessionsPerOwner
     )
   }
 
@@ -939,13 +939,14 @@ export class DaemonServer implements Disposable {
     if ((options.timeoutSeconds ?? 0) > MAX_EXEC_RUNTIME_SECONDS) {
       throw new DaemonError('Exec runtime limit exceeded.', 'limit')
     }
-    return this.withSessionSlot(owner, () =>
-      this.supervisor.nativeExecStart({
+    return this.supervisor.nativeExecStart(
+      {
         ...options,
         parentSessionId: owner.parentSessionId,
         ownerProjectDirectory: owner.projectDirectory,
         ownerCapabilityHash: owner.capability,
-      })
+      },
+      this.maxSessionsPerOwner
     )
   }
 
@@ -958,7 +959,7 @@ export class DaemonServer implements Disposable {
       typeof owner.projectDirectory !== 'string' ||
       !owner.projectDirectory ||
       typeof owner.capability !== 'string' ||
-      owner.capability.length !== 64
+      !/^[a-f0-9]{64}$/.test(owner.capability)
     ) {
       throw new ValidationError('A valid owner context is required.')
     }
@@ -992,30 +993,6 @@ export class DaemonServer implements Disposable {
     return new Bun.CryptoHasher('sha256')
       .update(`approval\0${this.ownershipSecret}\0${parentSessionId}\0${projectDirectory}`)
       .digest('hex')
-  }
-
-  private active(status: string): boolean {
-    return status === 'starting' || status === 'running' || status === 'stopping'
-  }
-
-  private async withSessionSlot<T>(owner: OwnerContext, task: () => Promise<T>): Promise<T> {
-    const key = `${owner.parentSessionId}\0${owner.projectDirectory}\0${owner.capability}`
-    const pending = (this.pendingSessions.get(key) ?? 0) + 1
-    if (pending > this.maxSessionsPerOwner)
-      throw new DaemonError('Session limit exceeded.', 'limit')
-    this.pendingSessions.set(key, pending)
-    try {
-      const owned = (await this.supervisor.list()).filter((session) => this.owns(session.id, owner))
-      if (
-        owned.filter((session) => this.active(session.status)).length + pending >
-        this.maxSessionsPerOwner
-      )
-        throw new DaemonError('Session limit exceeded.', 'limit')
-      return await task()
-    } finally {
-      if (pending === 1) this.pendingSessions.delete(key)
-      else this.pendingSessions.set(key, pending - 1)
-    }
   }
 
   private useInput(owner: OwnerContext, data: string): void {

@@ -184,6 +184,46 @@ test('spawn schema enforces a positive timeout without capping long sessions', (
   expect(spawn.args.timeoutSeconds.parse(86_400)).toBe(86_400)
 })
 
+test('spawn and exec pass environment options into authorization', async () => {
+  const root = await tempRoot('opencode-pty-plugin-authorization-environment-')
+  const calls: unknown[][] = []
+  const authorizer = async (...args: unknown[]) => {
+    calls.push(args)
+    throw new Error('stop after authorization')
+  }
+  const context = toolContext(root)
+
+  await expect(
+    createPtySpawn(authorizer as never).execute(
+      {
+        command: 'command',
+        args: [],
+        description: 'Exercise authorization options',
+        env: { TOKEN: 'secret' },
+        inheritEnv: true,
+      },
+      context
+    )
+  ).rejects.toThrow('stop after authorization')
+  await expect(
+    createShellExec(authorizer as never).execute(
+      {
+        command: 'command',
+        args: [],
+        timeoutSeconds: 1,
+        env: { TOKEN: 'secret' },
+        inheritEnv: true,
+      },
+      context
+    )
+  ).rejects.toThrow('stop after authorization')
+
+  expect(calls.map((args) => args.slice(-2))).toEqual([
+    [{ TOKEN: 'secret' }, true],
+    [{ TOKEN: 'secret' }, true],
+  ])
+})
+
 test('daemon client reads PTY_DAEMON_DIR at first use rather than at construction', async () => {
   const root = await tempRoot('opencode-pty-plugin-lazy-storage-')
   const client = new DaemonClient()

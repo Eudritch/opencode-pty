@@ -29,13 +29,21 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, DuplicateHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, DuplicateHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     Security::SECURITY_ATTRIBUTES,
-    Storage::FileSystem::{ReadFile, WriteFile},
+    Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        ReadFile, WriteFile,
+    },
     System::{
-        Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole, SetConsoleCtrlHandler},
+        Console::{
+            AllocConsole, COORD, ClosePseudoConsole, CreatePseudoConsole, FreeConsole,
+            GetConsoleWindow, GetStdHandle, HPCON, ResizePseudoConsole, STD_ERROR_HANDLE,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetStdHandle,
+        },
         IO::CancelSynchronousIo,
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -48,13 +56,13 @@ use windows_sys::Win32::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
             GetCurrentThread, GetExitCodeProcess, GetProcessTimes,
-            InitializeProcThreadAttributeList,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread,
-            STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-            WaitForSingleObject,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
+    UI::WindowsAndMessaging::{SW_HIDE, ShowWindow},
 };
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -855,6 +863,95 @@ fn pipe(inherit_read: bool) -> Result<(WinHandle, WinHandle), String> {
 }
 
 #[cfg(windows)]
+struct PseudoConsoleStdioGuard {
+    saved: [(u32, HANDLE); 3],
+    _output: WinHandle,
+    _input: WinHandle,
+    allocated_console: bool,
+}
+
+#[cfg(windows)]
+impl PseudoConsoleStdioGuard {
+    fn engage() -> Result<Self, String> {
+        fn open_console(name: &str, access: u32, share: u32) -> Result<WinHandle, String> {
+            let path = wide(name)?;
+            WinHandle::new(unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    access,
+                    share,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                )
+            })
+            .map_err(|error| error.to_string())
+        }
+        let mut allocated_console = false;
+        let output = open_console(
+            "CONOUT$",
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )
+        .or_else(|_| {
+            if unsafe { AllocConsole() } == 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            allocated_console = true;
+            let window = unsafe { GetConsoleWindow() };
+            if !window.is_null() {
+                unsafe { ShowWindow(window, SW_HIDE) };
+            }
+            open_console(
+                "CONOUT$",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )
+        })?;
+        let input = match open_console("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ) {
+            Ok(input) => input,
+            Err(error) => {
+                if allocated_console {
+                    unsafe { FreeConsole() };
+                }
+                return Err(error);
+            }
+        };
+        let saved = [
+            (STD_OUTPUT_HANDLE, unsafe {
+                GetStdHandle(STD_OUTPUT_HANDLE)
+            }),
+            (STD_ERROR_HANDLE, unsafe { GetStdHandle(STD_ERROR_HANDLE) }),
+            (STD_INPUT_HANDLE, unsafe { GetStdHandle(STD_INPUT_HANDLE) }),
+        ];
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, output.raw());
+            SetStdHandle(STD_ERROR_HANDLE, output.raw());
+            SetStdHandle(STD_INPUT_HANDLE, input.raw());
+        }
+        Ok(Self {
+            saved,
+            _output: output,
+            _input: input,
+            allocated_console,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PseudoConsoleStdioGuard {
+    fn drop(&mut self) {
+        for (slot, handle) in self.saved {
+            unsafe { SetStdHandle(slot, handle) };
+        }
+        if self.allocated_console {
+            unsafe { FreeConsole() };
+        }
+    }
+}
+
+#[cfg(windows)]
 fn windows_job_empty(job: HANDLE) -> Result<bool, String> {
     let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
     let mut returned = 0;
@@ -929,7 +1026,25 @@ fn windows_creation_flags(has_attributes: bool, pty: bool) -> u32 {
 }
 
 #[cfg(windows)]
-fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
+#[derive(Debug)]
+enum WindowsSpawnError {
+    NoChild(String),
+    ChildStarted {
+        pid: u32,
+        termination_confirmed: bool,
+        message: String,
+    },
+}
+
+#[cfg(windows)]
+impl From<String> for WindowsSpawnError {
+    fn from(message: String) -> Self {
+        Self::NoChild(message)
+    }
+}
+
+#[cfg(windows)]
+fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, WindowsSpawnError> {
     let job = windows_job()?;
     let plan = windows_spawn_plan(
         &bootstrap.command,
@@ -959,7 +1074,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
                 )
             };
             if result < 0 {
-                return Err(format!("CreatePseudoConsole failed: 0x{result:08x}"));
+                return Err(format!("CreatePseudoConsole failed: 0x{result:08x}").into());
             }
             // ConPTY owns these endpoints after creation; release our duplicates immediately.
             drop(console_input);
@@ -1024,7 +1139,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             )
         } == 0
     {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error().to_string().into());
     }
     if !inheritable_handles.is_empty()
         && unsafe {
@@ -1039,7 +1154,7 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             )
         } == 0
     {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error().to_string().into());
     }
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -1050,9 +1165,15 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
         startup.StartupInfo.hStdOutput = child_stdout.as_ref().expect("exec stdout").raw();
         startup.StartupInfo.hStdError = child_stderr.as_ref().expect("exec stderr").raw();
     }
-    // ConPTY supplies the child's terminal handles through the pseudoconsole attribute.
+    // ConPTY binds the child to the pseudoconsole when the parent's standard handles are console
+    // handles at CreateProcessW time. The guard is scoped to this dedicated one-session worker.
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = windows_creation_flags(attribute_list.is_some(), pty.is_some());
+    let stdio_guard = if pty.is_some() {
+        Some(PseudoConsoleStdioGuard::engage()?)
+    } else {
+        None
+    };
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -1067,21 +1188,28 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             &mut process,
         )
     };
+    drop(stdio_guard);
     drop(child_stdin);
     drop(child_stdout);
     drop(child_stderr);
     if created == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error().to_string().into());
     }
-    let process_handle = WinHandle::new(process.hProcess)?;
-    let thread = WinHandle::new(process.hThread)?;
+    // CreateProcessW returned success, so it transferred valid owned handles to us.
+    let process_handle = WinHandle(process.hProcess);
+    let thread = WinHandle(process.hThread);
     if bootstrap.fault.as_deref() == Some("job_assign")
         || unsafe { AssignProcessToJobObject(job.raw(), process_handle.raw()) } == 0
     {
         // The child is still suspended and not in the Job. Kill and reap this owned handle.
         let _ = unsafe { TerminateProcess(process_handle.raw(), 1) };
-        let _ = unsafe { WaitForSingleObject(process_handle.raw(), 1_000) };
-        return Err("failed to assign suspended child to Job Object".into());
+        let termination_confirmed =
+            unsafe { WaitForSingleObject(process_handle.raw(), 1_000) } == WAIT_OBJECT_0;
+        return Err(WindowsSpawnError::ChildStarted {
+            pid: process.dwProcessId,
+            termination_confirmed,
+            message: "failed to assign suspended child to Job Object".into(),
+        });
     }
     if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
         let resume_error = std::io::Error::last_os_error().to_string();
@@ -1096,7 +1224,11 @@ fn windows_spawn(bootstrap: &Bootstrap) -> Result<WindowsChild, String> {
             exit: None,
         };
         let cleanup = cleanup_unverified_windows_spawn(&mut child);
-        return Err(format!("{resume_error}; {}", cleanup.message));
+        return Err(WindowsSpawnError::ChildStarted {
+            pid: child.id(),
+            termination_confirmed: cleanup.confirmed,
+            message: format!("{resume_error}; {}", cleanup.message),
+        });
     }
     Ok(WindowsChild {
         process: process_handle,
@@ -1152,6 +1284,19 @@ struct SpawnFailureReceipt {
     direct_child_pid: Option<u32>,
     termination_confirmed: bool,
     message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrestartNoChildReceipt {
+    receipt_version: u32,
+    kind: &'static str,
+    worker_id: String,
+    worker_pid: u32,
+    worker_process_identity: String,
+    worker_endpoint: String,
+    worker_protocol_version: u32,
+    worker_control_token: String,
 }
 
 struct WorkerError {
@@ -1329,6 +1474,28 @@ fn write_spawn_failure(
         .map_err(|error| format!("could not serialize spawn failure receipt: {error}"))?,
     )
     .map_err(|error| format!("could not persist spawn failure receipt: {error}"))
+}
+
+fn write_prestart_no_child(
+    session_directory: &Path,
+    bootstrap: &Bootstrap,
+    descriptor: &Descriptor,
+) -> Result<(), String> {
+    write_atomic(
+        &session_directory.join("prestart-no-child.json"),
+        &serde_json::to_string(&PrestartNoChildReceipt {
+            receipt_version: 1,
+            kind: "prestart_no_child",
+            worker_id: bootstrap.worker_id.clone(),
+            worker_pid: std::process::id(),
+            worker_process_identity: descriptor.process_identity.clone(),
+            worker_endpoint: descriptor.endpoint.clone(),
+            worker_protocol_version: descriptor.protocol_version,
+            worker_control_token: bootstrap.worker_control_token.clone(),
+        })
+        .map_err(|error| format!("could not serialize pre-start receipt: {error}"))?,
+    )
+    .map_err(|error| format!("could not persist pre-start receipt: {error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -2874,6 +3041,103 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_rename_replaces_an_existing_journal_chunk() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-pty-worker-atomic-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("00000000000000000000.json");
+        write_atomic(&path, "first").expect("write first chunk");
+        write_atomic(&path, "second").expect("replace first chunk");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read replacement"),
+            "second"
+        );
+        remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_echo_resize_and_job_drain() {
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+        let command = format!("{system_root}\\System32\\cmd.exe");
+        let bootstrap = Bootstrap {
+            command,
+            args: vec!["/d".into(), "/c".into(), "more".into()],
+            workdir: std::env::current_dir()
+                .expect("current directory")
+                .to_string_lossy()
+                .into_owned(),
+            env: BTreeMap::from([
+                ("SystemRoot".into(), system_root.clone()),
+                (
+                    "ComSpec".into(),
+                    format!("{system_root}\\System32\\cmd.exe"),
+                ),
+                ("Path".into(), format!("{system_root}\\System32")),
+            ]),
+            redaction_secrets: Vec::new(),
+            session_directory: String::new(),
+            worker_control_token: String::new(),
+            worker_id: String::new(),
+            timeout_seconds: None,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            mode: "pty".into(),
+            cols: Some(80),
+            rows: Some(24),
+            fault: None,
+        };
+        let mut child = windows_spawn(&bootstrap).expect("spawn ConPTY child");
+        let pty = child.pty.as_mut().expect("ConPTY state");
+        let console = pty.console.expect("ConPTY handle");
+        assert!(unsafe { ResizePseudoConsole(console, COORD { X: 100, Y: 30 }) } >= 0);
+        let marker = format!("conpty-fixture-{}", std::process::id());
+        pty.input
+            .as_mut()
+            .expect("ConPTY input")
+            .write_all(format!("{marker}\r\n").as_bytes())
+            .expect("write ConPTY input");
+        let mut output = pty.output.take().expect("ConPTY output");
+        let marker_for_reader = marker.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let mut captured = String::new();
+            let mut buffer = [0_u8; 4096];
+            let result = loop {
+                match output.read(&mut buffer) {
+                    Ok(0) => break Err("ConPTY output closed before marker".into()),
+                    Ok(size) => {
+                        captured.push_str(&String::from_utf8_lossy(&buffer[..size]));
+                        if captured.contains(&marker_for_reader) {
+                            break Ok(captured);
+                        }
+                    }
+                    Err(error) => break Err(format!("read ConPTY output: {error}")),
+                }
+            };
+            let _ = sender.send(result);
+        });
+        let echoed = receiver.recv_timeout(Duration::from_secs(5));
+        child.terminate_job().expect("terminate ConPTY Job");
+        assert_eq!(
+            wait_for_windows_job_drain(&mut child, SystemTime::now() + Duration::from_secs(5)),
+            Ok(true)
+        );
+        reader.join().expect("ConPTY reader thread");
+        assert!(
+            echoed
+                .expect("ConPTY marker deadline")
+                .expect("ConPTY marker output")
+                .contains(&marker)
+        );
+    }
+
     #[cfg(unix)]
     struct FailingReader;
 
@@ -3115,7 +3379,10 @@ mod tests {
             env: BTreeMap::from([
                 ("Path".into(), bin.to_string_lossy().into_owned()),
                 ("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()),
-                ("ComSpec".into(), format!("{system_root}\\System32\\cmd.exe")),
+                (
+                    "ComSpec".into(),
+                    format!("{system_root}\\System32\\cmd.exe"),
+                ),
                 ("SystemRoot".into(), system_root),
             ]),
             redaction_secrets: Vec::new(),
@@ -3817,11 +4084,17 @@ fn main() -> Result<(), String> {
         return Err("injected worker ready stdout failure".into());
     }
     if bootstrap.fault.as_deref() == Some("missing_ready") {
-        thread::sleep(Duration::from_millis(100));
+        let delay = bootstrap
+            .env
+            .get("OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(100);
+        thread::sleep(Duration::from_millis(delay));
     } else {
-        if let Ok(delay) = std::env::var("OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS")
-            .unwrap_or_default()
-            .parse::<u64>()
+        if let Some(delay) = bootstrap
+            .env
+            .get("OPENCODE_PTY_NATIVE_WORKER_READY_DELAY_MS")
+            .and_then(|value| value.parse::<u64>().ok())
         {
             thread::sleep(Duration::from_millis(delay));
         }
@@ -3840,12 +4113,12 @@ fn main() -> Result<(), String> {
             return Err(error.to_string());
         }
     }
-    // The daemon controls command eligibility through this inherited pipe. Closing it before
-    // `start` means no direct child can be created after a failed worker identity probe.
+    // No spawn primitive has been called yet. A receipt from this branch therefore proves that no
+    // start frame made a child eligible, even if the daemon dies after persisting the reference.
     match control(&mut stdin, &bootstrap.worker_control_token) {
         Ok(control) if control.operation == "start" => {}
         Ok(_) | Err(_) => {
-            let _ = remove_file(&descriptor_path);
+            write_prestart_no_child(&session_directory, &bootstrap, &descriptor)?;
             return Ok(());
         }
     }
@@ -3893,7 +4166,7 @@ fn main() -> Result<(), String> {
                 true,
                 &error,
             )?;
-            let _ = remove_file(&descriptor_path);
+            // Cleanup needs worker.json to bind this no-child receipt to persisted metadata.
             return Err(error);
         }
     };
@@ -3901,17 +4174,26 @@ fn main() -> Result<(), String> {
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
+            let (direct_child_started, direct_child_pid, termination_confirmed, message) =
+                match error {
+                    WindowsSpawnError::NoChild(message) => (false, None, true, message),
+                    WindowsSpawnError::ChildStarted {
+                        pid,
+                        termination_confirmed,
+                        message,
+                    } => (true, Some(pid), termination_confirmed, message),
+                };
             write_spawn_failure(
                 &session_directory,
                 &bootstrap,
                 &descriptor,
-                false,
-                None,
-                true,
-                &error,
+                direct_child_started,
+                direct_child_pid,
+                termination_confirmed,
+                &message,
             )?;
-            let _ = remove_file(&descriptor_path);
-            return Err(error);
+            // Cleanup needs worker.json to bind this receipt to persisted metadata.
+            return Err(message);
         }
     };
     #[cfg(all(not(unix), not(windows)))]
@@ -4164,7 +4446,9 @@ fn main() -> Result<(), String> {
     if bootstrap.fault.as_deref() == Some("rpc_loss_after_start") {
         let shutdown = shutdown.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(200));
+            // Give the daemon time to complete the authenticated start checkpoint so this fault
+            // exercises post-start RPC loss rather than activation failure.
+            thread::sleep(Duration::from_secs(1));
             shutdown.store(true, Ordering::Release);
         });
     }

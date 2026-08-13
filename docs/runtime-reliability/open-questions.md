@@ -1,0 +1,17 @@
+# Open Questions
+
+**Status:** Open
+
+Only questions that can change a product contract, architecture decision, or release claim belong here. Resolved questions move to the canonical subject document with their evidence.
+
+| ID | Question | Why it matters | Current status | Resolution path |
+| --- | --- | --- | --- | --- |
+| OQ-01 | What ConPTY child-launch and close sequence works on all supported Windows versions without opening a visible console? | Blocks interactive Windows PTY release. | Local scoped-guard sequence passes; supported-build and close-order validation is unproven. | EXP-01 across the published Windows matrix. |
+| OQ-02 | Can the published Windows 10 version 1809+ contract use one ConPTY lifecycle sequence? | `ClosePseudoConsole` behavior and visible-console options differ. | Published contract exists in `README.md`; validation is unproven. | Test Windows 10 1809, Windows 11 before 24H2, and Windows 11 24H2. Narrow the public floor only by updating the README first. |
+| OQ-03 | Is OpenCode parent session ID globally unique across directories/routes? | Current idempotency identity is narrower than authorization identity. | Accepted risk: the target never relies on it. | Test full-owner idempotency isolation in Phase 1; host documentation can later improve diagnostics only. |
+| OQ-04 | Must a live PTY survive host/plugin restart, or only daemon restart? | Determines whether per-session durable worker/recovery is a hard requirement. | Resolved target contract: only explicitly persistent sessions recover. | Phase 1 state/retention tests and Phase 4 crash matrix. |
+| OQ-05 | Is same-user local adversarial process control in scope? | Determines runtime worker provenance verification and command-line token redesign priority. | Resolved target threat model: same OS user is trusted. | Document boundary; keep overrides development-only to prevent accidental production misuse. |
+| OQ-06 | Are interactive shells a supported PTY use case, or are PTYs limited to known CLIs? | An approved shell grants arbitrary later commands via terminal input. | Resolved target contract: interactive shells are supported. | Permission/UI text and shell-kind audit data must state the capability grant. |
+| OQ-07 | Can current storage format be migrated in place, and are persisted sessions from released versions supported? | State redesign needs a deletion/migration boundary. | Partially resolved: strict V1 writes, a V0 compatibility decoder, pre-activation worker-reference persistence, fresh terminal-shutdown proof reuse, and strict pre-start/post-start no-child receipts are implemented. V0 terminal migration and terminal cleanup still require explicit evidence; live/unproven records are owner-cleanable tombstones retaining legacy output; unknown, incomplete, and null-owner records remain unchanged. | Complete V2 discriminated-state cutover and the crash matrix around preparation, reference persistence, start-frame delivery, child creation, and terminal persistence. |
+| OQ-08 | What exact Bun minimum is supported? | CI and declared engine range currently disagree. | Unverified. | Green matrix on candidate minimum or pin/raise it. |
+| OQ-09 | Are all six optional worker packages expected to be smoke-tested before every release? | Without it, platform support is a packaging assertion, not evidence. | Resolved target release policy: yes. | Implement and retain the release matrix in Phase 4. |
