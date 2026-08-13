@@ -23,6 +23,7 @@
 | A no-child receipt is bound to the persisted worker identity and token hash before it permits pre-start deletion | `worker/src/main.rs`, `WorkerClient.hasVerifiedPrestartNoChildReceipt()`, and recovery test |
 | A post-start no-child receipt needs both the retained descriptor and a full compatible worker reference | `WorkerClient.hasVerifiedNoChildSpawnFailureReceipt()`, `spawn_failed` recovery tests, and invalid-command cleanup |
 | Normal terminal cleanup reuses fresh shutdown proof only within the running daemon; restart still requires a fresh authenticated shutdown for conversation workers | `SessionSupervisor.finalizeNativeVersion()`, `cleanup()`, and terminal cleanup tests |
+| Per-owner session admission reserves before the first record write and remains conservative after uncertainty | `SessionSupervisor.reserveSlot()`, `rebuildOwnerSlots()`, `releaseSlotIfSettled()`, and reservation tests |
 
 ## Findings and Required Target Rules
 
@@ -60,7 +61,7 @@
 
 | Resource | Enforcement point | Proposed behavior |
 | --- | --- | --- |
-| Active sessions | Daemon registry | Per-owner and global quota; atomically reserve before spawn and release only on terminal/deleted transition. |
+| Active sessions | Daemon registry | Per-owner quota atomically reserves before spawn. Unproven/lost records retain occupancy; strict terminal/no-child proof or successful deletion releases it. A global cap is intentionally not introduced in Phase 2. |
 | Pending waits | Daemon session controller | Fixed per-session/per-owner quota; reject excess with `resource_limit`, never silently drop. |
 | Input queue | Native worker | Bounded bytes and write count; preserve write order; return `not_running` or `input_backpressure` rather than allocate indefinitely. |
 | Output journal | Native worker writer | Bounded per session; evict whole oldest chunks with durable sequence cursor; report truncation. |

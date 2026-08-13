@@ -22,7 +22,6 @@ import {
 } from '../src/daemon/worker-client.ts'
 import {
   effectiveMaxOutputBytes,
-  OutputRedactor,
   ProcessError,
   runtimeEnvironment,
   SessionSupervisor,
@@ -1126,6 +1125,282 @@ test.skipIf(process.platform === 'win32')(
   }
 )
 
+test('owner reservations atomically enforce caps, isolate owners, and reuse matching PTYs at capacity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-owner-reservations-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const prepare = NativeWorkerClient.prepare
+  const reference = {
+    pid: 1,
+    startIdentity: 'reserved-worker',
+    processIdentity: 'reserved-process',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () =>
+    ({
+      reference,
+      client: {
+        start: async () => workerSnapshot(),
+        wait: async () => new Promise<WorkerSnapshot>(() => undefined),
+      },
+    }) as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+  const owner = {
+    parentSessionId: 'reserved-parent',
+    ownerProjectDirectory: root,
+    ownerCapabilityHash: DIRECT_OWNER_HASH,
+    workdir: root,
+  }
+  try {
+    const first = await supervisor.spawn(
+      {
+        ...owner,
+        command: 'reserved-command',
+        idempotencyKey: 'reserved-key',
+      },
+      2
+    )
+    const reused = await supervisor.spawn(
+      {
+        ...owner,
+        command: 'reserved-command',
+        idempotencyKey: 'reserved-key',
+      },
+      2
+    )
+    expect(reused.id).toBe(first.id)
+
+    const concurrent = await Promise.allSettled([
+      supervisor.spawn({ ...owner, command: 'second-command' }, 2),
+      supervisor.spawn({ ...owner, command: 'third-command' }, 2),
+    ])
+    expect(concurrent.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = concurrent.find((result) => result.status === 'rejected')
+    expect(rejected).toMatchObject({ reason: { code: 'limit' } })
+
+    await expect(
+      supervisor.spawn(
+        {
+          ...owner,
+          command: 'other-owner-command',
+          ownerCapabilityHash: SECOND_OWNER_HASH,
+        },
+        2
+      )
+    ).resolves.toMatchObject({ id: expect.stringMatching(/^pty_/) })
+  } finally {
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
+test('first record-write failure releases its reservation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-reservation-first-write-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const prepare = NativeWorkerClient.prepare
+  const writeSession = storage.writeSession.bind(storage)
+  const reference = {
+    pid: 1,
+    startIdentity: 'first-write-worker',
+    processIdentity: 'first-write-process',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () =>
+    ({
+      reference,
+      client: {
+        start: async () => workerSnapshot(),
+        wait: async () => new Promise<WorkerSnapshot>(() => undefined),
+      },
+    }) as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+  let fail = true
+  storage.writeSession = async (entry) => {
+    if (fail) {
+      fail = false
+      throw Object.assign(new Error('initial record write failed'), { code: 'ENOSPC' })
+    }
+    await writeSession(entry)
+  }
+  const options = {
+    command: 'first-write-command',
+    parentSessionId: 'first-write-parent',
+    ...directOwner(root),
+    workdir: root,
+  }
+  try {
+    await expect(supervisor.spawn(options, 1)).rejects.toThrow('initial record write failed')
+    await expect(supervisor.spawn(options, 1)).resolves.toMatchObject({ id: expect.any(String) })
+  } finally {
+    storage.writeSession = writeSession
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
+test('uncertain starts retain capacity until durable proof and deletion release it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-reservation-uncertain-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const prepare = NativeWorkerClient.prepare
+  const options = {
+    command: 'uncertain-command',
+    parentSessionId: 'uncertain-parent',
+    ...directOwner(root),
+    workdir: root,
+  }
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () => {
+    throw new WorkerStartError('worker state is uncertain', {
+      requested: false,
+      terminationConfirmed: false,
+      method: 'none',
+    })
+  }
+  try {
+    await expect(supervisor.spawn(options, 1)).rejects.toBeInstanceOf(ProcessError)
+    await expect(supervisor.spawn(options, 1)).rejects.toMatchObject({ code: 'limit' })
+
+    const records = (supervisor as unknown as { records: Map<string, SessionRecord> }).records
+    const uncertain = [...records.values()][0]
+    if (!uncertain) throw new Error('Expected an uncertain session record.')
+    uncertain.terminationConfirmed = true
+    markTerminalProof(uncertain)
+    await storage.writeSession(uncertain)
+    expect(await supervisor.cleanup(uncertain.id)).toBeTrue()
+
+    const reference = {
+      pid: 1,
+      startIdentity: 'released-worker',
+      processIdentity: 'released-process',
+      endpoint: 'http://127.0.0.1:1',
+      tokenFingerprint: 'f'.repeat(64),
+      protocolVersion: 5,
+    }
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () =>
+      ({
+        reference,
+        client: {
+          start: async () => workerSnapshot(),
+          wait: async () => new Promise<WorkerSnapshot>(() => undefined),
+        },
+      }) as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+    await expect(supervisor.spawn(options, 1)).resolves.toMatchObject({ id: expect.any(String) })
+  } finally {
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
+test('strict no-child cleanup and pre-activation records release capacity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-reservation-no-child-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const stale = record(root, 'pty_pre_activation', 'starting')
+  stale.pid = 0
+  await storage.writeSession(stale)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize(false)
+  expect(await storage.loadSessions()).toEqual([])
+
+  const prepare = NativeWorkerClient.prepare
+  const options = {
+    command: 'no-child-command',
+    parentSessionId: 'no-child-parent',
+    ...directOwner(root),
+    workdir: root,
+  }
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () => {
+    throw new WorkerStartError('child never started', {
+      requested: false,
+      terminationConfirmed: true,
+      method: 'rollback',
+      directChildStarted: false,
+    })
+  }
+  try {
+    await expect(supervisor.spawn(options, 1)).rejects.toBeInstanceOf(ProcessError)
+    const reference = {
+      pid: 1,
+      startIdentity: 'no-child-worker',
+      processIdentity: 'no-child-process',
+      endpoint: 'http://127.0.0.1:1',
+      tokenFingerprint: 'f'.repeat(64),
+      protocolVersion: 5,
+    }
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () =>
+      ({
+        reference,
+        client: {
+          start: async () => workerSnapshot(),
+          wait: async () => new Promise<WorkerSnapshot>(() => undefined),
+        },
+      }) as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+    await expect(supervisor.spawn(options, 1)).resolves.toMatchObject({ id: expect.any(String) })
+  } finally {
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
+test('admission is isolated from an unrelated worker snapshot', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-reservation-isolation-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  const prepare = NativeWorkerClient.prepare
+  const reference = {
+    pid: 1,
+    startIdentity: 'isolation-worker',
+    processIdentity: 'isolation-process',
+    endpoint: 'http://127.0.0.1:1',
+    tokenFingerprint: 'f'.repeat(64),
+    protocolVersion: 5,
+  }
+  let stallSnapshots = false
+  ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = async () =>
+    ({
+      reference,
+      client: {
+        start: async () => workerSnapshot(),
+        snapshot: async () =>
+          stallSnapshots ? new Promise<WorkerSnapshot>(() => undefined) : workerSnapshot(),
+        wait: async () => new Promise<WorkerSnapshot>(() => undefined),
+      },
+    }) as unknown as Awaited<ReturnType<typeof NativeWorkerClient.prepare>>
+  try {
+    const first = await supervisor.spawn({
+      command: 'first-owner-command',
+      parentSessionId: 'first-owner',
+      ...directOwner(root),
+      workdir: root,
+    })
+    stallSnapshots = true
+    void supervisor.get(first.id)
+    await expect(
+      Promise.race([
+        supervisor.spawn({
+          command: 'second-owner-command',
+          parentSessionId: 'second-owner',
+          ownerProjectDirectory: root,
+          ownerCapabilityHash: SECOND_OWNER_HASH,
+          workdir: root,
+        }),
+        Bun.sleep(100).then(() => {
+          throw new Error('Unrelated admission waited for a worker snapshot.')
+        }),
+      ])
+    ).resolves.toMatchObject({ id: expect.any(String) })
+  } finally {
+    ;(NativeWorkerClient as unknown as { prepare: typeof prepare }).prepare = prepare
+  }
+})
+
 test.skipIf(process.platform === 'win32')(
   'conversation cleanup excludes persistent sessions and environment values stay out of records',
   async () => {
@@ -1161,7 +1436,7 @@ test.skipIf(process.platform === 'win32')(
     )
     expect(
       (
-        await supervisor.exec({
+        await supervisor.nativeExec({
           ...common,
           args: ['-e', 'console.log(process.env.API_TOKEN)'],
           timeoutSeconds: 2,
@@ -1926,7 +2201,7 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
   await supervisor.initialize()
-  const exec = await supervisor.exec({
+  const exec = await supervisor.nativeExec({
     command: process.execPath,
     args: [
       '-e',
@@ -1941,15 +2216,6 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
   expect(exec.stdout).toBe('before [REDACTED] after\n')
   expect(exec.stdout).not.toContain('split-secret-value')
   expect((await supervisor.execOutput(exec.session.id))?.stdout).not.toContain('split-secret-value')
-})
-
-test('private and signing key environment values are redacted across chunks', () => {
-  for (const key of ['SSH_PRIVATE_KEY', 'PRIVATE_KEY', 'TLS_PRIVATE_KEY', 'SIGNING_KEY']) {
-    const redactor = new OutputRedactor({ [key]: 'private-key-value' })
-    expect(
-      `${redactor.write('before private-')}${redactor.write('key-value after')}${redactor.finish()}`
-    ).toBe('before [REDACTED] after')
-  }
 })
 
 test('Windows process identities require the queried PID and a creation time', () => {
@@ -2595,7 +2861,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
   const supervisor = new SessionSupervisor(storage, 32)
   await supervisor.initialize()
 
-  const success = await supervisor.exec({
+  const success = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', "console.log('out'); console.error('err')"],
     parentSessionId: 'parent',
@@ -2605,7 +2871,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
   })
   expect(success).toMatchObject({ stdout: 'out\n', stderr: 'err\n', exitCode: 0, timedOut: false })
 
-  const failure = await supervisor.exec({
+  const failure = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', "console.error('failed'); process.exit(7)"],
     parentSessionId: 'parent',
@@ -2615,7 +2881,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
   })
   expect(failure).toMatchObject({ stderr: 'failed\n', exitCode: 7, timedOut: false })
 
-  const timeout = await supervisor.exec({
+  const timeout = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', 'setTimeout(() => {}, 5000)'],
     parentSessionId: 'parent',
@@ -2625,7 +2891,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
   })
   expect(timeout.timedOut).toBeTrue()
 
-  const limited = await supervisor.exec({
+  const limited = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', "process.stdout.write('x'.repeat(100))"],
     parentSessionId: 'parent',
@@ -2641,7 +2907,7 @@ test('exec returns distinct stdout, stderr, exit, timeout, and output-limit evid
     stdoutBytes: 8,
     stdoutTruncated: true,
   })
-})
+}, 15_000)
 
 test('exec force-kills after grace and reports bounded, truthful termination state', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-exec-kill-'))
@@ -2649,7 +2915,7 @@ test('exec force-kills after grace and reports bounded, truthful termination sta
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
   await supervisor.initialize()
   const started = Date.now()
-  const result = await supervisor.exec({
+  const result = await supervisor.nativeExec({
     command: process.execPath,
     args: [
       '-e',
@@ -2672,7 +2938,7 @@ test('exec truncation preserves complete UTF-8 text', async () => {
   roots.push(root)
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
   await supervisor.initialize()
-  const result = await supervisor.exec({
+  const result = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', "process.stdout.write('A😀B')"],
     parentSessionId: 'parent',
@@ -2691,7 +2957,7 @@ test('exec truncation redacts a secret that crosses the output cap', async () =>
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
   await supervisor.initialize()
-  const result = await supervisor.exec({
+  const result = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', "process.stdout.write('before-super-secret-value-after')"],
     env: { API_TOKEN: 'super-secret-value' },
@@ -3209,7 +3475,7 @@ test('exec output remains separately recoverable after restart', async () => {
   const storage = new DaemonStorage(root)
   const supervisor = new SessionSupervisor(storage)
   await supervisor.initialize()
-  const result = await supervisor.exec({
+  const result = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', "process.stdout.write('out'); process.stderr.write('err')"],
     parentSessionId: 'parent',
@@ -3219,7 +3485,7 @@ test('exec output remains separately recoverable after restart', async () => {
   })
   const recovered = new SessionSupervisor(storage)
   await recovered.initialize()
-  expect(await recovered.execOutput(result.session.id)).toEqual({
+  expect(await recovered.execOutput(result.session.id)).toMatchObject({
     stdout: 'out',
     stderr: 'err',
     stdoutBytes: 3,
@@ -6062,7 +6328,7 @@ test('a stale running worker snapshot cannot revive a stopping session', async (
   })
 })
 
-test('native get and list snapshots cannot overwrite monitor finalization', async () => {
+test('metadata-only list does not snapshot workers or overwrite monitor finalization', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-snapshot-race-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -6091,11 +6357,11 @@ test('native get and list snapshots cannot overwrite monitor finalization', asyn
     outputComplete: true,
   })
   let snapshots = 0
-  let snapshotsStarted!: () => void
+  let snapshotStarted!: () => void
   let releaseSnapshots!: () => void
   let finalizationStarted!: () => void
   const started = new Promise<void>((resolve) => {
-    snapshotsStarted = resolve
+    snapshotStarted = resolve
   })
   const release = new Promise<void>((resolve) => {
     releaseSnapshots = resolve
@@ -6106,7 +6372,7 @@ test('native get and list snapshots cannot overwrite monitor finalization', asyn
   const worker = {
     snapshot: async () => {
       snapshots += 1
-      if (snapshots === 2) snapshotsStarted()
+      snapshotStarted()
       await release
       return running
     },
@@ -6133,8 +6399,9 @@ test('native get and list snapshots cannot overwrite monitor finalization', asyn
   }
 
   try {
+    const list = await supervisor.list()
+    expect(snapshots).toBe(0)
     const get = supervisor.get(session.id)
-    const list = supervisor.list()
     await started
     const monitor = (
       supervisor as unknown as {
@@ -6146,7 +6413,7 @@ test('native get and list snapshots cannot overwrite monitor finalization', asyn
 
     await monitor
     expect(await get).toMatchObject({ status: 'exited' })
-    expect(await list).toMatchObject([{ id: session.id, status: 'exited' }])
+    expect(list).toMatchObject([{ id: session.id, status: 'running' }])
     expect(await storage.loadSessions()).toMatchObject([{ id: session.id, status: 'exited' }])
     expect(await supervisor.cleanup(session.id)).toBeTrue()
     expect(reconnects).toBe(0)

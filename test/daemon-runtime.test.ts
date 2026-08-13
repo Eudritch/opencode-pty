@@ -179,7 +179,7 @@ test('sessions without an explicit workdir run in the owner project directory', 
   await mkdir(ownerProjectDirectory, { recursive: true })
   const supervisor = new SessionSupervisor(new DaemonStorage(root))
   await supervisor.initialize()
-  const result = await supervisor.exec({
+  const result = await supervisor.nativeExec({
     command: process.execPath,
     args: ['-e', 'console.log(process.cwd())'],
     parentSessionId: 'parent',

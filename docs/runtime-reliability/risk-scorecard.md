@@ -10,13 +10,13 @@ Scores use 1-5: **1** broken or unproven for a required contract, **2** substant
 
 | Dimension | Score | Evidence and explanation |
 | --- | ---: | --- |
-| Simplicity | 1 | 1,280-line server, 1,738-line supervisor, 1,456-line storage, and 4,206-line mixed-platform worker; a legacy duplicate exec path remains. |
+| Simplicity | 1 | The server, supervisor, storage, and mixed-platform worker remain large, although the legacy daemon-side exec implementation is deleted. |
 | Lifecycle determinism | 3 | A pure reducer blocks stale status/fact regression, recovery is lifecycle-specific, and V0 decoding fences legacy live state; V1 persistence still combines status and mutable observations. |
 | PTY correctness | 2 | Local guarded ConPTY live/package contracts pass, but supported-build and close-order evidence is incomplete. |
 | Windows reliability | 2 | Local recovery is repeatable, but there is no Windows version/architecture matrix and the Bun minimum remains unproven. |
 | Linux reliability | 3 | Conservative direct-child and `/proc` containment evidence; needs fresh full-matrix verification. |
 | macOS reliability | 2 | Native path exists, but CI/build and packaged-smoke evidence is incomplete; descendant verification is intentionally unavailable. |
-| Concurrency isolation | 3 | Owner capability and per-session workers isolate data, but all starts call a global worker snapshot. |
+| Concurrency isolation | 4 | Owner capability and per-session workers isolate data; full-owner reservations replace global worker polling, and focused tests prove unrelated liveness cannot delay admission. Controller lanes remain open. |
 | Durability/recovery | 3 | Persistent recovery and conversation cleanup/tombstones are explicit; verified worker references persist before activation; rollback/deletion retain reaping credentials; normal terminal cleanup now reuses fresh shutdown proof without a redundant reconnect; and incompatible workers are inert. Crash matrix and cross-platform evidence remain incomplete. |
 | Resource bounding | 3 | Per-session output and input limits exist; aggregate retained-byte, process, waiter, and durable-record budgets do not. |
 | Security | 3 | Strong loopback/capability/DACL controls; full-owner reuse, owner-safe V0 decoding, tombstone retention, and fail-closed dynamic environments improve isolation, but worker override and aggregate policy remain open. |
@@ -35,7 +35,7 @@ Scores use 1-5: **1** broken or unproven for a required contract, **2** substant
 | Start-lock test deadline was shorter than its Windows work | Local `bun unittest` passes after an explicit 30-second budget | Keep the explicit deadline; no retry masking. |
 | Declared Bun 1.3.8 contract not established | CI pins 1.3.8 while local works on 1.3.14; historical matrix failures reported | Green exact-version matrix or raise and pin minimum. |
 | Persisted lifecycle model remains partial | V1 compatibility migration fences V0 recovery, but records still carry legacy status plus independent observations | Complete discriminated persisted state and tombstone retention budget. |
-| Admission does global worker polling | `src/daemon/server.ts:1001-1019` | Registry-backed owner count; liveness probes only on the requested session. |
+| Mutation ordering is implicit | Per-owner admission is now registry-backed, but write/resize/stop/finalize do not yet share explicit per-session controller lanes | Complete Phase 2 controller lanes and prove deterministic concurrent mutation behavior. |
 | Release test prerequisite mismatch | `README.md` says debug worker required; release builds release worker before Bun suite | Build/test the declared worker artifact from a clean checkout. |
 | Aggregate resource policy absent | Unbounded waiters and aggregate output/durable records | Define and enforce budgets before service claims. |
 

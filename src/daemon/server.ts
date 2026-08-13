@@ -1179,7 +1179,7 @@ export class DaemonServer implements Disposable {
     }
   }
 
-  private execPayload(payload: unknown): Parameters<SessionSupervisor['exec']>[0] {
+  private execPayload(payload: unknown): ExecOptions {
     const value = this.objectPayload(payload)
     this.onlyFields(value, [
       'command',

@@ -1,6 +1,6 @@
 # Runtime Reliability Investigation
 
-**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open.
+**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open. Phase 2 has removed the daemon-side direct-exec path and replaced global admission polling with conservative per-owner reservations; controller lanes and unified shutdown remain open.
 
 This directory is the engineering record for rebuilding the process and terminal runtime. It deliberately treats `shekohex/opencode-pty` as historical input rather than a design authority.
 
@@ -11,7 +11,7 @@ This directory is the engineering record for rebuilding the process and terminal
 | Evidence and scope | Verified | [evidence.md](evidence.md) | Findings are tied to source, official documentation, history, or an experiment. |
 | Current runtime | Partially verified | [current-architecture.md](current-architecture.md) | The fork is a major durable-runtime rewrite; recovery distinguishes persistent sessions from conversation cleanup and the decoder fences legacy live records from recovery. |
 | Bun and dependencies | Partially verified | [platforms-and-dependencies.md](platforms-and-dependencies.md) | Bun has a PTY API, but it has not demonstrated parity with the durable native-worker contract. |
-| Windows and concurrency | Partially verified | [risk-scorecard.md](risk-scorecard.md) | Local packaged ConPTY is repaired by a scoped console-handle guard; the Windows build/close-order matrix and global admission coupling remain open. |
+| Windows and concurrency | Partially verified | [risk-scorecard.md](risk-scorecard.md) | Local packaged ConPTY is repaired by a scoped console-handle guard; admission is per-owner and independent of unrelated worker liveness, while the Windows build/close-order matrix remains open. |
 | Security and operations | Partially verified | [security-and-operations.md](security-and-operations.md) | Owner-scoped reuse, inert incompatible-worker records, and evidence-retaining tombstones are implemented; transient approvals reject custom/inherited environments and aggregate budgets remain open. |
 | Tests and experiments | Partially verified | [testing-and-experiments.md](testing-and-experiments.md) | Local native/package checks are green; cross-platform release confidence is blocked by the unrun Windows and macOS matrices. |
 | Target architecture | Proposed from evidence | [target-architecture.md](target-architecture.md) | Keep the mode split and narrow native engine; simplify the control plane and make state authority explicit. |
@@ -55,6 +55,8 @@ This directory is the engineering record for rebuilding the process and terminal
 | Reap verified pre-start workers | Implemented checkpoint | A reference-bound no-child receipt is accepted only before a `start` frame; it permits deletion without inventing child/containment facts. |
 | Reap verified post-start no-child workers | Implemented checkpoint | A full worker reference plus a retained descriptor can authenticate `spawn-failure.json` only when it proves `directChildStarted: false`; child-started failures are never treated as no-child. |
 | Reuse fresh shutdown proof for normal terminal cleanup | Implemented checkpoint | A session that already proved terminal shutdown in-process can delete without a redundant reconnect, while crash-recovered terminal records still require fresh authenticated shutdown proof. |
+| Use conservative per-owner reservations for admission | Implemented Phase 2 slice | A full-owner slot is reserved before the first record write; matching PTY reuse happens first, first-write failure releases, and uncertain/lost records continue to occupy capacity until strict proof or durable deletion releases them. |
+| Remove daemon-side direct exec | Implemented Phase 2 slice | All supported exec requests now use the native worker path; list reads metadata without snapshotting workers. |
 
 ## Completion Gates
 
