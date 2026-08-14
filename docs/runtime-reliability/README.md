@@ -1,6 +1,6 @@
 # Runtime Reliability Investigation
 
-**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open. Phase 2 is locally complete: it removes the daemon-side direct-exec path and global admission polling, adds controller lanes/unified shutdown, and separates records, worker routing, and journal reads.
+**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a V2 discriminated persisted state, pure state reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0/V1 compatibility decoding, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; resource budgets and the crash matrix remain open. Phase 2 is locally complete: it removes the daemon-side direct-exec path and global admission polling, adds controller lanes/unified shutdown, and separates records, worker routing, and journal reads.
 
 This directory is the engineering record for rebuilding the process and terminal runtime. It deliberately treats `shekohex/opencode-pty` as historical input rather than a design authority.
 
@@ -12,7 +12,7 @@ This directory is the engineering record for rebuilding the process and terminal
 | Current runtime | Partially verified | [current-architecture.md](current-architecture.md) | The fork is a major durable-runtime rewrite; recovery distinguishes persistent sessions from conversation cleanup and the decoder fences legacy live records from recovery. |
 | Bun and dependencies | Partially verified | [platforms-and-dependencies.md](platforms-and-dependencies.md) | Bun has a PTY API, but it has not demonstrated parity with the durable native-worker contract. |
 | Windows and concurrency | Partially verified | [risk-scorecard.md](risk-scorecard.md) | Local packaged ConPTY is repaired by a scoped console-handle guard; admission is per-owner and independent of unrelated worker liveness, while the Windows build/close-order matrix remains open. |
-| Security and operations | Partially verified | [security-and-operations.md](security-and-operations.md) | Owner-scoped reuse, inert incompatible-worker records, and evidence-retaining tombstones are implemented; transient approvals reject custom/inherited environments and aggregate budgets remain open. |
+| Security and operations | Partially verified | [security-and-operations.md](security-and-operations.md) | Owner-scoped reuse, inert incompatible-worker records, and evidence-retaining V2 tombstones are implemented; transient approvals reject custom/inherited environments and aggregate budgets remain open. |
 | Tests and experiments | Partially verified | [testing-and-experiments.md](testing-and-experiments.md) | Local native/package checks are green; cross-platform release confidence is blocked by the unrun Windows and macOS matrices. |
 | Target architecture | Proposed from evidence | [target-architecture.md](target-architecture.md) | Keep the mode split and narrow native engine; simplify the control plane and make state authority explicit. |
 | Open questions | Open | [open-questions.md](open-questions.md) | Only unresolved questions that can change a decision or release claim remain here. |
@@ -50,7 +50,7 @@ This directory is the engineering record for rebuilding the process and terminal
 | Preserve existing persisted data safely | Accepted migration policy | Terminal records migrate; old live records become owner-cleanable legacy tombstones rather than live target sessions. |
 | Package-test all six published worker targets for release | Accepted | A published target is a release claim requiring executable evidence. |
 | Fail closed for custom/inherited environments under transient approval | Accepted interim policy | OpenCode approval metadata cannot bind those options; explicit local `bash` allow is required instead. |
-| Version persisted records before recovery | Implemented compatibility slice | V1 records require a root marker and a lowercase SHA-256 owner hash. V0 terminal migration and terminal cleanup require explicit direct-child/containment evidence; V0 live/unproven records become cleanup-only tombstones that retain legacy output. Unknown, incomplete, and null-owner records remain untouched and inert. |
+| Version persisted records before recovery | Implemented V2 cutover | V2 is the only writer and contains one discriminated state; V0/V1 readers import proven terminals with unknown stream drain and turn live/unproven records into cleanup-only unreachable tombstones. Explicit V0, unknown future, incomplete, and null-owner artifacts remain untouched and inert. |
 | Persist worker reference before activation | Implemented checkpoint | The worker remains blocked on its authenticated bootstrap pipe until the daemon persists its verified reference; a failed reference write rolls back without starting a child. |
 | Reap verified pre-start workers | Implemented checkpoint | A reference-bound no-child receipt is accepted only before a `start` frame; it permits deletion without inventing child/containment facts. |
 | Reap verified post-start no-child workers | Implemented checkpoint | A full worker reference plus a retained descriptor can authenticate `spawn-failure.json` only when it proves `directChildStarted: false`; child-started failures are never treated as no-child. |
@@ -60,6 +60,7 @@ This directory is the engineering record for rebuilding the process and terminal
 | Serialize session mutations | Implemented Phase 2 slice | Writes, send-and-wait input acceptance, resize, stop, finalization, cleanup marking, and durable deletion share one per-session lane. |
 | Unify daemon shutdown | Implemented Phase 2 slice | `stop`, synchronous disposal, and async disposal share one idempotent descriptor-cleanup path. |
 | Split the control-plane state owners | Implemented Phase 2 slice | `SessionRegistry` owns records/admission, `SessionRouter` owns workers/ordered control lanes, and `JournalReader` owns output paging/search. |
+| Make V2 state authoritative | Implemented Phase 1 slice | `SessionSupervisor` reduces V2 state before projecting legacy fields for RPC compatibility; a terminal transition without strict child/containment or no-child evidence becomes an unreachable tombstone retaining its terminal payload. |
 
 ## Completion Gates
 

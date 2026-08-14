@@ -2,7 +2,7 @@ export const DAEMON_PROTOCOL_VERSION = 8
 
 export const OUTPUT_JOURNAL_VERSION = 2
 
-export const SESSION_RECORD_VERSION = 1
+export const SESSION_RECORD_VERSION = 2
 
 export const MAX_EXEC_RUNTIME_SECONDS = 3600
 export const MAX_EXEC_WAIT_SECONDS = MAX_EXEC_RUNTIME_SECONDS + 5
@@ -201,9 +201,64 @@ export interface WorkerPrestartAuthority {
 }
 
 export interface LegacyTombstone {
-  sourceRecordVersion: 0
+  sourceRecordVersion: 0 | 1
   lastKnown: 'creating' | 'running' | 'stopping' | 'terminal' | 'unreachable'
 }
+
+export type StreamDrain = 'drained' | 'unknown'
+
+export type SessionStateTarget = 'creating' | 'running' | 'stopping' | 'terminal' | 'unreachable'
+
+export type TerminalSessionOutcome = 'exited' | 'timed_out' | 'spawn_failed' | 'output_limited'
+
+export interface SessionStateEvidence {
+  child: { pid: number; directExited?: boolean }
+  startedAt?: string
+  exitedAt?: string
+  timedOut: boolean
+  termination: {
+    requested: boolean
+    confirmed: boolean
+    result?: TerminationResult
+  }
+  containment?: ContainmentReport
+  exitCode?: number
+  exitSignal?: number | string
+  exitReason?: ExitReason
+  worker?: WorkerReference
+  prestart?: WorkerPrestartAuthority
+  startAttempted?: boolean
+  streamDrain: StreamDrain
+  execOutput?: ExecOutput
+  storageFailure?: string
+  diagnostics?: string[]
+  lastWaitResult?: WaitResult
+  legacy?: {
+    tombstone?: LegacyTombstone
+    outputCleanupPending?: true
+  }
+}
+
+export interface TerminalSessionPayload {
+  outcome: TerminalSessionOutcome
+  evidence: SessionStateEvidence
+}
+
+export type SessionState =
+  | (SessionStateEvidence & { kind: 'creating' | 'running' | 'stopping' })
+  | (SessionStateEvidence & { kind: 'terminal'; outcome: TerminalSessionOutcome })
+  | (SessionStateEvidence & {
+      kind: 'unreachable'
+      lastKnown: LegacyTombstone['lastKnown']
+      terminal?: TerminalSessionPayload
+    })
+  | (SessionStateEvidence & {
+      kind: 'cleaning'
+      target: SessionStateTarget
+      outcome?: TerminalSessionOutcome
+      lastKnown?: LegacyTombstone['lastKnown']
+      terminal?: TerminalSessionPayload
+    })
 
 export interface SessionRecord {
   recordVersion: typeof SESSION_RECORD_VERSION
@@ -220,6 +275,8 @@ export interface SessionRecord {
   ownerCapabilityHash: string
   lifecycle: SessionLifecycle
   environment: EnvironmentProfile
+  // Internal V2 lifecycle authority. Flat fields below are compatibility projections only.
+  state: SessionState
   status: DaemonStatus
   pid: number
   createdAt: string
@@ -258,10 +315,13 @@ export interface SessionRecord {
   storageFailure?: string
   diagnostics?: string[]
   lastWaitResult?: WaitResult
-  // A V0 record that was live or unproven at upgrade time can only be read or reaped.
+  // A V0/V1 record that was live or unproven at upgrade time can only be read or reaped.
   legacyTombstone?: LegacyTombstone
-  // A proven V0 terminal record imported output.log and must retry deleting that source file.
+  // A proven legacy terminal record imported output.log and must retry deleting that source file.
   legacyOutputCleanupPending?: boolean
+  // Persisted only inside V2 state; retained here for the flat in-memory compatibility record.
+  streamDrain?: StreamDrain
+  lastKnown?: LegacyTombstone['lastKnown']
 }
 
 export interface OutputChunk {

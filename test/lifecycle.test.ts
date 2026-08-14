@@ -1,5 +1,9 @@
 import { expect, test } from 'bun:test'
-import { isActiveDaemonStatus, reduceDaemonStatus } from '../src/daemon/lifecycle.ts'
+import {
+  isActiveDaemonStatus,
+  reduceDaemonStatus,
+  reduceSessionState,
+} from '../src/daemon/lifecycle.ts'
 import type { DaemonStatus } from '../src/daemon/types.ts'
 
 test('lifecycle reducer accepts legal transitions', () => {
@@ -48,4 +52,70 @@ test('only start, run, and stop statuses are active', () => {
   ] as const satisfies readonly DaemonStatus[]
   expect(active.every(isActiveDaemonStatus)).toBe(true)
   expect(inactive.some(isActiveDaemonStatus)).toBe(false)
+})
+
+function state(kind: 'creating' | 'running' | 'stopping' = 'creating') {
+  return {
+    kind,
+    child: { pid: 1, directExited: false },
+    timedOut: false,
+    termination: { requested: false, confirmed: false },
+    streamDrain: 'unknown' as const,
+  }
+}
+
+test('V2 reducer accepts legal transitions and rejects regressions', () => {
+  expect(reduceSessionState(state(), 'worker_ready')).toMatchObject({
+    ok: true,
+    state: { kind: 'running' },
+  })
+  expect(reduceSessionState(state('running'), 'stop_requested')).toMatchObject({
+    ok: true,
+    state: { kind: 'stopping' },
+  })
+  expect(reduceSessionState(state('stopping'), 'worker_ready')).toEqual({
+    ok: false,
+    error: 'invalid_transition',
+  })
+})
+
+test('V2 reducer preserves an unproven terminal payload when it becomes unreachable', () => {
+  const result = reduceSessionState(
+    {
+      ...state('running'),
+      child: { pid: 1, directExited: true },
+      termination: { requested: true, confirmed: false },
+      exitReason: { kind: 'timeout' },
+    },
+    'timed_out'
+  )
+
+  expect(result).toMatchObject({
+    ok: true,
+    state: {
+      kind: 'unreachable',
+      lastKnown: 'terminal',
+      terminal: { outcome: 'timed_out', evidence: { exitReason: { kind: 'timeout' } } },
+    },
+  })
+})
+
+test('cleaning cannot return to running', () => {
+  const cleaning = {
+    ...state('running'),
+    kind: 'cleaning' as const,
+    target: 'running' as const,
+  }
+  expect(reduceSessionState(cleaning, 'worker_ready')).toEqual({
+    ok: false,
+    error: 'invalid_transition',
+  })
+  expect(reduceSessionState(cleaning, 'recovered')).toEqual({
+    ok: false,
+    error: 'invalid_transition',
+  })
+  expect(reduceSessionState(cleaning, 'unreachable')).toMatchObject({
+    ok: true,
+    state: { kind: 'cleaning', target: 'unreachable', lastKnown: 'running' },
+  })
 })

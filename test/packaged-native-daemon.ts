@@ -482,8 +482,8 @@ try {
       }
       const firstRecord = JSON.parse(
         await readFile(join(stateDirectory, 'sessions', id.id, 'session.json'), 'utf8')
-      ) as { worker?: { executable?: string } }
-      const executable = firstRecord.worker?.executable
+      ) as { state?: { worker?: { executable?: string } } }
+      const executable = firstRecord.state?.worker?.executable
       const { pid } = descriptor
       if (
         typeof pid === 'number' &&

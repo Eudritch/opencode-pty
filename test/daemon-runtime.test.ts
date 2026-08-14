@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DaemonError } from '../src/daemon/errors.ts'
+import { sessionStateFromCompatibility } from '../src/daemon/lifecycle.ts'
 import { classifyRpcFailure, DaemonServer } from '../src/daemon/server.ts'
 import { DaemonStorage } from '../src/daemon/storage.ts'
 import {
@@ -42,7 +43,7 @@ function record(
   status: SessionRecord['status'] = 'running'
 ): SessionRecord {
   const now = new Date().toISOString()
-  return {
+  const flat: Omit<SessionRecord, 'state'> = {
     recordVersion: SESSION_RECORD_VERSION,
     id,
     title: id,
@@ -71,6 +72,7 @@ function record(
     outputHasPartialLine: false,
     outputJournalVersion: 2,
   }
+  return { ...flat, state: sessionStateFromCompatibility(flat) }
 }
 
 async function owner(storage: DaemonStorage, parentSessionId: string, projectDirectory: string) {

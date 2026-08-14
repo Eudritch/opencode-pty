@@ -4,7 +4,13 @@ import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../
 import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import { DaemonError } from './errors.ts'
 import { JournalReader, lineCount } from './journal-reader.ts'
-import { isActiveDaemonStatus, reduceDaemonStatus, type LifecycleEvent } from './lifecycle.ts'
+import {
+  isActiveDaemonStatus,
+  projectSessionState,
+  reduceSessionState,
+  refreshSessionState,
+  type LifecycleEvent,
+} from './lifecycle.ts'
 import { containmentDrained, SessionRegistry, terminalDirectChild } from './session-registry.ts'
 import { SessionRouter } from './session-router.ts'
 import type { DaemonStorage } from './storage.ts'
@@ -182,7 +188,10 @@ export class SessionSupervisor {
   async initialize(reconnect = true): Promise<void> {
     await this.storage.initialize()
     for (const record of await this.storage.loadSessions()) {
-      if (record.status === 'starting' && !record.worker && !record.workerPrestart) {
+      if (
+        this.noChildSpawnFailure(record) ||
+        (record.status === 'starting' && !record.worker && !record.workerPrestart)
+      ) {
         try {
           await this.storage.deleteSession(record.id)
           continue
@@ -360,6 +369,14 @@ export class SessionSupervisor {
       ownerCapabilityHash: options.ownerCapabilityHash ?? '',
       lifecycle: options.lifecycle ?? 'conversation',
       environment: environmentProfile(environment, options.inheritEnv === true),
+      state: {
+        kind: 'creating',
+        child: { pid: 0, directExited: false },
+        startedAt: now,
+        timedOut: false,
+        termination: { requested: false, confirmed: false },
+        streamDrain: 'unknown',
+      },
       status: 'starting',
       pid: 0,
       createdAt: now,
@@ -450,7 +467,6 @@ export class SessionSupervisor {
         record.worker = error.prestartReference
         record.workerStartAttempted = false
       }
-      this.transition(record, cleanup.terminationConfirmed ? 'spawn_failed' : 'unreachable')
       record.terminationRequested = cleanup.requested
       record.terminationConfirmed = cleanup.terminationConfirmed
       record.exitReason = {
@@ -458,6 +474,7 @@ export class SessionSupervisor {
         message: error instanceof Error ? error.message : String(error),
         cleanup,
       }
+      this.transition(record, this.noChildCleanup(cleanup) ? 'spawn_failed' : 'unreachable')
       record.updatedAt = new Date().toISOString()
       await this.storage.writeSession(record)
       this.registry.releaseIfSettled(record)
@@ -611,6 +628,14 @@ export class SessionSupervisor {
       ownerCapabilityHash: options.ownerCapabilityHash ?? '',
       lifecycle: options.lifecycle ?? 'conversation',
       environment: environmentProfile(environment, options.inheritEnv === true),
+      state: {
+        kind: 'creating',
+        child: { pid: 0 },
+        startedAt: now,
+        timedOut: false,
+        termination: { requested: false, confirmed: false },
+        streamDrain: 'unknown',
+      },
       status: 'starting',
       pid: 0,
       createdAt: now,
@@ -704,10 +729,10 @@ export class SessionSupervisor {
         record.worker = error.prestartReference
         record.workerStartAttempted = false
       }
-      this.transition(record, cleanup.terminationConfirmed ? 'spawn_failed' : 'unreachable')
       record.terminationRequested = cleanup.requested
       record.terminationConfirmed = cleanup.terminationConfirmed
       record.exitReason = { kind: 'spawn_error', message: String(error), cleanup }
+      this.transition(record, this.noChildCleanup(cleanup) ? 'spawn_failed' : 'unreachable')
       record.updatedAt = new Date().toISOString()
       await this.storage.writeSession(record)
       this.registry.releaseIfSettled(record)
@@ -934,13 +959,67 @@ export class SessionSupervisor {
   ): Promise<ExecResult | PTYSessionInfo> {
     // A stale snapshot must not overwrite a newer stop or terminal observation just because its
     // status transition was rejected.
-    if (!this.transition(record, this.workerEvent(result))) return this.toInfo(record)
-    record.pid = result.pid
-    record.nextSequence = result.nextSequence
-    record.firstRetainedSequence = result.firstRetainedSequence
-    record.outputBytes = result.stdoutBytes + result.stderrBytes
-    record.outputTruncated = result.outputTruncated
-    record.timedOut = result.timedOut
+    const exitReason: ExitReason =
+      result.storageFailure || result.readerFailure || result.outputIncomplete
+        ? {
+            kind: 'unknown',
+            message: result.storageFailure
+              ? `Native worker storage failure: ${result.storageFailure}`
+              : result.readerFailure
+                ? `Native worker output incomplete: ${result.readerFailure}`
+                : 'Native worker output incomplete: reader drain deadline elapsed.',
+          }
+        : result.exitReason === 'timeout'
+          ? { kind: 'timeout' }
+          : result.exitReason === 'output_limit'
+            ? { kind: 'output_limit' }
+            : result.exitReason === 'stopped'
+              ? { kind: 'stopped' }
+              : result.exitReason?.startsWith('signal:')
+                ? { kind: 'signal', signal: result.exitSignal ?? result.exitReason.slice(7) }
+                : result.terminationConfirmed
+                  ? this.exitReason(result.exitCode ?? null, result.exitSignal ?? undefined)
+                  : { kind: 'unknown' }
+    const observations: Partial<SessionRecord> = {
+      pid: result.pid,
+      nextSequence: result.nextSequence,
+      firstRetainedSequence: result.firstRetainedSequence,
+      outputTruncated: result.outputTruncated,
+      timedOut: result.timedOut,
+      ...(record.mode === 'exec' && result.stdout !== undefined && result.stderr !== undefined
+        ? {
+            execOutput: {
+              stdout: result.stdout,
+              stderr: result.stderr,
+              stdoutBytes: result.stdoutBytes,
+              stderrBytes: result.stderrBytes,
+              stdoutTruncated: result.stdoutTruncated,
+              stderrTruncated: result.stderrTruncated,
+              containment: result.containment,
+              termination: result.termination,
+            },
+          }
+        : {}),
+      exitCode: result.exitCode ?? undefined,
+      exitSignal: result.exitSignal ?? undefined,
+      terminationRequested: result.terminationRequested,
+      terminationConfirmed: result.terminationConfirmed,
+      directChildExited: result.directChildExited,
+      containment: result.containment,
+      termination: result.termination,
+      storageFailure: result.storageFailure ?? undefined,
+      diagnostics: result.diagnostics?.length ? result.diagnostics : undefined,
+      streamDrain: result.readerFailure || result.outputIncomplete ? 'unknown' : 'drained',
+      exitReason,
+      exitedAt: result.exitedAt ?? undefined,
+      outputBytes:
+        record.mode === 'exec'
+          ? result.stdoutBytes + result.stderrBytes
+          : result.nextSequence - result.firstRetainedSequence,
+      lineCount: result.outputLineCount,
+      outputHasPartialLine: result.outputHasPartialLine,
+    }
+    if (!this.transition(record, this.workerEvent(result), observations)) return this.toInfo(record)
     if (record.mode === 'exec' && result.stdout !== undefined && result.stderr !== undefined)
       record.execOutput = {
         stdout: result.stdout,
@@ -952,43 +1031,7 @@ export class SessionSupervisor {
         containment: result.containment,
         termination: result.termination,
       }
-    record.exitCode = result.exitCode ?? undefined
-    record.exitSignal = result.exitSignal ?? undefined
-    record.terminationRequested = result.terminationRequested
-    record.terminationConfirmed = result.terminationConfirmed
-    record.directChildExited = result.directChildExited
-    record.containment = result.containment
-    record.termination = result.termination
-    record.storageFailure = result.storageFailure ?? undefined
-    record.diagnostics = result.diagnostics?.length ? result.diagnostics : undefined
-    if (result.storageFailure || result.readerFailure || result.outputIncomplete)
-      record.exitReason = {
-        kind: 'unknown',
-        message: result.storageFailure
-          ? `Native worker storage failure: ${result.storageFailure}`
-          : result.readerFailure
-            ? `Native worker output incomplete: ${result.readerFailure}`
-            : 'Native worker output incomplete: reader drain deadline elapsed.',
-      }
-    else if (result.exitReason === 'timeout') record.exitReason = { kind: 'timeout' }
-    else if (result.exitReason === 'output_limit') record.exitReason = { kind: 'output_limit' }
-    else if (result.exitReason === 'stopped') record.exitReason = { kind: 'stopped' }
-    else if (result.exitReason?.startsWith('signal:'))
-      record.exitReason = {
-        kind: 'signal',
-        signal: result.exitSignal ?? result.exitReason.slice(7),
-      }
-    else if (record.terminationConfirmed)
-      record.exitReason = this.exitReason(result.exitCode ?? null, result.exitSignal ?? undefined)
-    else record.exitReason = { kind: 'unknown' }
-    record.exitedAt = result.exitedAt ?? undefined
     record.updatedAt = new Date().toISOString()
-    record.outputBytes =
-      record.mode === 'exec'
-        ? result.stdoutBytes + result.stderrBytes
-        : result.nextSequence - result.firstRetainedSequence
-    record.lineCount = result.outputLineCount
-    record.outputHasPartialLine = result.outputHasPartialLine
     try {
       await this.storage.writeSession(record)
     } catch (error) {
@@ -1149,6 +1192,7 @@ export class SessionSupervisor {
     await this.flush()
     const record = this.records.get(id)
     if (!record) return false
+    if (this.noChildSpawnFailure(record)) return this.deleteNativeSession(record)
     await this.nativeFinalizations.get(id)
     const prestartAuthority = this.prestartReceiptAuthority(record)
     if (
@@ -1300,6 +1344,25 @@ export class SessionSupervisor {
     )
       return record.worker ?? record.workerPrestart
     return undefined
+  }
+
+  private noChildCleanup(cleanup: SpawnFailure['cleanup']): boolean {
+    return cleanup.terminationConfirmed && cleanup.directChildStarted === false
+  }
+
+  private noChildSpawnFailure(record: SessionRecord): boolean {
+    return Boolean(
+      !record.worker &&
+        !record.workerPrestart &&
+        record.exitReason?.kind === 'spawn_error' &&
+        this.noChildCleanup(
+          record.exitReason.cleanup ?? {
+            requested: false,
+            terminationConfirmed: false,
+            method: 'none',
+          }
+        )
+    )
   }
 
   private postStartNoChildFailureEligible(record: SessionRecord): boolean {
@@ -1524,10 +1587,18 @@ export class SessionSupervisor {
     return { kind: 'unknown' }
   }
 
-  private transition(record: SessionRecord, event: LifecycleEvent): boolean {
-    const reduction = reduceDaemonStatus(record.status, event)
+  private transition(
+    record: SessionRecord,
+    event: LifecycleEvent,
+    observations: Partial<SessionRecord> = {}
+  ): boolean {
+    const observed = { ...record, ...observations } as SessionRecord
+    const current = refreshSessionState(record.state, observed)
+    const reduction = reduceSessionState(current, event)
     if (!reduction.ok) return false
-    record.status = reduction.status
+    Object.assign(record, observations)
+    record.state = reduction.state
+    Object.assign(record, projectSessionState(record.state))
     return true
   }
 

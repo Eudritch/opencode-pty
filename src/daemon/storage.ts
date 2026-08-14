@@ -21,7 +21,14 @@ import {
   type OutputChunk,
   SESSION_RECORD_VERSION,
   type SessionRecord,
+  type SessionState,
+  type TerminalSessionOutcome,
 } from './types.ts'
+import {
+  projectSessionState,
+  refreshSessionState,
+  sessionStateFromCompatibility,
+} from './lifecycle.ts'
 
 const DESCRIPTOR_FILE = 'daemon.json'
 const OWNERSHIP_SECRET_FILE = 'ownership-secret'
@@ -198,6 +205,34 @@ const SESSION_STATUSES = new Set([
   'spawn_failed',
   'output_limited',
 ])
+
+const V2_ROOT_LIFECYCLE_FIELDS = [
+  'status',
+  'pid',
+  'startedAt',
+  'exitedAt',
+  'timedOut',
+  'terminationRequested',
+  'terminationConfirmed',
+  'pendingCleanup',
+  'directChildExited',
+  'exitCode',
+  'exitSignal',
+  'exitReason',
+  'worker',
+  'workerPrestart',
+  'workerStartAttempted',
+  'containment',
+  'termination',
+  'execOutput',
+  'storageFailure',
+  'diagnostics',
+  'lastWaitResult',
+  'legacyTombstone',
+  'legacyOutputCleanupPending',
+  'streamDrain',
+  'lastKnown',
+] as const
 
 function validText(value: unknown): value is string {
   if (typeof value !== 'string') return false
@@ -757,11 +792,17 @@ export class DaemonStorage {
   }
 
   async writeSession(record: SessionRecord): Promise<void> {
-    if (!this.validSession(record, record.id, 1))
+    record.state = refreshSessionState(record.state, record)
+    const compatibility = { ...record, ...projectSessionState(record.state) }
+    Object.assign(record, compatibility)
+    if (!this.validCompatibilitySession(compatibility, record.id))
       throw new Error('Refusing to persist invalid PTY session.')
+    const persisted = this.toV2Session(record)
+    if (!this.validV2Session(persisted, record.id))
+      throw new Error('Refusing to persist an invalid V2 PTY session.')
     const directory = this.sessionDirectory(record.id)
     await this.privateDirectory(directory)
-    await this.writeAtomic(this.metadataPath(record.id), JSON.stringify(record))
+    await this.writeAtomic(this.metadataPath(record.id), JSON.stringify(persisted))
   }
 
   async appendOutput(id: string, chunks: OutputChunk[]): Promise<void> {
@@ -929,13 +970,15 @@ export class DaemonStorage {
     if (!record || typeof record !== 'object') throw new InvalidSessionError()
     const version = (record as { recordVersion?: unknown }).recordVersion
     if (version === undefined) return this.decodeV0Session(record, id)
+    if (version === 1) return this.decodeV1Session(record, id)
     if (version === SESSION_RECORD_VERSION) {
-      if (!this.validSession(record, id, 1)) throw new InvalidSessionError()
+      if (!this.validV2Session(record, id)) throw new InvalidSessionError()
+      const converted = this.fromV2Session(record as Record<string, unknown>)
       return {
-        record,
+        record: converted,
         forceMetadataWrite: false,
         importLegacyOutput: false,
-        removeLegacyOutput: record.legacyOutputCleanupPending === true,
+        removeLegacyOutput: converted.legacyOutputCleanupPending === true,
       }
     }
     if (validNonnegativeInteger(version)) {
@@ -961,6 +1004,19 @@ export class DaemonStorage {
       )
     }
     if (!this.validSession(record, id, 0)) throw new InvalidSessionError()
+    return this.decodeLegacySession(source, id, 0)
+  }
+
+  private async decodeV1Session(record: unknown, id: string): Promise<DecodedSession> {
+    if (!this.validSession(record, id, 1)) throw new InvalidSessionError()
+    return this.decodeLegacySession(record as Partial<SessionRecord>, id, 1)
+  }
+
+  private async decodeLegacySession(
+    source: Partial<SessionRecord>,
+    id: string,
+    sourceRecordVersion: 0 | 1
+  ): Promise<DecodedSession> {
     if (
       !nonemptyText(source.parentSessionId) ||
       !nonemptyText(source.ownerProjectDirectory) ||
@@ -996,8 +1052,13 @@ export class DaemonStorage {
     const lastKnown = this.legacyLastKnown(source.status as SessionRecord['status'])
     const legacyTombstone: LegacyTombstone | undefined = terminal
       ? undefined
-      : { sourceRecordVersion: 0, lastKnown }
-    const converted: SessionRecord = {
+      : (source.legacyTombstone ?? { sourceRecordVersion, lastKnown })
+    const legacyOutputCleanupPending =
+      terminal &&
+      (sourceRecordVersion === 0
+        ? source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION
+        : source.legacyOutputCleanupPending === true)
+    const legacyRecord = {
       ...source,
       recordVersion: SESSION_RECORD_VERSION,
       mode,
@@ -1018,17 +1079,28 @@ export class DaemonStorage {
       directChildExited: terminal && directChildExited,
       pendingCleanup: terminal ? source.pendingCleanup : true,
       outputJournalVersion: OUTPUT_JOURNAL_VERSION,
-      ...(terminal && source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION
-        ? { legacyOutputCleanupPending: true }
-        : {}),
+      streamDrain: terminal ? 'unknown' : undefined,
+      ...(legacyOutputCleanupPending ? { legacyOutputCleanupPending: true } : {}),
       ...(legacyTombstone ? { legacyTombstone } : {}),
-    } as SessionRecord
-    if (!this.validSession(converted, id, 1)) throw new InvalidSessionError()
+    } as Omit<SessionRecord, 'state'>
+    const converted: SessionRecord = {
+      ...legacyRecord,
+      state: sessionStateFromCompatibility({
+        ...legacyRecord,
+        status: ['exited', 'timed_out', 'output_limited', 'spawn_failed'].includes(
+          String(source.status)
+        )
+          ? (source.status as SessionRecord['status'])
+          : legacyRecord.status,
+      }),
+    }
+    if (!this.validCompatibilitySession(converted, id)) throw new InvalidSessionError()
     return {
       record: converted,
       forceMetadataWrite: true,
-      importLegacyOutput: source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION,
-      removeLegacyOutput: terminal && source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION,
+      importLegacyOutput:
+        sourceRecordVersion === 0 && source.outputJournalVersion !== OUTPUT_JOURNAL_VERSION,
+      removeLegacyOutput: legacyOutputCleanupPending,
     }
   }
 
@@ -1049,7 +1121,197 @@ export class DaemonStorage {
     )
   }
 
-  private validSession(record: unknown, id: string, version: 0 | 1): record is SessionRecord {
+  private toV2Session(record: SessionRecord): Record<string, unknown> {
+    const metadata: Record<string, unknown> = { ...record }
+    for (const field of V2_ROOT_LIFECYCLE_FIELDS) delete metadata[field]
+    return { ...metadata, recordVersion: SESSION_RECORD_VERSION, state: record.state }
+  }
+
+  private fromV2Session(source: Record<string, unknown>): SessionRecord {
+    const { state, ...metadata } = source
+    const value = state as SessionState
+    return {
+      ...metadata,
+      recordVersion: SESSION_RECORD_VERSION,
+      state: value,
+      ...projectSessionState(value),
+    } as SessionRecord
+  }
+
+  private validV2Session(record: unknown, id: string): boolean {
+    if (!record || typeof record !== 'object') return false
+    const value = record as Record<string, unknown>
+    if (
+      value.recordVersion !== SESSION_RECORD_VERSION ||
+      V2_ROOT_LIFECYCLE_FIELDS.some((field) => Object.hasOwn(value, field)) ||
+      !this.validV2State(value.state)
+    ) {
+      return false
+    }
+    return this.validCompatibilitySession(this.fromV2Session(value), id)
+  }
+
+  private validV2State(state: unknown): state is SessionState {
+    if (!state || typeof state !== 'object') return false
+    const value = state as Record<string, unknown>
+    const validLastKnown = (lastKnown: unknown): boolean =>
+      ['creating', 'running', 'stopping', 'terminal', 'unreachable'].includes(String(lastKnown))
+    const validOutcome = (outcome: unknown): outcome is TerminalSessionOutcome =>
+      ['exited', 'timed_out', 'spawn_failed', 'output_limited'].includes(String(outcome))
+    const validChild =
+      value.child &&
+      typeof value.child === 'object' &&
+      validNonnegativeInteger((value.child as Record<string, unknown>).pid) &&
+      ((value.child as Record<string, unknown>).directExited === undefined ||
+        typeof (value.child as Record<string, unknown>).directExited === 'boolean')
+    const validTermination =
+      value.termination &&
+      typeof value.termination === 'object' &&
+      typeof (value.termination as Record<string, unknown>).requested === 'boolean' &&
+      typeof (value.termination as Record<string, unknown>).confirmed === 'boolean'
+    const validTerminalPayload = (payload: unknown): boolean => {
+      if (!payload || typeof payload !== 'object') return false
+      const value = payload as Record<string, unknown>
+      const evidence = value.evidence
+      if (!validOutcome(value.outcome) || !evidence || typeof evidence !== 'object') return false
+      const source = evidence as Record<string, unknown>
+      const child = source.child as Record<string, unknown> | undefined
+      const termination = source.termination as Record<string, unknown> | undefined
+      return (
+        !['kind', 'target', 'outcome', 'lastKnown', 'terminal'].some((key) =>
+          Object.hasOwn(source, key)
+        ) &&
+        child !== undefined &&
+        validNonnegativeInteger(child.pid) &&
+        (child.directExited === undefined || typeof child.directExited === 'boolean') &&
+        termination !== undefined &&
+        typeof termination.requested === 'boolean' &&
+        typeof termination.confirmed === 'boolean' &&
+        typeof source.timedOut === 'boolean' &&
+        (source.streamDrain === 'drained' || source.streamDrain === 'unknown')
+      )
+    }
+    if (
+      !validChild ||
+      !validTermination ||
+      typeof value.timedOut !== 'boolean' ||
+      (value.streamDrain !== 'drained' && value.streamDrain !== 'unknown')
+    ) {
+      return false
+    }
+    const legacy = value.legacy
+    if (legacy !== undefined) {
+      if (!legacy || typeof legacy !== 'object') return false
+      const legacyValue = legacy as Record<string, unknown>
+      const tombstone = legacyValue.tombstone
+      if (
+        legacyValue.outputCleanupPending !== undefined &&
+        legacyValue.outputCleanupPending !== true
+      ) {
+        return false
+      }
+      if (
+        tombstone !== undefined &&
+        (!tombstone ||
+          typeof tombstone !== 'object' ||
+          ![0, 1].includes((tombstone as Record<string, unknown>).sourceRecordVersion as number) ||
+          !validLastKnown((tombstone as Record<string, unknown>).lastKnown))
+      ) {
+        return false
+      }
+    }
+    const kind = value.kind
+    const hasTerminalPayload = value.terminal !== undefined
+    if (hasTerminalPayload && !validTerminalPayload(value.terminal)) return false
+    const terminal = kind === 'terminal' || (kind === 'cleaning' && value.target === 'terminal')
+    if (
+      terminal &&
+      (!validOutcome(value.outcome) ||
+        (value.termination as Record<string, unknown>).confirmed !== true ||
+        !this.validV2TerminalProof(value, value.outcome as TerminalSessionOutcome))
+    ) {
+      return false
+    }
+    if (legacy && (legacy as Record<string, unknown>).outputCleanupPending === true && !terminal)
+      return false
+    if (kind === 'terminal')
+      return value.target === undefined && value.lastKnown === undefined && !hasTerminalPayload
+    if (kind === 'unreachable')
+      return (
+        value.target === undefined &&
+        value.outcome === undefined &&
+        validLastKnown(value.lastKnown) &&
+        (value.lastKnown === 'terminal') === hasTerminalPayload
+      )
+    if (kind === 'cleaning') {
+      if (
+        !['creating', 'running', 'stopping', 'terminal', 'unreachable'].includes(
+          String(value.target)
+        )
+      )
+        return false
+      if ((value.target === 'terminal') !== (value.outcome !== undefined)) return false
+      if ((value.target === 'unreachable') !== (value.lastKnown !== undefined)) return false
+      if (hasTerminalPayload !== (value.target === 'unreachable' && value.lastKnown === 'terminal'))
+        return false
+      const tombstone = (legacy as Record<string, unknown> | undefined)?.tombstone as
+        | Record<string, unknown>
+        | undefined
+      return (
+        tombstone === undefined ||
+        (value.target === 'unreachable' && tombstone.lastKnown === value.lastKnown)
+      )
+    }
+    return (
+      (kind === 'creating' || kind === 'running' || kind === 'stopping') &&
+      value.target === undefined &&
+      value.outcome === undefined &&
+      value.lastKnown === undefined &&
+      !hasTerminalPayload &&
+      legacy === undefined
+    )
+  }
+
+  private validV2TerminalProof(
+    value: Record<string, unknown>,
+    outcome: TerminalSessionOutcome
+  ): boolean {
+    const child = value.child as Record<string, unknown>
+    const containment = value.containment as SessionRecord['containment']
+    const cleanup = (value.exitReason as { cleanup?: unknown } | undefined)?.cleanup as
+      | Record<string, unknown>
+      | undefined
+    const noChildSpawnFailure =
+      outcome === 'spawn_failed' &&
+      (value.exitReason as { kind?: unknown } | undefined)?.kind === 'spawn_error' &&
+      cleanup?.directChildStarted === false &&
+      cleanup.terminationConfirmed === true
+    return (
+      noChildSpawnFailure ||
+      (child.directExited === true &&
+        (this.containmentDrained(containment) || process.platform === 'darwin'))
+    )
+  }
+
+  private validCompatibilitySession(record: unknown, id: string): record is SessionRecord {
+    if (!record || typeof record !== 'object') return false
+    const value = record as Partial<SessionRecord>
+    return (
+      this.validSession({ ...value, recordVersion: 1 }, id, 1, true) &&
+      (value.streamDrain === undefined ||
+        value.streamDrain === 'drained' ||
+        value.streamDrain === 'unknown') &&
+      (value.lastKnown === undefined ||
+        ['creating', 'running', 'stopping', 'terminal', 'unreachable'].includes(value.lastKnown))
+    )
+  }
+
+  private validSession(
+    record: unknown,
+    id: string,
+    version: 0 | 1,
+    allowV1LegacyTombstone = false
+  ): record is SessionRecord {
     if (!record || typeof record !== 'object') return false
     const value = record as Partial<SessionRecord>
     const validOptionalText = (item: unknown) => item === undefined || validText(item)
@@ -1098,7 +1360,8 @@ export class DaemonStorage {
       if (!tombstone || typeof tombstone !== 'object') return false
       const value = tombstone as Record<string, unknown>
       return (
-        value.sourceRecordVersion === 0 &&
+        (value.sourceRecordVersion === 0 ||
+          (allowV1LegacyTombstone && value.sourceRecordVersion === 1)) &&
         ['creating', 'running', 'stopping', 'terminal', 'unreachable'].includes(
           String(value.lastKnown)
         )
@@ -1217,7 +1480,7 @@ export class DaemonStorage {
     }
     if (
       (version === 0 && value.recordVersion !== undefined) ||
-      (version === 1 && value.recordVersion !== SESSION_RECORD_VERSION) ||
+      (version === 1 && (value as Record<string, unknown>).recordVersion !== 1) ||
       value.id !== id ||
       !validText(value.title) ||
       !validText(value.command) ||
@@ -1416,7 +1679,7 @@ export class DaemonStorage {
     }
     if (removeLegacyOutput) {
       try {
-        // A terminal V0 import can discard its source only after V1 metadata is durable.
+        // A terminal legacy import can discard its source only after V2 metadata is durable.
         await rm(this.legacyOutputPath(record.id), { force: true })
         if (migrated.legacyOutputCleanupPending) {
           const { legacyOutputCleanupPending: _, ...cleared } = migrated

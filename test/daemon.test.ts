@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DaemonServer } from '../src/daemon/server.ts'
+import { sessionStateFromCompatibility } from '../src/daemon/lifecycle.ts'
 import {
   DaemonStorage,
   parseWindowsProcessIdentity,
@@ -171,7 +172,7 @@ function record(
   status: SessionRecord['status'] = 'running'
 ): SessionRecord {
   const now = new Date().toISOString()
-  return {
+  const flat: Omit<SessionRecord, 'state'> = {
     recordVersion: SESSION_RECORD_VERSION,
     id,
     title: id,
@@ -200,6 +201,7 @@ function record(
     outputHasPartialLine: false,
     outputJournalVersion: 2,
   }
+  return { ...flat, state: sessionStateFromCompatibility(flat) }
 }
 
 function directOwner(root: string) {
@@ -219,6 +221,7 @@ function markTerminalProof(session: SessionRecord): void {
     observedEscapedDescendantPids: [],
     verifiedAt: session.updatedAt,
   }
+  session.state = sessionStateFromCompatibility(session)
 }
 
 async function owner(storage: DaemonStorage, parentSessionId: string, projectDirectory: string) {
@@ -1431,7 +1434,7 @@ test('admission is isolated from an unrelated worker snapshot', async () => {
           ownerCapabilityHash: SECOND_OWNER_HASH,
           workdir: root,
         }),
-        Bun.sleep(100).then(() => {
+        Bun.sleep(1500).then(() => {
           throw new Error('Unrelated admission waited for a worker snapshot.')
         }),
       ])
@@ -2869,7 +2872,10 @@ test('invalid persistent fields quarantine before a valid legacy record migrates
   expect(await supervisor.rawOutput(legacy.id)).toMatchObject({ raw: 'legacy\n', byteLength: 7 })
   expect(
     JSON.parse(await readFile(join(root, 'sessions', legacy.id, 'session.json'), 'utf8'))
-  ).toMatchObject({ recordVersion: SESSION_RECORD_VERSION, status: 'exited' })
+  ).toMatchObject({
+    recordVersion: SESSION_RECORD_VERSION,
+    state: { kind: 'terminal', outcome: 'exited' },
+  })
   expect(await Bun.file(join(root, 'sessions', legacy.id, 'output.log')).exists()).toBeFalse()
   expect(await readdir(join(root, 'quarantine'))).toHaveLength(invalid.length)
 })
@@ -2882,17 +2888,13 @@ test('legacy terminal status without explicit proof becomes a cleanup tombstone'
   session.nextSequence = 7
   session.outputBytes = 7
   session.lineCount = 1
-  await storage.writeSession(session)
-  await writeFile(
-    join(root, 'sessions', session.id, 'session.json'),
-    JSON.stringify(
-      Object.fromEntries(
-        Object.entries(session).filter(
-          ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion'
-        )
-      )
+  const legacy = Object.fromEntries(
+    Object.entries(session).filter(
+      ([key]) => key !== 'recordVersion' && key !== 'outputJournalVersion' && key !== 'state'
     )
   )
+  await storage.writeSession(session)
+  await writeFile(join(root, 'sessions', session.id, 'session.json'), JSON.stringify(legacy))
   const legacyOutput = join(root, 'sessions', session.id, 'output.log')
   await writeFile(legacyOutput, 'legacy\n', 'utf8')
 
@@ -2937,7 +2939,7 @@ test('V0 records with null owner fields stay inert beside healthy sessions', asy
   expect(await Bun.file(join(root, 'quarantine')).exists()).toBeFalse()
 })
 
-test('V1 retries legacy output cleanup left after terminal migration', async () => {
+test('V2 retries legacy output cleanup left after terminal migration', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v1-legacy-output-'))
   roots.push(root)
   const storage = new DaemonStorage(root)
@@ -3830,7 +3832,7 @@ test('native exec uses a total stdout/stderr cap and persists terminal storage f
   }
 }, 10_000)
 
-test('native startup failures clean up the direct child and report the proven outcome', async () => {
+test('native startup failures retain unproven child state and report no-child outcomes', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-native-startup-failure-'))
   roots.push(root)
   await stat(nativeWorkerPath)
@@ -3862,7 +3864,8 @@ test('native startup failures clean up the direct child and report the proven ou
     })
     const descriptorRecord = (await storage.loadSessions()).at(-1)
     expect(descriptorRecord).toMatchObject({
-      status: 'spawn_failed',
+      status: 'lost',
+      lastKnown: 'creating',
       terminationConfirmed: true,
       exitReason: { kind: 'spawn_error', cleanup: { terminationConfirmed: true } },
     })
@@ -3963,7 +3966,8 @@ test('native startup failures clean up the direct child and report the proven ou
           record.exitReason.message.includes('failed to assign suspended child to Job Object')
       )
       expect(assignmentRecord).toMatchObject({
-        status: 'spawn_failed',
+        status: 'lost',
+        lastKnown: 'creating',
         workerStartAttempted: true,
         exitReason: {
           cleanup: {
@@ -4025,7 +4029,8 @@ test('native startup failures clean up the direct child and report the proven ou
         record.exitReason.cleanup?.method === 'rollback'
     )
     expect(readinessRecord).toMatchObject({
-      status: 'spawn_failed',
+      status: 'lost',
+      lastKnown: 'creating',
       terminationRequested: true,
       terminationConfirmed: true,
       exitReason: {
@@ -4077,7 +4082,8 @@ test('native startup failures clean up the direct child and report the proven ou
       expect(containmentRecord).toMatchObject(
         process.platform === 'linux' || process.platform === 'win32'
           ? {
-              status: 'spawn_failed',
+              status: 'lost',
+              lastKnown: 'creating',
               terminationRequested: true,
               terminationConfirmed: true,
               exitReason: { cleanup: { directChildPid: expect.any(Number) } },
@@ -4643,7 +4649,8 @@ test('ready-timeout failures retain a verified reference for no-child recovery',
     if (!session) throw new Error('Expected ready-timeout session record.')
     const sessionDirectory = join(root, 'sessions', session.id)
     expect(session).toMatchObject({
-      status: 'spawn_failed',
+      status: 'lost',
+      lastKnown: 'creating',
       workerStartAttempted: false,
       worker: { protocolVersion: 5 },
     })
@@ -6107,7 +6114,9 @@ test('restart cleanup retains a terminal conversation record without proof', asy
   const [stored] = await storage.loadSessions()
   expect(stored).toMatchObject({
     id: session.id,
-    status: 'exited',
+    status: 'lost',
+    lastKnown: 'terminal',
+    pendingCleanup: true,
     terminationConfirmed: true,
   })
   expect(stored?.directChildExited).toBeUndefined()
@@ -7184,7 +7193,7 @@ test('obsolete worker terminal records remain readable and owner-cleanable', asy
   expect(await supervisor.cleanup(session.id)).toBeTrue()
 })
 
-test('V0 migration keeps output.log until V1 metadata is durable', async () => {
+test('V0 migration keeps output.log until V2 metadata is durable', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-v0-recovery-'))
   roots.push(root)
   const storage = new DaemonStorage(root)

@@ -12,7 +12,7 @@ OpenCode host
   -> child process and its platform containment mechanism
 ```
 
-The three layers are justified by distinct trust and failure boundaries. Phase 2 makes control-plane ownership explicit; Phase 1 still needs a discriminated persisted-state model and resource budgets.
+The three layers are justified by distinct trust and failure boundaries. Phase 2 makes control-plane ownership explicit; Phase 1 has cut over persisted state and still needs resource budgets and crash-matrix evidence.
 
 ## Current Responsibility Map
 
@@ -24,7 +24,7 @@ The three layers are justified by distinct trust and failure boundaries. Phase 2
 | Session registry | Session records, full-owner identity checks, conservative admission slots, and slot release | `src/daemon/session-registry.ts` | No worker RPC. Uncertain/lost records retain capacity until strict proof or durable deletion. |
 | Session router | Live worker references, owner-route checks, snapshot-version fences, persistence queue, and mutation lane | `src/daemon/session-router.ts` | No metadata quota logic. Its ordered queues retain the controller-lane and persistence-deadlock invariants. |
 | Journal reader | Output loading, line paging, literal search, and raw output | `src/daemon/journal-reader.ts` | Read-only output boundary; it cannot mutate session state or contact workers. |
-| Storage | Private directory, DACL/POSIX permissions, daemon descriptor/locks, V0/V1 metadata decoding, inert unsupported-record handling, journal read/migration | `src/daemon/storage.ts` | Essential persistence boundary, but it also owns platform process-identity probing. |
+| Storage | Private directory, DACL/POSIX permissions, daemon descriptor/locks, V0/V1/V2 metadata decoding, inert unsupported-record handling, journal read/migration | `src/daemon/storage.ts` | V2 is the only writer; this remains the essential persistence boundary and also owns platform process-identity probing. |
 | Native worker | Prepared authenticated bootstrap, start-frame-gated spawn, terminal/pipe I/O, redaction, journal writing, timeout/stop, platform containment | `worker/src/main.rs`, `src/daemon/worker-client.ts` | The durable pre-activation reference checkpoint closes one lost-worker window; the mixed-platform engine remains hard to audit. |
 | Native child | Actual command, shell, TTY behavior | OS | Must remain the sole process being described by PID and exit result. |
 
@@ -38,9 +38,7 @@ The three layers are justified by distinct trust and failure boundaries. Phase 2
 
 ## Lifecycle as Implemented
 
-`DaemonStatus` currently permits `starting`, `running`, `stopping`, `exited`, `timed_out`, `lost`, `spawn_failed`, and `output_limited` (`src/daemon/types.ts:19-27`). `SessionRecord` then stores independent booleans for timeout, termination requested/confirmed, direct-child exit, pending cleanup, output truncation, and optional containment/termination reports (`src/daemon/types.ts:200-251`).
-
-**Inference:** This permits logically awkward combinations, such as a record that is `lost` yet has a confirmed direct-child exit, or a terminal status whose cleanup is pending. The fields are useful observations but should not all be independently mutable lifecycle state.
+`session.json` is V2-only: its single `state` discriminant is `creating`, `running`, `stopping`, `terminal`, `unreachable`, or `cleaning`. Terminal payloads retain direct-child, drain, containment, and termination observations; an unproven terminal transition becomes `unreachable { lastKnown: terminal }` with that payload preserved. V0 and V1 decode into this representation, while the in-memory flat fields remain a non-persisted compatibility projection for the existing RPC shape.
 
 Current transitions include:
 
@@ -50,14 +48,14 @@ starting -> spawn_failed | lost
 running  -> timed_out | output_limited | exited | lost
 ```
 
-`src/daemon/lifecycle.ts` now supplies a pure reducer for the persisted status names. `SessionSupervisor.transition()` is the status-mutation gateway, and rejected snapshot transitions return before they can overwrite newer facts. `SessionRouter` owns a per-session controller lane for write, send-and-wait input acceptance, resize, stop, finalization, cleanup marking, and durable deletion; reads remain concurrent through `JournalReader`. Router persistence and mutation queues remain separate to avoid recursive finalization persistence deadlocks. The final discriminated persisted state model remains future Phase 1 work.
+`src/daemon/lifecycle.ts` supplies the pure V2 state reducer. `SessionSupervisor.transition()` refreshes observations, reduces V2 state, and only then projects status for compatibility; rejected snapshot transitions remain inert. `SessionRouter` owns a per-session controller lane for write, send-and-wait input acceptance, resize, stop, finalization, cleanup marking, and durable deletion; reads remain concurrent through `JournalReader`. Router persistence and mutation queues remain separate to avoid recursive finalization persistence deadlocks.
 
 ## Confirmed Problems
 
 | Severity | Finding | Evidence | Root cause family |
 | --- | --- | --- | --- |
 | High | Windows ConPTY behavior has only one-host validation | Initial local `bun package:smoke` failure; guarded local package contract then passed 20/20 | Platform launch behavior needs the published Windows-version matrix and close-order evidence. |
-| Medium | Persisted state is still status plus mutable observations | `src/daemon/types.ts:17-240`; reducer in `src/daemon/lifecycle.ts` | The reducer prevents known regressions, but a discriminated persisted terminal/tombstone model is not implemented yet. |
+| Medium | Aggregate resource policy is still absent | `src/daemon/server.ts`, `src/daemon/supervisor.ts` | Per-session limits exist, but waits, retained bytes, and terminal-tombstone retention still lack declared global budgets. |
 | High | Worker-RPC-loss fallback kills only the worker PID | `WorkerClient.terminateOrphan` at `src/daemon/worker-client.ts:604-640`; POSIX child is in a separate session | Descriptor retention now preserves later reaping evidence, but orphan cleanup cannot claim child containment after control-plane loss. |
 | Medium | Worker journal sharing-violation policy differs from daemon metadata writes | `worker/src/main.rs`; `src/daemon/storage.ts:130-155` | Standard atomic rename is validated locally, but worker journal writes do not share daemon retry classification. |
 
@@ -71,7 +69,7 @@ The Phase 0 full-suite run also found a separate exec fault-path ambiguity. The 
 
 ## Phase 1 Update
 
-The reducer accepts the existing persisted status vocabulary and rejects stale regressions, including `stopping -> running`. A rejected worker snapshot is fully inert: it cannot overwrite termination, exit, output, or containment facts. An authenticated `lost -> recovered -> running` transition exists only in persistent recovery after a fresh non-lost worker snapshot; ordinary worker-ready snapshots cannot revive a tombstone.
+V2 is the only persisted-session writer. Its pure reducer rejects stale regressions, including `stopping -> running`; a rejected worker snapshot is fully inert. The reducer retains a terminal payload when control becomes unreachable, and an authenticated `lost -> recovered -> running` projection exists only in persistent recovery after a fresh non-lost worker snapshot. Cleaning cannot revive a session.
 
 Idempotent PTY reuse now requires the complete owner identity: parent session, canonical project directory, capability hash, canonical workdir, key, and matching specification. It no longer relies on an undocumented host session-ID uniqueness property.
 
@@ -89,7 +87,7 @@ State-changing operations have a per-session controller lane. A write or send-an
 
 `SessionRegistry` owns the records and conservative full-owner admission slots. `SessionRouter` owns worker handles, owner-route checks, snapshot versions, and the ordered mutation/persistence queues. `JournalReader` owns all journal paging/search/raw reads. `SessionSupervisor` remains the narrow public facade and native lifecycle coordinator; it does not retain another record, quota, worker, or journal implementation.
 
-New records are strict V1 metadata. Before any validation, journal migration, or recovery, storage decodes an unversioned V0 record. A V0 record needs a canonical owner tuple with a lowercase SHA-256 capability hash, explicit `directChildExited`, and explicit drained containment before it is rewritten as V1 terminal metadata. A V0 record that was live, lost, or only terminal-looking becomes a `lost` conversation tombstone with `pendingCleanup`, retains `output.log`, and cannot re-enter ordinary recovery or idempotent reuse. A proven terminal import persists a cleanup marker before removing `output.log`; V1 retries removal after a crash/failure. Null, incomplete, or unknown-version owner artifacts are skipped in place without rewriting or quarantining the source artifact, so they cannot block healthy session loading. Descriptor deletion is now atomic with session-directory deletion: unconfirmed startup rollback or failed deletion retains `worker.json`, and authenticated orphan reaping remains possible. Worker references with an incompatible protocol are similarly retained as read-only tombstones and are never reconnected, signaled, or orphan-killed. This is a compatibility fence, not the final discriminated persisted-state model.
+Before validation, journal migration, or recovery, storage dispatches explicit V0, V1, and V2 decoders. V0/V1 records need a canonical owner tuple with a lowercase SHA-256 capability hash plus direct-child/containment proof to import as V2 terminal state with unknown stream drain. Live or unproven legacy records become forced-conversation cleanup-only V2 unreachable tombstones and retain legacy output. Explicit V0, future, incomplete, and null-owner artifacts are skipped in place without rewriting or quarantining the source artifact. A proven terminal import persists a cleanup marker before removing `output.log`; V2 retries removal after a crash/failure. Descriptor deletion is atomic with session-directory deletion: unconfirmed startup rollback or failed deletion retains `worker.json`, and authenticated orphan reaping remains possible. Incompatible worker references remain read-only tombstones and are never reconnected, signaled, or orphan-killed.
 
 ## What Is Essential Versus Accidental
 
