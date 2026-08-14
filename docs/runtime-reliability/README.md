@@ -1,6 +1,6 @@
 # Runtime Reliability Investigation
 
-**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open. Phase 2 has removed the daemon-side direct-exec path and replaced global admission polling with conservative per-owner reservations; controller lanes and unified shutdown remain open.
+**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open. Phase 2 has removed the daemon-side direct-exec path, replaced global admission polling with conservative per-owner reservations, and given every state-changing session operation one controller lane; only the planned responsibility split remains.
 
 This directory is the engineering record for rebuilding the process and terminal runtime. It deliberately treats `shekohex/opencode-pty` as historical input rather than a design authority.
 
@@ -57,6 +57,8 @@ This directory is the engineering record for rebuilding the process and terminal
 | Reuse fresh shutdown proof for normal terminal cleanup | Implemented checkpoint | A session that already proved terminal shutdown in-process can delete without a redundant reconnect, while crash-recovered terminal records still require fresh authenticated shutdown proof. |
 | Use conservative per-owner reservations for admission | Implemented Phase 2 slice | A full-owner slot is reserved before the first record write; matching PTY reuse happens first, first-write failure releases, and uncertain/lost records continue to occupy capacity until strict proof or durable deletion releases them. |
 | Remove daemon-side direct exec | Implemented Phase 2 slice | All supported exec requests now use the native worker path; list reads metadata without snapshotting workers. |
+| Serialize session mutations | Implemented Phase 2 slice | Writes, send-and-wait input acceptance, resize, stop, finalization, cleanup marking, and durable deletion share one per-session lane. |
+| Unify daemon shutdown | Implemented Phase 2 slice | `stop`, synchronous disposal, and async disposal share one idempotent descriptor-cleanup path. |
 
 ## Completion Gates
 

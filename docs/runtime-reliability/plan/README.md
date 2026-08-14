@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 0 | Locally green, externally incomplete | [00-recover-baseline.md](00-recover-baseline.md) | Explain and regress Windows ConPTY failure; restore deterministic test baseline. |
 | 1 | In progress | [01-contract-and-state.md](01-contract-and-state.md) | Freeze portable contract, ownership, budgets, and state transition model. |
-| 2 | In progress | [02-simplify-control-plane.md](02-simplify-control-plane.md) | Delete duplicate exec and global admission polling; introduce single authoritative controller/registry flow. |
+| 2 | In progress | [02-simplify-control-plane.md](02-simplify-control-plane.md) | Duplicate exec/global admission polling are deleted and controller lanes are live; the planned responsibility split remains. |
 | 3 | Pending | [03-native-engine-and-security.md](03-native-engine-and-security.md) | Narrow engine boundary, complete platform lifecycle policy, fix security/resource rules. |
 | 4 | Pending | [04-verification-and-release.md](04-verification-and-release.md) | Green native/package contract matrix and release evidence. |
 

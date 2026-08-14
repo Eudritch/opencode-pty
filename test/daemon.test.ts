@@ -1401,6 +1401,117 @@ test('admission is isolated from an unrelated worker snapshot', async () => {
   }
 })
 
+test('controller lane orders writes before stop and rejects later resize', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-controller-lane-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_controller_lane')
+  storage.writeSession = async () => {}
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitedAt: new Date().toISOString(),
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  const operations: string[] = []
+  const worker = {
+    write: async () => {
+      operations.push('write')
+      return { arrivalSequence: 0 }
+    },
+    resize: async () => ({ cols: 80, rows: 24 }),
+    stop: async () => {
+      operations.push('stop')
+      return terminal
+    },
+    finalSnapshot: async () => terminal,
+    shutdown: async () => terminal,
+  }
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(
+    session.id,
+    worker
+  )
+
+  const write = supervisor.write(session.id, 'input')
+  const stop = supervisor.stop(session.id)
+  const resize = supervisor.resize(session.id, 80, 24)
+
+  const [written, stopped, resized] = await Promise.allSettled([write, stop, resize])
+  expect(written).toMatchObject({ status: 'fulfilled', value: { acceptedBytes: 5 } })
+  expect(stopped).toMatchObject({
+    status: 'fulfilled',
+    value: { requested: true, terminationConfirmed: true },
+  })
+  expect(resized).toMatchObject({ status: 'rejected', reason: { code: 'session_closed' } })
+  expect(operations).toEqual(['write', 'stop'])
+})
+
+test('controller lane ignores a queued duplicate terminal finalizer', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-controller-finalizer-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const session = record(root, 'pty_controller_finalizer')
+  await storage.writeSession(session)
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+  const terminal = workerSnapshot({
+    status: 'exited',
+    exitedAt: new Date().toISOString(),
+    terminationConfirmed: true,
+    directChildExited: true,
+    stdoutEof: true,
+    stderrEof: true,
+    outputComplete: true,
+  })
+  let snapshots = 0
+  const worker = {
+    finalSnapshot: async () => {
+      snapshots += 1
+      return terminal
+    },
+    shutdown: async () => terminal,
+  }
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(
+    session.id,
+    worker
+  )
+
+  await Promise.all([
+    (
+      supervisor as unknown as {
+        finalizeNative: (
+          record: SessionRecord,
+          worker: unknown,
+          result: WorkerSnapshot
+        ) => Promise<unknown>
+      }
+    ).finalizeNative(session, worker, terminal),
+    (
+      supervisor as unknown as {
+        finalizeNative: (
+          record: SessionRecord,
+          worker: unknown,
+          result: WorkerSnapshot
+        ) => Promise<unknown>
+      }
+    ).finalizeNative(session, worker, terminal),
+  ])
+
+  expect(snapshots).toBe(1)
+  expect(session.status).toBe('exited')
+})
+
 test.skipIf(process.platform === 'win32')(
   'conversation cleanup excludes persistent sessions and environment values stay out of records',
   async () => {

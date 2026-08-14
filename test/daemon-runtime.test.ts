@@ -172,6 +172,24 @@ test('server RPC reports the limit code for deliberate session limits', async ()
   }
 }, 20_000)
 
+test('server stop and disposal share descriptor cleanup', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-runtime-dispose-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const first = new DaemonServer(storage, new SessionSupervisor(storage), 'first-token')
+  await first.start()
+  await first[Symbol.asyncDispose]()
+  expect(await storage.readDescriptor()).toBeNull()
+  await expect(first.stop()).resolves.toBeUndefined()
+
+  const second = new DaemonServer(storage, new SessionSupervisor(storage), 'second-token')
+  await second.start()
+  second[Symbol.dispose]()
+  for (let attempt = 0; attempt < 20 && (await storage.readDescriptor()); attempt += 1)
+    await Bun.sleep(10)
+  expect(await storage.readDescriptor()).toBeNull()
+}, 20_000)
+
 test('sessions without an explicit workdir run in the owner project directory', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-runtime-workdir-'))
   roots.push(root)

@@ -24,6 +24,7 @@
 | A post-start no-child receipt needs both the retained descriptor and a full compatible worker reference | `WorkerClient.hasVerifiedNoChildSpawnFailureReceipt()`, `spawn_failed` recovery tests, and invalid-command cleanup |
 | Normal terminal cleanup reuses fresh shutdown proof only within the running daemon; restart still requires a fresh authenticated shutdown for conversation workers | `SessionSupervisor.finalizeNativeVersion()`, `cleanup()`, and terminal cleanup tests |
 | Per-owner session admission reserves before the first record write and remains conservative after uncertainty | `SessionSupervisor.reserveSlot()`, `rebuildOwnerSlots()`, `releaseSlotIfSettled()`, and reservation tests |
+| One per-session lane serializes state-changing control operations | `SessionSupervisor.enqueueMutation()`, controller-lane and terminal-finalization tests |
 
 ## Findings and Required Target Rules
 

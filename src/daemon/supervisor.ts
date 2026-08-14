@@ -215,6 +215,7 @@ export class SessionSupervisor {
   private readonly nativeWorkers = new Map<string, WorkerClient>()
   private readonly nativeVersions = new Map<string, number>()
   private readonly nativePersists = new Map<string, Promise<void>>()
+  private readonly nativeMutations = new Map<string, Promise<void>>()
   private readonly nativeFinalizations = new Map<string, Promise<ExecResult | PTYSessionInfo>>()
   private readonly pendingConversationCleanup = new Map<string, Promise<void>>()
   private readonly confirmedWorkerShutdowns = new Set<string>()
@@ -522,18 +523,20 @@ export class SessionSupervisor {
 
   async write(id: string, data: string): Promise<WriteResult> {
     await this.flush()
-    const worker = this.nativeWorkers.get(id)
-    const record = this.recordFor(id)
-    if (!worker || record.status !== 'running' || record.pendingCleanup)
-      throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
-    try {
-      await worker.write(data)
-      return { acceptedBytes: Buffer.byteLength(data), acceptedCharacters: [...data].length }
-    } catch (error) {
-      throw new ProcessError(
-        `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
+    return this.enqueueMutation(id, async () => {
+      const worker = this.nativeWorkers.get(id)
+      const record = this.recordFor(id)
+      if (!worker || record.status !== 'running' || record.pendingCleanup)
+        throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
+      try {
+        await worker.write(data)
+        return { acceptedBytes: Buffer.byteLength(data), acceptedCharacters: [...data].length }
+      } catch (error) {
+        throw new ProcessError(
+          `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    })
   }
 
   async sendWait(
@@ -544,20 +547,21 @@ export class SessionSupervisor {
   ): Promise<WaitResult> {
     await this.flush()
     this.validateWait(condition, timeoutSeconds)
-    const worker = this.nativeWorkers.get(id)
-    const record = this.recordFor(id)
-    if (!worker || record.status !== 'running' || record.pendingCleanup)
-      throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
-    let afterSequence: number
-    try {
-      // The worker returns the cursor at the input acceptance boundary. On Windows this is before
-      // WriteFile because ConPTY reads block and an immediate echo may be published concurrently.
-      afterSequence = (await worker.write(data)).arrivalSequence
-    } catch (error) {
-      throw new ProcessError(
-        `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
+    const afterSequence = await this.enqueueMutation(id, async () => {
+      const worker = this.nativeWorkers.get(id)
+      const record = this.recordFor(id)
+      if (!worker || record.status !== 'running' || record.pendingCleanup)
+        throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
+      try {
+        // The worker returns the cursor at the input acceptance boundary. On Windows this is before
+        // WriteFile because ConPTY reads block and an immediate echo may be published concurrently.
+        return (await worker.write(data)).arrivalSequence
+      } catch (error) {
+        throw new ProcessError(
+          `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    })
     return this.wait(
       id,
       { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
@@ -567,13 +571,15 @@ export class SessionSupervisor {
 
   async resize(id: string, cols: number, rows: number): Promise<{ cols: number; rows: number }> {
     await this.flush()
-    const record = this.recordFor(id)
-    if (record.mode !== 'pty') throw new Error(`Session '${id}' is not a PTY.`)
-    if (record.status !== 'running' || record.pendingCleanup)
-      throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
-    const worker = this.nativeWorkers.get(id)
-    if (!worker) throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
-    return worker.resize(cols, rows)
+    return this.enqueueMutation(id, async () => {
+      const record = this.recordFor(id)
+      if (record.mode !== 'pty') throw new Error(`Session '${id}' is not a PTY.`)
+      if (record.status !== 'running' || record.pendingCleanup)
+        throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
+      const worker = this.nativeWorkers.get(id)
+      if (!worker) throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
+      return worker.resize(cols, rows)
+    })
   }
 
   async wait(id: string, condition: WaitCondition, timeoutSeconds: number): Promise<WaitResult> {
@@ -853,6 +859,15 @@ export class SessionSupervisor {
     worker: WorkerClient,
     error: unknown
   ): Promise<void> {
+    return this.enqueueMutation(record.id, () => this.rollbackNativeInLane(record, worker, error))
+  }
+
+  private async rollbackNativeInLane(
+    record: SessionRecord,
+    worker: WorkerClient,
+    error: unknown
+  ): Promise<void> {
+    if (this.nativeWorkers.get(record.id) !== worker) return
     const version = this.bumpNativeVersion(record.id)
     const cleanup = await worker.rollback().catch((rollbackError) => ({
       requested: false,
@@ -882,6 +897,16 @@ export class SessionSupervisor {
     worker: WorkerClient,
     result: WorkerSnapshot
   ): Promise<ExecResult | PTYSessionInfo> {
+    return this.enqueueMutation(record.id, () => this.finalizeNativeInLane(record, worker, result))
+  }
+
+  private async finalizeNativeInLane(
+    record: SessionRecord,
+    worker: WorkerClient,
+    result: WorkerSnapshot
+  ): Promise<ExecResult | PTYSessionInfo> {
+    // A queued duplicate can run after the first finalizer removed this worker.
+    if (this.nativeWorkers.get(record.id) !== worker) return this.toInfo(record)
     const existing = this.nativeFinalizations.get(record.id)
     if (existing) return existing
     const version = this.bumpNativeVersion(record.id)
@@ -906,7 +931,7 @@ export class SessionSupervisor {
     let final = result
     try {
       if (this.nativeTerminal(result)) final = await worker.finalSnapshot()
-      return await this.finishNative(record, final, version, this.nativeTerminal(final))
+      return await this.finishNativeInLane(record, final, version, this.nativeTerminal(final))
     } catch (error) {
       await this.persistNativeFinalizationFailure(record, final, error)
       const failure = new Error(`Native finalization failed: ${String(error)}`)
@@ -926,6 +951,17 @@ export class SessionSupervisor {
   }
 
   private async finishNative(
+    record: SessionRecord,
+    result: WorkerSnapshot,
+    version = this.nativeVersion(record.id),
+    terminal = false
+  ): Promise<ExecResult | PTYSessionInfo> {
+    return this.enqueueMutation(record.id, () =>
+      this.finishNativeInLane(record, result, version, terminal)
+    )
+  }
+
+  private async finishNativeInLane(
     record: SessionRecord,
     result: WorkerSnapshot,
     version = this.nativeVersion(record.id),
@@ -1180,31 +1216,32 @@ export class SessionSupervisor {
 
   async stop(id: string): Promise<StopResult> {
     await this.flush()
-    const native = this.nativeWorkers.get(id)
-    if (native) {
-      const record = this.recordFor(id)
-      record.terminationRequested = true
-      this.transition(record, 'stop_requested')
-      await this.storage.writeSession(record)
-      const result = await native.stop()
-      await this.finalizeNative(record, native, result)
+    return this.enqueueMutation(id, async () => {
+      const native = this.nativeWorkers.get(id)
+      if (native) {
+        const record = this.recordFor(id)
+        record.terminationRequested = true
+        this.transition(record, 'stop_requested')
+        await this.storage.writeSession(record)
+        await this.finalizeNativeInLane(record, native, await native.stop())
+        return {
+          requested: true,
+          terminationConfirmed: record.terminationConfirmed,
+          directChildExited: record.directChildExited,
+          containment: record.containment,
+          termination: record.termination,
+        }
+      }
+      const record = this.records.get(id)
+      if (!record) throw new DaemonError(`PTY session '${id}' not found.`, 'not_found')
       return {
-        requested: true,
+        requested: false,
         terminationConfirmed: record.terminationConfirmed,
         directChildExited: record.directChildExited,
         containment: record.containment,
         termination: record.termination,
       }
-    }
-    const record = this.records.get(id)
-    if (!record) throw new DaemonError(`PTY session '${id}' not found.`, 'not_found')
-    return {
-      requested: false,
-      terminationConfirmed: record.terminationConfirmed,
-      directChildExited: record.directChildExited,
-      containment: record.containment,
-      termination: record.termination,
-    }
+    })
   }
 
   async cleanup(id: string): Promise<boolean> {
@@ -1298,9 +1335,12 @@ export class SessionSupervisor {
     const existing = this.pendingConversationCleanup.get(record.id)
     if (existing) return existing
     const cleanup = (async () => {
-      record.pendingCleanup = true
-      await this.storage.writeSession(record)
-      if (record.status === 'lost' || !activeStatus(record)) {
+      const active = await this.enqueueMutation(record.id, async () => {
+        record.pendingCleanup = true
+        await this.storage.writeSession(record)
+        return activeStatus(record)
+      })
+      if (record.status === 'lost' || !active) {
         await this.cleanup(record.id)
         return
       }
@@ -1489,17 +1529,33 @@ export class SessionSupervisor {
     return result
   }
 
-  private deleteNativeSession(record: SessionRecord): Promise<boolean> {
-    return this.enqueueNativePersist(record.id, async () => {
-      if (this.records.get(record.id) !== record) return false
-      this.bumpNativeVersion(record.id)
-      this.nativeWorkers.delete(record.id)
-      await this.storage.deleteSession(record.id)
-      this.confirmedWorkerShutdowns.delete(record.id)
-      this.releaseSlot(record.id)
-      this.records.delete(record.id)
-      return true
+  private enqueueMutation<T>(id: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.nativeMutations.get(id) ?? Promise.resolve()
+    const result = previous.then(task, task)
+    const settled = result.then(
+      () => undefined,
+      () => undefined
+    )
+    this.nativeMutations.set(id, settled)
+    void settled.then(() => {
+      if (this.nativeMutations.get(id) === settled) this.nativeMutations.delete(id)
     })
+    return result
+  }
+
+  private deleteNativeSession(record: SessionRecord): Promise<boolean> {
+    return this.enqueueMutation(record.id, () =>
+      this.enqueueNativePersist(record.id, async () => {
+        if (this.records.get(record.id) !== record) return false
+        this.bumpNativeVersion(record.id)
+        this.nativeWorkers.delete(record.id)
+        await this.storage.deleteSession(record.id)
+        this.confirmedWorkerShutdowns.delete(record.id)
+        this.releaseSlot(record.id)
+        this.records.delete(record.id)
+        return true
+      })
+    )
   }
 
   private idempotentSession(options: SpawnOptions, args: string[]): SessionRecord | undefined {

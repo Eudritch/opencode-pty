@@ -61,8 +61,9 @@ export function classifyRpcFailure(error: unknown): RpcFailure['error']['code'] 
   return 'internal'
 }
 
-export class DaemonServer implements Disposable {
+export class DaemonServer implements Disposable, AsyncDisposable {
   private server: ReturnType<typeof Bun.serve> | null = null
+  private stopPromise: Promise<void> | null = null
   private readonly inputUsage = new Map<string, { startedAt: number; bytes: number }>()
   private approvalWrites: Promise<void> = Promise.resolve()
   private readonly approvalClaimTokens = new Map<string, string>()
@@ -123,14 +124,25 @@ export class DaemonServer implements Disposable {
   }
 
   async stop(): Promise<void> {
-    this.server?.stop()
+    this.stopPromise ??= this.stopOnce()
+    return this.stopPromise
+  }
+
+  private async stopOnce(): Promise<void> {
+    const server = this.server
+    this.server = null
+    server?.stop()
     await this.supervisor.shutdown()
     await this.supervisor.flush()
     await this.storage.removeDescriptor(this.token, this.processIdentity)
   }
 
   [Symbol.dispose](): void {
-    this.server?.stop(true)
+    void this.stop().catch((error) => console.warn(`PTY daemon shutdown failed: ${String(error)}`))
+  }
+
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.stop()
   }
 
   private async handle(request: Request): Promise<Response> {
