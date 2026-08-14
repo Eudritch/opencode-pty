@@ -3,7 +3,10 @@ import { join, resolve } from 'node:path'
 import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../plugin/pty/types.ts'
 import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import { DaemonError } from './errors.ts'
+import { JournalReader, lineCount } from './journal-reader.ts'
 import { isActiveDaemonStatus, reduceDaemonStatus, type LifecycleEvent } from './lifecycle.ts'
+import { containmentDrained, SessionRegistry, terminalDirectChild } from './session-registry.ts'
+import { SessionRouter } from './session-router.ts'
 import type { DaemonStorage } from './storage.ts'
 import type { SpawnFailure } from './types.ts'
 import {
@@ -62,12 +65,6 @@ interface PendingWait {
   settled: boolean
 }
 
-interface SessionReservation {
-  id: string
-  ownerKey: string
-  state: 'reserved' | 'committed' | 'released'
-}
-
 export class ProcessError extends Error {
   constructor(
     message: string,
@@ -84,40 +81,6 @@ export function effectiveMaxOutputBytes(value = process.env.PTY_MAX_OUTPUT_BYTES
     : DEFAULT_MAX_OUTPUT_BYTES
 }
 
-function lineCount(output: string): number {
-  if (!output) return 0
-  const lines = output.split('\n')
-  return lines.at(-1) === '' ? lines.length - 1 : lines.length
-}
-
-function outputLines(
-  output: string,
-  firstSequence: number
-): Array<{ lineNumber: number; sequence: number; text: string }> {
-  if (!output) return []
-  const parts = output.split('\n')
-  const count = output.endsWith('\n') ? parts.length - 1 : parts.length
-  let sequence = firstSequence
-  return parts.slice(0, count).map((text, index) => {
-    const line = { lineNumber: index + 1, sequence, text }
-    sequence += Buffer.byteLength(text) + (index < parts.length - 1 ? 1 : 0)
-    return line
-  })
-}
-
-function searchLines(
-  output: string,
-  pattern: string,
-  ignoreCase: boolean,
-  firstSequence: number
-): Array<{ lineNumber: number; sequence: number; text: string }> {
-  const needle = ignoreCase ? pattern.toLowerCase() : pattern
-  return outputLines(output, firstSequence).filter(({ text }) => {
-    const haystack = ignoreCase ? text.toLowerCase() : text
-    return Boolean(text) && haystack.includes(needle)
-  })
-}
-
 function safeRegex(pattern: string): RegExp {
   if (pattern.length > 512 || /[()*+?{|}]/.test(pattern) || /\\[1-9]/.test(pattern)) {
     throw new Error('Regex wait pattern is outside the limited-safe subset.')
@@ -131,26 +94,6 @@ function safeRegex(pattern: string): RegExp {
 
 function activeStatus(record: SessionRecord): boolean {
   return isActiveDaemonStatus(record.status)
-}
-
-function containmentDrained(
-  record: Pick<SessionRecord, 'containment' | 'terminationConfirmed' | 'directChildExited'>
-): boolean {
-  return (
-    record.containment?.status === 'posix_best_effort_empty' ||
-    record.containment?.status === 'windows_job_empty' ||
-    record.containment?.status === 'not_applicable'
-  )
-}
-
-function terminalDirectChild(
-  record: Pick<SessionRecord, 'containment' | 'terminationConfirmed' | 'directChildExited'>
-): boolean {
-  return (
-    record.terminationConfirmed &&
-    record.directChildExited === true &&
-    (containmentDrained(record) || process.platform === 'darwin')
-  )
 }
 
 // Sessions without an explicit workdir run in the owner's project directory, never in whatever
@@ -210,17 +153,13 @@ export function runtimeEnvironment(
 }
 
 export class SessionSupervisor {
-  private readonly records = new Map<string, SessionRecord>()
+  private readonly registry = new SessionRegistry()
   private readonly waits = new Map<string, PendingWait[]>()
-  private readonly nativeWorkers = new Map<string, WorkerClient>()
-  private readonly nativeVersions = new Map<string, number>()
-  private readonly nativePersists = new Map<string, Promise<void>>()
-  private readonly nativeMutations = new Map<string, Promise<void>>()
+  private readonly router = new SessionRouter(this.registry)
   private readonly nativeFinalizations = new Map<string, Promise<ExecResult | PTYSessionInfo>>()
   private readonly pendingConversationCleanup = new Map<string, Promise<void>>()
   private readonly confirmedWorkerShutdowns = new Set<string>()
-  private readonly ownerSlots = new Map<string, Set<string>>()
-  private readonly slotOwnerBySessionId = new Map<string, string>()
+  private readonly journal: JournalReader
   private persistQueue = Promise.resolve()
 
   constructor(
@@ -228,7 +167,17 @@ export class SessionSupervisor {
     private readonly maxOutputBytes: number = effectiveMaxOutputBytes(),
     private readonly recoveryAttempts = 30,
     private readonly recoveryRetryMs = 100
-  ) {}
+  ) {
+    this.journal = new JournalReader(storage, () => this.flush())
+  }
+
+  private get records(): Map<string, SessionRecord> {
+    return this.registry.records
+  }
+
+  private get nativeWorkers(): Map<string, WorkerClient> {
+    return this.router.workers
+  }
 
   async initialize(reconnect = true): Promise<void> {
     await this.storage.initialize()
@@ -259,7 +208,7 @@ export class SessionSupervisor {
         await this.storage.writeSession(record)
       }
     }
-    this.rebuildOwnerSlots()
+    this.registry.rebuildSlots()
     if (reconnect) {
       await this.reconcileWorkers()
     }
@@ -431,14 +380,14 @@ export class SessionSupervisor {
       outputHasPartialLine: false,
       outputJournalVersion: OUTPUT_JOURNAL_VERSION,
     }
-    const reservation = this.reserveSlot(record, maxSessionsPerOwner)
+    const reservation = this.registry.reserve(record, maxSessionsPerOwner)
     this.records.set(id, record)
-    this.commitReservation(reservation)
+    this.registry.commit(reservation)
     try {
       await this.storage.writeSession(record)
     } catch (error) {
       this.records.delete(id)
-      this.releaseReservation(reservation)
+      this.registry.releaseReservation(reservation)
       throw error
     }
     let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
@@ -511,7 +460,7 @@ export class SessionSupervisor {
       }
       record.updatedAt = new Date().toISOString()
       await this.storage.writeSession(record)
-      this.releaseSlotIfSettled(record)
+      this.registry.releaseIfSettled(record)
       if (error instanceof WorkerStartError && error.noWorkerSpawned)
         await this.deleteNativeSession(record).catch(() => false)
       throw new ProcessError(
@@ -681,14 +630,14 @@ export class SessionSupervisor {
       outputHasPartialLine: false,
       outputJournalVersion: OUTPUT_JOURNAL_VERSION,
     }
-    const reservation = this.reserveSlot(record, maxSessionsPerOwner)
+    const reservation = this.registry.reserve(record, maxSessionsPerOwner)
     this.records.set(id, record)
-    this.commitReservation(reservation)
+    this.registry.commit(reservation)
     try {
       await this.storage.writeSession(record)
     } catch (error) {
       this.records.delete(id)
-      this.releaseReservation(reservation)
+      this.registry.releaseReservation(reservation)
       throw error
     }
     const redactionSecrets = Object.entries(environment)
@@ -761,7 +710,7 @@ export class SessionSupervisor {
       record.exitReason = { kind: 'spawn_error', message: String(error), cleanup }
       record.updatedAt = new Date().toISOString()
       await this.storage.writeSession(record)
-      this.releaseSlotIfSettled(record)
+      this.registry.releaseIfSettled(record)
       if (error instanceof WorkerStartError && error.noWorkerSpawned)
         await this.deleteNativeSession(record).catch(() => false)
       throw new ProcessError(String(error), { cleanup })
@@ -1048,7 +997,7 @@ export class SessionSupervisor {
       Object.assign(failure, { code: 'ESTORAGE' })
       throw failure
     }
-    this.releaseSlotIfSettled(record)
+    this.registry.releaseIfSettled(record)
     this.resolveOutputWaits(record)
     if (!activeStatus(record)) this.resolveExitWaits(record)
     if (
@@ -1104,25 +1053,7 @@ export class SessionSupervisor {
   }
 
   async read(id: string, offset = 0, limit?: number, sequence?: number): Promise<ReadResult> {
-    const record = this.recordFor(id)
-    const output = await this.outputFor(id)
-    const lines = outputLines(output, record.firstRetainedSequence).filter(
-      (line) => sequence === undefined || line.sequence >= sequence
-    )
-    const start = Math.max(0, offset)
-    const page = limit === undefined ? lines.slice(start) : lines.slice(start, start + limit)
-    return {
-      lines: page.map((line) => line.text),
-      sequences: page.map((line) => line.sequence),
-      totalLines: lines.length,
-      offset: start,
-      hasMore: start + page.length < lines.length,
-      firstRetainedSequence: record.firstRetainedSequence,
-      nextSequence: record.nextSequence,
-      truncated: record.outputTruncated,
-      containment: record.containment,
-      termination: record.termination,
-    }
+    return this.journal.read(this.recordFor(id), offset, limit, sequence)
   }
 
   async search(
@@ -1133,25 +1064,7 @@ export class SessionSupervisor {
     limit?: number,
     sequence?: number
   ): Promise<SearchResult> {
-    const record = this.recordFor(id)
-    const output = await this.outputFor(id)
-    const matches = searchLines(output, pattern, ignoreCase, record.firstRetainedSequence).filter(
-      (match) => sequence === undefined || match.sequence >= sequence
-    )
-    const start = Math.max(0, offset)
-    const page = limit === undefined ? matches.slice(start) : matches.slice(start, start + limit)
-    return {
-      matches: page,
-      totalMatches: matches.length,
-      totalLines: lineCount(output),
-      offset: start,
-      hasMore: start + page.length < matches.length,
-      firstRetainedSequence: record.firstRetainedSequence,
-      nextSequence: record.nextSequence,
-      truncated: record.outputTruncated,
-      containment: record.containment,
-      termination: record.termination,
-    }
+    return this.journal.search(this.recordFor(id), pattern, ignoreCase, offset, limit, sequence)
   }
 
   async get(id: string): Promise<PTYSessionInfo | null> {
@@ -1175,13 +1088,7 @@ export class SessionSupervisor {
     projectDirectory: string,
     capabilityHash: string
   ): boolean {
-    const record = this.records.get(id)
-    return Boolean(
-      record &&
-        record.parentSessionId === parentSessionId &&
-        record.ownerProjectDirectory === projectDirectory &&
-        record.ownerCapabilityHash === capabilityHash
-    )
+    return this.router.owns(id, parentSessionId, projectDirectory, capabilityHash)
   }
 
   async rawOutput(id: string): Promise<{
@@ -1193,13 +1100,7 @@ export class SessionSupervisor {
     await this.flush()
     const record = this.records.get(id)
     if (!record) return null
-    const raw = await this.storage.readOutput(id)
-    return {
-      raw,
-      byteLength: Buffer.byteLength(raw),
-      containment: record.containment,
-      termination: record.termination,
-    }
+    return this.journal.raw(record)
   }
 
   async execOutput(id: string): Promise<import('./types.ts').ExecOutput | null> {
@@ -1379,12 +1280,6 @@ export class SessionSupervisor {
     }
   }
 
-  private async outputFor(id: string): Promise<string> {
-    this.recordFor(id)
-    await this.persistQueue
-    return this.storage.readOutput(id)
-  }
-
   private enqueuePersist(task: () => Promise<void>): void {
     this.persistQueue = this.persistQueue.then(task, task)
   }
@@ -1394,68 +1289,6 @@ export class SessionSupervisor {
       record.worker !== undefined &&
       record.worker.protocolVersion !== NATIVE_WORKER_PROTOCOL_VERSION
     )
-  }
-
-  private ownerKey(
-    record: Pick<SessionRecord, 'parentSessionId' | 'ownerProjectDirectory' | 'ownerCapabilityHash'>
-  ): string {
-    return `${record.parentSessionId}\0${record.ownerProjectDirectory}\0${record.ownerCapabilityHash}`
-  }
-
-  private occupiesSlot(record: SessionRecord): boolean {
-    return !(
-      terminalDirectChild(record) ||
-      (record.exitReason?.kind === 'spawn_error' &&
-        record.exitReason.cleanup?.directChildStarted === false &&
-        record.exitReason.cleanup.terminationConfirmed)
-    )
-  }
-
-  private rebuildOwnerSlots(): void {
-    this.ownerSlots.clear()
-    this.slotOwnerBySessionId.clear()
-    for (const record of this.records.values()) {
-      if (!this.occupiesSlot(record)) continue
-      const ownerKey = this.ownerKey(record)
-      const slots = this.ownerSlots.get(ownerKey) ?? new Set<string>()
-      slots.add(record.id)
-      this.ownerSlots.set(ownerKey, slots)
-      this.slotOwnerBySessionId.set(record.id, ownerKey)
-    }
-  }
-
-  private reserveSlot(record: SessionRecord, maxSessionsPerOwner: number): SessionReservation {
-    const ownerKey = this.ownerKey(record)
-    const slots = this.ownerSlots.get(ownerKey) ?? new Set<string>()
-    if (slots.size >= maxSessionsPerOwner) throw new DaemonError('Session limit exceeded.', 'limit')
-    slots.add(record.id)
-    this.ownerSlots.set(ownerKey, slots)
-    this.slotOwnerBySessionId.set(record.id, ownerKey)
-    return { id: record.id, ownerKey, state: 'reserved' }
-  }
-
-  private commitReservation(reservation: SessionReservation): void {
-    if (reservation.state !== 'reserved') throw new Error('Session reservation is no longer valid.')
-    reservation.state = 'committed'
-  }
-
-  private releaseReservation(reservation: SessionReservation): void {
-    if (reservation.state === 'released') return
-    reservation.state = 'released'
-    this.releaseSlot(reservation.id)
-  }
-
-  private releaseSlotIfSettled(record: SessionRecord): void {
-    if (!this.occupiesSlot(record)) this.releaseSlot(record.id)
-  }
-
-  private releaseSlot(id: string): void {
-    const ownerKey = this.slotOwnerBySessionId.get(id)
-    if (!ownerKey) return
-    const slots = this.ownerSlots.get(ownerKey)
-    slots?.delete(id)
-    if (!slots?.size) this.ownerSlots.delete(ownerKey)
-    this.slotOwnerBySessionId.delete(id)
   }
 
   private prestartReceiptAuthority(
@@ -1490,13 +1323,11 @@ export class SessionSupervisor {
   }
 
   private nativeVersion(id: string): number {
-    return this.nativeVersions.get(id) ?? 0
+    return this.router.version(id)
   }
 
   private bumpNativeVersion(id: string): number {
-    const version = this.nativeVersion(id) + 1
-    this.nativeVersions.set(id, version)
-    return version
+    return this.router.bumpVersion(id)
   }
 
   private async syncNative(record: SessionRecord, worker: WorkerClient): Promise<void> {
@@ -1516,31 +1347,11 @@ export class SessionSupervisor {
   }
 
   private enqueueNativePersist<T>(id: string, task: () => Promise<T>): Promise<T> {
-    const previous = this.nativePersists.get(id) ?? Promise.resolve()
-    const result = previous.then(task, task)
-    const settled = result.then(
-      () => undefined,
-      () => undefined
-    )
-    this.nativePersists.set(id, settled)
-    void settled.then(() => {
-      if (this.nativePersists.get(id) === settled) this.nativePersists.delete(id)
-    })
-    return result
+    return this.router.persist(id, task)
   }
 
   private enqueueMutation<T>(id: string, task: () => Promise<T>): Promise<T> {
-    const previous = this.nativeMutations.get(id) ?? Promise.resolve()
-    const result = previous.then(task, task)
-    const settled = result.then(
-      () => undefined,
-      () => undefined
-    )
-    this.nativeMutations.set(id, settled)
-    void settled.then(() => {
-      if (this.nativeMutations.get(id) === settled) this.nativeMutations.delete(id)
-    })
-    return result
+    return this.router.mutate(id, task)
   }
 
   private deleteNativeSession(record: SessionRecord): Promise<boolean> {
@@ -1551,7 +1362,7 @@ export class SessionSupervisor {
         this.nativeWorkers.delete(record.id)
         await this.storage.deleteSession(record.id)
         this.confirmedWorkerShutdowns.delete(record.id)
-        this.releaseSlot(record.id)
+        this.registry.release(record.id)
         this.records.delete(record.id)
         return true
       })
@@ -1618,7 +1429,7 @@ export class SessionSupervisor {
     condition: WaitCondition
   ): Promise<WaitResult | undefined> {
     if (condition.kind === 'exit') return activeStatus(record) ? undefined : this.exitWait(record)
-    const output = await this.outputFor(record.id)
+    const output = await this.journal.output(record.id)
     const after = condition.afterSequence ?? record.firstRetainedSequence
     const scoped =
       after <= record.firstRetainedSequence

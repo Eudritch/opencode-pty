@@ -1,6 +1,6 @@
 # Runtime Reliability Investigation
 
-**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open. Phase 2 has removed the daemon-side direct-exec path, replaced global admission polling with conservative per-owner reservations, and given every state-changing session operation one controller lane; only the planned responsibility split remains.
+**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0-to-V1 persisted-record compatibility, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; a discriminated persistent state model and resource budgets remain open. Phase 2 is locally complete: it removes the daemon-side direct-exec path and global admission polling, adds controller lanes/unified shutdown, and separates records, worker routing, and journal reads.
 
 This directory is the engineering record for rebuilding the process and terminal runtime. It deliberately treats `shekohex/opencode-pty` as historical input rather than a design authority.
 
@@ -59,6 +59,7 @@ This directory is the engineering record for rebuilding the process and terminal
 | Remove daemon-side direct exec | Implemented Phase 2 slice | All supported exec requests now use the native worker path; list reads metadata without snapshotting workers. |
 | Serialize session mutations | Implemented Phase 2 slice | Writes, send-and-wait input acceptance, resize, stop, finalization, cleanup marking, and durable deletion share one per-session lane. |
 | Unify daemon shutdown | Implemented Phase 2 slice | `stop`, synchronous disposal, and async disposal share one idempotent descriptor-cleanup path. |
+| Split the control-plane state owners | Implemented Phase 2 slice | `SessionRegistry` owns records/admission, `SessionRouter` owns workers/ordered control lanes, and `JournalReader` owns output paging/search. |
 
 ## Completion Gates
 

@@ -23,8 +23,9 @@
 | A no-child receipt is bound to the persisted worker identity and token hash before it permits pre-start deletion | `worker/src/main.rs`, `WorkerClient.hasVerifiedPrestartNoChildReceipt()`, and recovery test |
 | A post-start no-child receipt needs both the retained descriptor and a full compatible worker reference | `WorkerClient.hasVerifiedNoChildSpawnFailureReceipt()`, `spawn_failed` recovery tests, and invalid-command cleanup |
 | Normal terminal cleanup reuses fresh shutdown proof only within the running daemon; restart still requires a fresh authenticated shutdown for conversation workers | `SessionSupervisor.finalizeNativeVersion()`, `cleanup()`, and terminal cleanup tests |
-| Per-owner session admission reserves before the first record write and remains conservative after uncertainty | `SessionSupervisor.reserveSlot()`, `rebuildOwnerSlots()`, `releaseSlotIfSettled()`, and reservation tests |
-| One per-session lane serializes state-changing control operations | `SessionSupervisor.enqueueMutation()`, controller-lane and terminal-finalization tests |
+| Per-owner session admission reserves before the first record write and remains conservative after uncertainty | `SessionRegistry.reserve()`, `rebuildSlots()`, `releaseIfSettled()`, and reservation tests |
+| One per-session lane serializes state-changing control operations | `SessionRouter.mutate()`, controller-lane and terminal-finalization tests |
+| A foreign owner is rejected before a routed worker can be snapshotted | `SessionRouter.owns()`, `DaemonServer.authorize()`, and foreign-owner route test |
 
 ## Findings and Required Target Rules
 

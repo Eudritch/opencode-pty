@@ -423,6 +423,46 @@ test('daemon rejects malformed owner capability hashes before authorization', as
   }
 }, 30_000)
 
+test('a foreign owner cannot snapshot a routed worker', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-routed-owner-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  const server = new DaemonServer(storage, supervisor, 'test-token')
+  const descriptor = await server.start()
+  const ownerContext = await owner(storage, 'parent', root)
+  const session = record(root, 'pty_routed_owner')
+  session.parentSessionId = ownerContext.parentSessionId
+  session.ownerCapabilityHash = ownerContext.capability
+  ;(supervisor as unknown as { records: Map<string, SessionRecord> }).records.set(
+    session.id,
+    session
+  )
+  let snapshots = 0
+  ;(supervisor as unknown as { nativeWorkers: Map<string, unknown> }).nativeWorkers.set(
+    session.id,
+    {
+      snapshot: async () => {
+        snapshots += 1
+        return workerSnapshot()
+      },
+    }
+  )
+
+  try {
+    const denied = await rpc(
+      descriptor,
+      'get',
+      { id: session.id },
+      await owner(storage, 'other', root)
+    )
+    expect(((await denied.json()) as { error: { code: string } }).error.code).toBe('authorization')
+    expect(snapshots).toBe(0)
+  } finally {
+    await server.stop()
+  }
+})
+
 test.skipIf(process.platform === 'win32')(
   'daemon denies other owners and reports bounded diagnostics',
   async () => {

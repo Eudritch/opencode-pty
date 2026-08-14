@@ -10,7 +10,7 @@ Scores use 1-5: **1** broken or unproven for a required contract, **2** substant
 
 | Dimension | Score | Evidence and explanation |
 | --- | ---: | --- |
-| Simplicity | 1 | The server, supervisor, storage, and mixed-platform worker remain large, although the legacy daemon-side exec implementation is deleted. |
+| Simplicity | 2 | Registry, worker routing, and journal reads are separated from the supervisor, and legacy daemon-side exec is deleted; server, storage, and mixed-platform worker remain large. |
 | Lifecycle determinism | 3 | A pure reducer blocks stale status/fact regression, recovery is lifecycle-specific, and V0 decoding fences legacy live state; V1 persistence still combines status and mutable observations. |
 | PTY correctness | 2 | Local guarded ConPTY live/package contracts pass, but supported-build and close-order evidence is incomplete. |
 | Windows reliability | 2 | Local recovery is repeatable, but there is no Windows version/architecture matrix and the Bun minimum remains unproven. |
