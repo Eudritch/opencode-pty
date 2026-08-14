@@ -1,5 +1,9 @@
 # dependencies (bun install)
 node_modules
+.opencode-pty-checkpoints
+.opencode-pty-runtime
+.opencode/opencode-pty-checkpoint.json
+.opencode/opencode-pty-checkpoint-runtime.json
 
 # output
 out

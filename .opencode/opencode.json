@@ -1,7 +1,7 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": ["README.md"],
-  "plugin": ["file:///C:/Users/User/Desktop/Need/05%20-%20Coding/opencode-pty/index.ts"],
+  "plugin": ["./plugin/opencode-pty-checkpoint.ts"],
   "permission": {
     "bash": "allow"
   }

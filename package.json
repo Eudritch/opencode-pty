@@ -62,6 +62,7 @@
     "native:sign:windows": "bun scripts/sign-windows-worker.ts",
     "native:sign:macos": "bun scripts/sign-macos-worker.ts",
     "native:publish": "bun scripts/publish-native-artifacts.ts",
+    "checkpoint": "bun scripts/opencode-pty-checkpoint.ts",
     "prepack": "bun build:prod",
     "clean": "rm -rf dist",
     "lint": "biome lint .",

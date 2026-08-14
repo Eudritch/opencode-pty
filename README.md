@@ -103,6 +103,19 @@ bun build:prod
 bun package:smoke
 ```
 
+## Local Checkpoints
+
+The project includes a development-only checkpoint loader for exercising a verified Windows build while work continues. It keeps durable daemon state in `.opencode-pty-runtime/` and loads verified source/worker snapshots from `.opencode-pty-checkpoints/`; both directories are ignored.
+
+```bash
+bun run checkpoint stage <git-ref>
+bun run checkpoint verify <git-ref>
+bun run checkpoint activate <git-ref>
+bun run checkpoint status
+```
+
+`verify` runs the full local gate and builds the matching debug worker. `activate` accepts only a verified commit and atomically updates the manifest. Once OpenCode has been restarted once to load `.opencode/plugin/opencode-pty-checkpoint.ts`, internal plugin changes reload from that manifest without restarting OpenCode or its unrelated MCP servers. Reload failure preserves the previous implementation. Tool names/arguments, plugin options, TUI registration, and worker-protocol changes remain an OpenCode restart boundary.
+
 The unit tests expect a debug worker binary: `cargo build --locked --workspace` produces `target/debug/opencode-pty-worker`, which `bun unittest` uses (the tests set `PTY_NATIVE_WORKER_PATH` to it), so run the cargo build before the test suite.
 
 ## License
