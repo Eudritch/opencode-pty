@@ -29,6 +29,7 @@ import {
   refreshSessionState,
   sessionStateFromCompatibility,
 } from './lifecycle.ts'
+import { MAX_OUTPUT_BYTES } from './limits.ts'
 
 const DESCRIPTOR_FILE = 'daemon.json'
 const OWNERSHIP_SECRET_FILE = 'ownership-secret'
@@ -1525,6 +1526,10 @@ export class DaemonStorage {
       !validNonnegativeInteger(value.nextSequence) ||
       !validNonnegativeInteger(value.firstRetainedSequence) ||
       !validNonnegativeInteger(value.outputBytes) ||
+      (value.outputLimitBytes !== undefined &&
+        (!validNonnegativeInteger(value.outputLimitBytes) ||
+          value.outputLimitBytes === 0 ||
+          value.outputLimitBytes > MAX_OUTPUT_BYTES)) ||
       typeof value.outputTruncated !== 'boolean' ||
       !validNonnegativeInteger(value.lineCount) ||
       typeof value.outputHasPartialLine !== 'boolean' ||

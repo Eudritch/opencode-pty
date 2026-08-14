@@ -16,6 +16,7 @@ import { DaemonError } from './errors.ts'
 import type { DaemonStorage } from './storage.ts'
 import { ProcessError, type ExecOptions, type SessionSupervisor } from './supervisor.ts'
 import { effectiveMaxOutputBytes } from './supervisor.ts'
+import { DEFAULT_MAX_SESSIONS_PER_OWNER } from './limits.ts'
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 
@@ -28,7 +29,6 @@ const MAX_ENVIRONMENT_ENTRIES = 128
 const MAX_PAGE_SIZE = 10_000
 const MAX_INPUT_BYTES = 64 * 1024
 const MAX_INPUT_BYTES_PER_MINUTE = 256 * 1024
-const DEFAULT_MAX_SESSIONS_PER_OWNER = 32
 const MAX_APPROVAL_EXPIRY_SECONDS = 3600
 const MAX_SESSION_GRANT_SECONDS = 24 * 60 * 60
 const CLAIM_LEASE_MS = 5_000
@@ -1022,16 +1022,34 @@ export class DaemonServer implements Disposable, AsyncDisposable {
 
   private diagnostics(owner: OwnerContext): DaemonDiagnostics {
     if (!owner.parentSessionId) throw new DaemonError('Owner is not authorized.', 'authorization')
+    const quotas = this.supervisor.quotaLimits()
     return {
       protocolVersion: DAEMON_PROTOCOL_VERSION,
       pid: process.pid,
       limits: {
         maxSessionsPerOwner: this.maxSessionsPerOwner,
+        maxActiveSessions: quotas.maxActiveSessions,
+        maxRecordsPerOwner: quotas.maxRecordsPerOwner,
+        maxRecords: quotas.maxRecords,
+        maxPendingWaitsPerSession: quotas.maxPendingWaitsPerSession,
+        maxPendingWaitsPerOwner: quotas.maxPendingWaitsPerOwner,
+        maxPendingWaits: quotas.maxPendingWaits,
         maxInputBytes: MAX_INPUT_BYTES,
         maxInputBytesPerMinute: MAX_INPUT_BYTES_PER_MINUTE,
+        maxQueuedInputBytesPerSession: quotas.maxQueuedInputBytesPerSession,
+        maxQueuedInputBytesPerOwner: quotas.maxQueuedInputBytesPerOwner,
+        maxQueuedInputBytes: quotas.maxQueuedInputBytes,
         maxOutputBytes: effectiveMaxOutputBytes(),
+        maxRetainedOutputBytesPerOwner: quotas.maxRetainedOutputBytesPerOwner,
+        maxRetainedOutputBytes: quotas.maxRetainedOutputBytes,
+        terminalRetentionSeconds: quotas.terminalRetentionSeconds,
         maxExecRuntimeSeconds: MAX_EXEC_RUNTIME_SECONDS,
       },
+      usage: this.supervisor.quotaUsage(
+        owner.parentSessionId,
+        owner.projectDirectory,
+        owner.capability
+      ),
       environment: { inheritEnabled: true, defaultProfile: 'safe' },
       platform: {
         nativeContainment: process.platform === 'linux' || process.platform === 'win32',

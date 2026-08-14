@@ -299,6 +299,7 @@ export interface SessionRecord {
   nextSequence: number
   firstRetainedSequence: number
   outputBytes: number
+  outputLimitBytes?: number
   outputTruncated: boolean
   lineCount: number
   outputHasPartialLine: boolean
@@ -400,10 +401,38 @@ export interface DaemonDiagnostics {
   pid: number
   limits: {
     maxSessionsPerOwner: number
+    maxActiveSessions: number
+    maxRecordsPerOwner: number
+    maxRecords: number
+    maxPendingWaitsPerSession: number
+    maxPendingWaitsPerOwner: number
+    maxPendingWaits: number
     maxInputBytes: number
     maxInputBytesPerMinute: number
+    maxQueuedInputBytesPerSession: number
+    maxQueuedInputBytesPerOwner: number
+    maxQueuedInputBytes: number
     maxOutputBytes: number
+    maxRetainedOutputBytesPerOwner: number
+    maxRetainedOutputBytes: number
+    terminalRetentionSeconds: number
     maxExecRuntimeSeconds: number
+  }
+  usage: {
+    owner: {
+      activeSessions: number
+      records: number
+      pendingWaits: number
+      queuedInputBytes: number
+      retainedOutputBytes: number
+    }
+    global: {
+      activeSessions: number
+      records: number
+      pendingWaits: number
+      queuedInputBytes: number
+      retainedOutputBytes: number
+    }
   }
   environment: { inheritEnabled: boolean; defaultProfile: 'safe' }
   platform: {

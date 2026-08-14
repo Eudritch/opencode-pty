@@ -12,16 +12,16 @@ OpenCode host
   -> child process and its platform containment mechanism
 ```
 
-The three layers are justified by distinct trust and failure boundaries. Phase 2 makes control-plane ownership explicit; Phase 1 has cut over persisted state and still needs resource budgets and crash-matrix evidence.
+The three layers are justified by distinct trust and failure boundaries. Phase 2 makes control-plane ownership explicit; Phase 1 has cut over persisted state, bounded registry-owned resources, and added local crash-cutover evidence.
 
 ## Current Responsibility Map
 
 | Component | Owns today | Evidence | Assessment |
 | --- | --- | --- | --- |
 | Plugin | Host permission evaluation, workdir preflight, owner context, tool output, TUI approval bridge | `src/plugin.ts`, `src/plugin/pty/permissions.ts`, `src/plugin/pty/tools` | Essential adapter. Tool-side `get` preflights duplicate daemon checks but are non-authoritative. |
-| Daemon server | Loopback transport, bearer auth, RPC validation, owner capability validation, per-owner session/input limits | `src/daemon/server.ts` | Essential control-plane role. `dispatch` has 33 cyclomatic complexity and mixes routing, validation, approvals, and session control. |
+| Daemon server | Loopback transport, bearer auth, RPC validation, owner capability validation, ingress rate limit, and quota diagnostics | `src/daemon/server.ts` | Essential control-plane role. `dispatch` has 33 cyclomatic complexity and mixes routing, validation, approvals, and session control. |
 | Supervisor | Recovery, native lifecycle orchestration, waits, and public daemon facade | `src/daemon/supervisor.ts` | Coordinates collaborators without owning their maps. Native lifecycle remains deliberately local until the Phase 3 engine boundary narrows. |
-| Session registry | Session records, full-owner identity checks, conservative admission slots, and slot release | `src/daemon/session-registry.ts` | No worker RPC. Uncertain/lost records retain capacity until strict proof or durable deletion. |
+| Session registry | Session records, full-owner identity checks, active/durable/output reservations, wait permits, and queued-input permits | `src/daemon/session-registry.ts` | No worker RPC. Uncertain/lost records retain capacity and their full output reservation until strict proof or durable deletion. |
 | Session router | Live worker references, owner-route checks, snapshot-version fences, persistence queue, and mutation lane | `src/daemon/session-router.ts` | No metadata quota logic. Its ordered queues retain the controller-lane and persistence-deadlock invariants. |
 | Journal reader | Output loading, line paging, literal search, and raw output | `src/daemon/journal-reader.ts` | Read-only output boundary; it cannot mutate session state or contact workers. |
 | Storage | Private directory, DACL/POSIX permissions, daemon descriptor/locks, V0/V1/V2 metadata decoding, inert unsupported-record handling, journal read/migration | `src/daemon/storage.ts` | V2 is the only writer; this remains the essential persistence boundary and also owns platform process-identity probing. |
@@ -55,7 +55,7 @@ running  -> timed_out | output_limited | exited | lost
 | Severity | Finding | Evidence | Root cause family |
 | --- | --- | --- | --- |
 | High | Windows ConPTY behavior has only one-host validation | Initial local `bun package:smoke` failure; guarded local package contract then passed 20/20 | Platform launch behavior needs the published Windows-version matrix and close-order evidence. |
-| Medium | Aggregate resource policy is still absent | `src/daemon/server.ts`, `src/daemon/supervisor.ts` | Per-session limits exist, but waits, retained bytes, and terminal-tombstone retention still lack declared global budgets. |
+| Medium | Budget defaults have only local functional evidence | `src/daemon/limits.ts`, `src/daemon/session-registry.ts` | Admission is bounded, but repeated pressure, disk-full, and multi-platform resource measurements remain Phase 4 work. |
 | High | Worker-RPC-loss fallback kills only the worker PID | `WorkerClient.terminateOrphan` at `src/daemon/worker-client.ts:604-640`; POSIX child is in a separate session | Descriptor retention now preserves later reaping evidence, but orphan cleanup cannot claim child containment after control-plane loss. |
 | Medium | Worker journal sharing-violation policy differs from daemon metadata writes | `worker/src/main.rs`; `src/daemon/storage.ts:130-155` | Standard atomic rename is validated locally, but worker journal writes do not share daemon retry classification. |
 
@@ -76,6 +76,10 @@ Idempotent PTY reuse now requires the complete owner identity: parent session, c
 `DaemonServer.start()` marks active or lost conversation sessions for cleanup before it publishes the daemon descriptor. Persistent records may reconnect and retry after an unreachable observation; marked conversations reconnect only for cleanup. Cleanup retains a tombstone unless an authenticated shutdown plus explicit direct-child and containment evidence proves it safe to delete. That same proof gate applies to persisted terminal records. Owner deletion retries tombstones rather than silently discarding their worker descriptor or journal. A memory-only cache now distinguishes a session that already completed a strict worker shutdown in the running daemon from a crash-recovered terminal record: normal finalization can delete without a redundant reconnect, while restart paths still require a fresh authenticated shutdown.
 
 The current worker start path has a durable pre-activation checkpoint. `WorkerClient.prepare()` verifies the bootstrap-ready descriptor while the worker remains blocked on the inherited start/rollback pipe. The supervisor persists that verified reference before `client.start()` sends the frame that permits child creation. Health and snapshots remain post-start because the worker HTTP listener does not exist before the child is created. Reference-persistence failure rolls the prepared worker back without activating the command. On rollback or EOF before any valid `start`, the worker writes `prestart-no-child.json`; recovery accepts it only when its worker identity, endpoint, protocol, and token hash match the persisted reference. It never treats this receipt as evidence after `start`. A distinct retained `spawn-failure.json` plus `worker.json` now proves the narrower post-start case where `start` was accepted but no direct child was created, and that proof is recoverable only for a full compatible worker reference.
+
+`SessionRegistry` now applies fixed limits before admission or mutation: 32 active sessions per owner and 64 globally; 64 durable records per owner and 128 globally; 8/32/128 pending waits by session/owner/daemon; 64 KiB/256 KiB/1 MiB queued input; and 64 MiB/128 MiB retained-output reservations. New records persist their effective per-session output cap. Active or unreachable records reserve their full cap; strict terminals reserve actual retained bytes. A terminal record becomes eligible for cleanup after 24 hours on a later admission attempt, but it is never force-deleted without the ordinary strict cleanup proof. `diagnostics` exposes limits plus owner/global usage.
+
+The local cutover matrix combines deterministic pre-activation/reference/post-start/finalization tests with a source-daemon kill/restart test. The live-child case runs a persistent command with a durable marker, kills the daemon, reconnects the worker, and proves the marker has one start only. This is process-termination evidence on one Windows x64 host, not a power-loss or multi-platform claim.
 
 ## Phase 2 Update
 

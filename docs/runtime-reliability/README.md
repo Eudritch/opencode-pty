@@ -1,6 +1,6 @@
 # Runtime Reliability Investigation
 
-**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 has implemented a V2 discriminated persisted state, pure state reducer, full-owner idempotency, lifecycle-specific recovery, fail-closed environment authorization, V0/V1 compatibility decoding, a durable worker-reference checkpoint, verified pre-start and post-start no-child cleanup, and fresh shutdown proof for terminal conversation cleanup; resource budgets and the crash matrix remain open. Phase 2 is locally complete: it removes the daemon-side direct-exec path and global admission polling, adds controller lanes/unified shutdown, and separates records, worker routing, and journal reads.
+**Status:** Investigating. Phase 0 recovered the local Windows baseline. Phase 1 is locally complete: V2 discriminated persisted state, pure state reduction, lifecycle-specific recovery, compatibility decoding, durable worker-reference checkpoints, bounded registry admission/waits/input/output/records, and source-daemon crash recovery are locally verified. Phase 2 is locally complete: it removes the daemon-side direct-exec path and global admission polling, adds controller lanes/unified shutdown, and separates records, worker routing, and journal reads. Cross-platform pressure, crash, and release matrices remain open.
 
 This directory is the engineering record for rebuilding the process and terminal runtime. It deliberately treats `shekohex/opencode-pty` as historical input rather than a design authority.
 
@@ -12,7 +12,7 @@ This directory is the engineering record for rebuilding the process and terminal
 | Current runtime | Partially verified | [current-architecture.md](current-architecture.md) | The fork is a major durable-runtime rewrite; recovery distinguishes persistent sessions from conversation cleanup and the decoder fences legacy live records from recovery. |
 | Bun and dependencies | Partially verified | [platforms-and-dependencies.md](platforms-and-dependencies.md) | Bun has a PTY API, but it has not demonstrated parity with the durable native-worker contract. |
 | Windows and concurrency | Partially verified | [risk-scorecard.md](risk-scorecard.md) | Local packaged ConPTY is repaired by a scoped console-handle guard; admission is per-owner and independent of unrelated worker liveness, while the Windows build/close-order matrix remains open. |
-| Security and operations | Partially verified | [security-and-operations.md](security-and-operations.md) | Owner-scoped reuse, inert incompatible-worker records, and evidence-retaining V2 tombstones are implemented; transient approvals reject custom/inherited environments and aggregate budgets remain open. |
+| Security and operations | Partially verified | [security-and-operations.md](security-and-operations.md) | Owner-scoped reuse, inert incompatible-worker records, evidence-retaining V2 tombstones, and fixed registry budgets are implemented; transient approvals reject custom/inherited environments. |
 | Tests and experiments | Partially verified | [testing-and-experiments.md](testing-and-experiments.md) | Local native/package checks are green; cross-platform release confidence is blocked by the unrun Windows and macOS matrices. |
 | Target architecture | Proposed from evidence | [target-architecture.md](target-architecture.md) | Keep the mode split and narrow native engine; simplify the control plane and make state authority explicit. |
 | Open questions | Open | [open-questions.md](open-questions.md) | Only unresolved questions that can change a decision or release claim remain here. |
@@ -61,6 +61,8 @@ This directory is the engineering record for rebuilding the process and terminal
 | Unify daemon shutdown | Implemented Phase 2 slice | `stop`, synchronous disposal, and async disposal share one idempotent descriptor-cleanup path. |
 | Split the control-plane state owners | Implemented Phase 2 slice | `SessionRegistry` owns records/admission, `SessionRouter` owns workers/ordered control lanes, and `JournalReader` owns output paging/search. |
 | Make V2 state authoritative | Implemented Phase 1 slice | `SessionSupervisor` reduces V2 state before projecting legacy fields for RPC compatibility; a terminal transition without strict child/containment or no-child evidence becomes an unreachable tombstone retaining its terminal payload. |
+| Bound registry resources | Implemented Phase 1 slice | Registry reservations bound active sessions, durable records, pending waits, queued input, and aggregate retained output; terminal records are eligible for safe reaping after 24 hours. |
+| Verify crash cutover | Implemented Phase 1 slice | Deterministic checkpoint tests cover pre-start/reference/finalization boundaries; a source-daemon crash/restart test proves a persistent live child reconnects without replaying its start frame. |
 
 ## Completion Gates
 

@@ -24,6 +24,7 @@
 | A post-start no-child receipt needs both the retained descriptor and a full compatible worker reference | `WorkerClient.hasVerifiedNoChildSpawnFailureReceipt()`, `spawn_failed` recovery tests, and invalid-command cleanup |
 | Normal terminal cleanup reuses fresh shutdown proof only within the running daemon; restart still requires a fresh authenticated shutdown for conversation workers | `SessionSupervisor.finalizeNativeVersion()`, `cleanup()`, and terminal cleanup tests |
 | Per-owner session admission reserves before the first record write and remains conservative after uncertainty | `SessionRegistry.reserve()`, `rebuildSlots()`, `releaseIfSettled()`, and reservation tests |
+| Registry-owned fixed budgets bound active sessions, durable records, waits, queued input, and aggregate retained output | `src/daemon/limits.ts`, `SessionRegistry`, quota regressions, and daemon diagnostics |
 | One per-session lane serializes state-changing control operations | `SessionRouter.mutate()`, controller-lane and terminal-finalization tests |
 | A foreign owner is rejected before a routed worker can be snapshotted | `SessionRouter.owns()`, `DaemonServer.authorize()`, and foreign-owner route test |
 
@@ -33,8 +34,8 @@
 | --- | --- | --- |
 | Transient approval cannot bind `env` or `inheritEnv` | `createSpawnAuthorizer()` rejects non-empty `env` and `inheritEnv: true` before `ctx.ask` unless local `bash` policy explicitly allows the command; both adapters pass the options into that check | **Mitigated restrictively:** do not add an environment fingerprint to approval metadata. `pty_spawn` and `shell_exec` require explicit local `bash` allow for custom or inherited environments. |
 | Native bootstrap does not enforce the documented 4,096-byte secret limit | README says 4 KiB; RPC validation permits 16,384 UTF-16 code units, while native bootstrap forwards sensitive values without the 4,096-byte check | Enforce a 4,096 UTF-8-byte maximum before worker bootstrap and test split secrets at the limit. |
-| Waiters, durable records, and aggregate output are unbounded | `wait` registrations have no aggregate cap; output cap is per session | Define per-owner and global budgets: active sessions, pending waits, input bytes/minute, retained bytes, terminal record TTL, and admission behavior. |
-| Tombstone retention has no aggregate expiry/budget policy | Lost cleanup now retains metadata without strict shutdown/containment proof | Define owner/global tombstone count, disk budget, alerting, and an explicit operator expiry procedure. |
+| Native worker writes can still block after TypeScript accepts input | The registry bounds queued mutation-lane bytes, but `write_all` remains synchronous in the worker | Phase 3 must add a bounded native input queue and stable `input_backpressure` outcome. |
+| Tombstone retention is conservative rather than force-expiring | A 24-hour terminal cleanup attempt still requires ordinary strict proof | Keep failed cleanup evidence and let the durable-record cap deny new admission; add pressure/operations measurements in Phase 4. |
 | Persisted-state cutover is one-way | V0 records are rewritten as V1 only after strict classification; an old daemon cannot safely interpret V1 tombstone semantics | Backward recovery means restoring the daemon-data backup, not running an old daemon against migrated state. |
 | Persisted terminal facts may be incomplete | Status and `terminationConfirmed` alone are not proof of safe terminal cleanup | Require explicit direct-child and platform containment evidence for V0 migration and terminal cleanup. Otherwise retain a cleanup-only tombstone and preserve legacy output. |
 | Terminal V0 log removal can be interrupted | Metadata and journal may be durable before old `output.log` removal | Persist a V1 cleanup marker, remove only after terminal migration is durable, and retry removal on later V1 loads. |
@@ -63,11 +64,12 @@
 
 | Resource | Enforcement point | Proposed behavior |
 | --- | --- | --- |
-| Active sessions | Daemon registry | Per-owner quota atomically reserves before spawn. Unproven/lost records retain occupancy; strict terminal/no-child proof or successful deletion releases it. A global cap is intentionally not introduced in Phase 2. |
-| Pending waits | Daemon session controller | Fixed per-session/per-owner quota; reject excess with `resource_limit`, never silently drop. |
-| Input queue | Native worker | Bounded bytes and write count; preserve write order; return `not_running` or `input_backpressure` rather than allocate indefinitely. |
-| Output journal | Native worker writer | Bounded per session; evict whole oldest chunks with durable sequence cursor; report truncation. |
-| Aggregate disk | Daemon storage | Quota across owner and daemon root; deny new session or evict terminal records according to explicit retention policy. |
+| Active sessions | Daemon registry | 32 per owner, 64 globally; reserve before the first write. Unproven/lost records retain occupancy; strict terminal/no-child proof or deletion releases it. |
+| Durable records | Daemon registry | 64 per owner, 128 globally. Strict terminals are eligible for normal cleanup after 24 hours on admission; uncertain tombstones are never force-deleted. |
+| Pending waits | Daemon registry | 8 per session, 32 per owner, 128 globally. Immediate output/exit matches take no permit; pending waits release on match, terminal, deadline, or failed send-and-wait input. |
+| Input queue | Daemon registry and native worker | 64 KiB per session, 256 KiB per owner, 1 MiB globally for queued controller-lane input; ingress also remains 64 KiB/request and 256 KiB/minute per owner. Native write backpressure remains Phase 3 work. |
+| Output journal | Native worker writer and daemon registry | Per session: configured cap up to 64 MiB. Registry reserves 64 MiB per owner and 128 MiB globally; active/unreachable records reserve their cap and strict terminals retain actual bytes. |
+| Aggregate disk | Daemon registry | Deny admission when durable-record or retained-output reservations are exhausted; diagnostics exposes owner/global use. |
 | Runtime | Native engine | Exec always needs deadline; PTY deadline only when requested. Stop has a finite grace and one documented force phase. |
 | Worker process | Daemon watchdog | One engine per live session; record and alarm on unreaped workers rather than deleting evidence. |
 

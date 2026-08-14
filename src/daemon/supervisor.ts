@@ -4,6 +4,7 @@ import type { PTYSessionInfo, ReadResult, SearchResult, SpawnOptions } from '../
 import { NATIVE_WORKER_PROTOCOL_VERSION } from '../shared/native-worker-targets.ts'
 import { DaemonError } from './errors.ts'
 import { JournalReader, lineCount } from './journal-reader.ts'
+import { DEFAULT_SESSION_LIMITS, effectiveMaxOutputBytes, type SessionLimits } from './limits.ts'
 import {
   isActiveDaemonStatus,
   projectSessionState,
@@ -11,7 +12,12 @@ import {
   refreshSessionState,
   type LifecycleEvent,
 } from './lifecycle.ts'
-import { containmentDrained, SessionRegistry, terminalDirectChild } from './session-registry.ts'
+import {
+  containmentDrained,
+  SessionRegistry,
+  terminalDirectChild,
+  type WaitReservation,
+} from './session-registry.ts'
 import { SessionRouter } from './session-router.ts'
 import type { DaemonStorage } from './storage.ts'
 import type { SpawnFailure } from './types.ts'
@@ -34,8 +40,6 @@ import {
 import type { WorkerClient, WorkerSnapshot } from './worker-client.ts'
 import { WorkerClient as NativeWorkerClient, WorkerStartError } from './worker-client.ts'
 
-const DEFAULT_MAX_OUTPUT_BYTES = 1000000
-const MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 const RECOVERY_CONCURRENCY = 4
 const EXEC_TERMINAL_WAIT_SECONDS = MAX_EXEC_WAIT_SECONDS - MAX_EXEC_RUNTIME_SECONDS
 const SAFE_ENVIRONMENT_KEYS = new Set([
@@ -66,6 +70,7 @@ export interface ExecOptions extends SpawnOptions {
 
 interface PendingWait {
   condition: WaitCondition
+  reservation: WaitReservation
   settle: (result: WaitResult) => void
   timer: ReturnType<typeof setTimeout>
   settled: boolean
@@ -80,12 +85,7 @@ export class ProcessError extends Error {
   }
 }
 
-export function effectiveMaxOutputBytes(value = process.env.PTY_MAX_OUTPUT_BYTES): number {
-  const parsed = Number.parseInt(value ?? '', 10)
-  return Number.isSafeInteger(parsed) && parsed > 0
-    ? Math.min(parsed, MAX_OUTPUT_BYTES)
-    : DEFAULT_MAX_OUTPUT_BYTES
-}
+export { effectiveMaxOutputBytes } from './limits.ts'
 
 function safeRegex(pattern: string): RegExp {
   if (pattern.length > 512 || /[()*+?{|}]/.test(pattern) || /\\[1-9]/.test(pattern)) {
@@ -159,9 +159,9 @@ export function runtimeEnvironment(
 }
 
 export class SessionSupervisor {
-  private readonly registry = new SessionRegistry()
+  private readonly registry: SessionRegistry
   private readonly waits = new Map<string, PendingWait[]>()
-  private readonly router = new SessionRouter(this.registry)
+  private readonly router: SessionRouter
   private readonly nativeFinalizations = new Map<string, Promise<ExecResult | PTYSessionInfo>>()
   private readonly pendingConversationCleanup = new Map<string, Promise<void>>()
   private readonly confirmedWorkerShutdowns = new Set<string>()
@@ -172,8 +172,11 @@ export class SessionSupervisor {
     private readonly storage: DaemonStorage,
     private readonly maxOutputBytes: number = effectiveMaxOutputBytes(),
     private readonly recoveryAttempts = 30,
-    private readonly recoveryRetryMs = 100
+    private readonly recoveryRetryMs = 100,
+    limits: SessionLimits = DEFAULT_SESSION_LIMITS
   ) {
+    this.registry = new SessionRegistry(limits)
+    this.router = new SessionRouter(this.registry)
     this.journal = new JournalReader(storage, () => this.flush())
   }
 
@@ -349,6 +352,7 @@ export class SessionSupervisor {
     const args = options.args ?? []
     const existing = this.idempotentSession(options, args)
     if (existing) return this.toInfo(existing)
+    await this.pruneExpiredTerminals()
     const id = `pty_${crypto.randomUUID()}`
     const now = new Date().toISOString()
     const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
@@ -392,6 +396,7 @@ export class SessionSupervisor {
       nextSequence: 0,
       firstRetainedSequence: 0,
       outputBytes: 0,
+      outputLimitBytes: this.maxOutputBytes,
       outputTruncated: false,
       lineCount: 0,
       outputHasPartialLine: false,
@@ -418,7 +423,7 @@ export class SessionSupervisor {
           redactionSecrets: this.redactionSecrets(environment),
           sessionDirectory: join(this.storage.rootDirectory, 'sessions', id),
           timeoutSeconds: options.timeoutSeconds,
-          maxOutputBytes: this.maxOutputBytes,
+          maxOutputBytes: record.outputLimitBytes ?? this.maxOutputBytes,
           mode: 'pty',
           cols: 120,
           rows: 40,
@@ -489,18 +494,23 @@ export class SessionSupervisor {
 
   async write(id: string, data: string): Promise<WriteResult> {
     await this.flush()
+    const record = this.recordFor(id)
+    const input = this.registry.reserveInput(record, Buffer.byteLength(data))
     return this.enqueueMutation(id, async () => {
-      const worker = this.nativeWorkers.get(id)
-      const record = this.recordFor(id)
-      if (!worker || record.status !== 'running' || record.pendingCleanup)
-        throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
       try {
+        const worker = this.nativeWorkers.get(id)
+        const current = this.recordFor(id)
+        if (!worker || current.status !== 'running' || current.pendingCleanup)
+          throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
         await worker.write(data)
         return { acceptedBytes: Buffer.byteLength(data), acceptedCharacters: [...data].length }
       } catch (error) {
+        if (error instanceof DaemonError) throw error
         throw new ProcessError(
           `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
         )
+      } finally {
+        this.registry.releaseInput(input)
       }
     })
   }
@@ -513,26 +523,38 @@ export class SessionSupervisor {
   ): Promise<WaitResult> {
     await this.flush()
     this.validateWait(condition, timeoutSeconds)
-    const afterSequence = await this.enqueueMutation(id, async () => {
-      const worker = this.nativeWorkers.get(id)
-      const record = this.recordFor(id)
-      if (!worker || record.status !== 'running' || record.pendingCleanup)
-        throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
-      try {
-        // The worker returns the cursor at the input acceptance boundary. On Windows this is before
-        // WriteFile because ConPTY reads block and an immediate echo may be published concurrently.
-        return (await worker.write(data)).arrivalSequence
-      } catch (error) {
-        throw new ProcessError(
-          `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
-        )
-      }
-    })
-    return this.wait(
-      id,
-      { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
-      timeoutSeconds
-    )
+    const record = this.recordFor(id)
+    const wait = this.registry.reserveWait(record)
+    try {
+      const input = this.registry.reserveInput(record, Buffer.byteLength(data))
+      const afterSequence = await this.enqueueMutation(id, async () => {
+        try {
+          const worker = this.nativeWorkers.get(id)
+          const current = this.recordFor(id)
+          if (!worker || current.status !== 'running' || current.pendingCleanup)
+            throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
+          // The worker returns the cursor at the input acceptance boundary. On Windows this is before
+          // WriteFile because ConPTY reads block and an immediate echo may be published concurrently.
+          return (await worker.write(data)).arrivalSequence
+        } catch (error) {
+          if (error instanceof DaemonError) throw error
+          throw new ProcessError(
+            `Failed to write to PTY '${id}': ${error instanceof Error ? error.message : String(error)}`
+          )
+        } finally {
+          this.registry.releaseInput(input)
+        }
+      })
+      return await this.wait(
+        id,
+        { ...condition, ...(condition.kind === 'output' ? { afterSequence } : {}) },
+        timeoutSeconds,
+        wait
+      )
+    } catch (error) {
+      this.registry.releaseWait(wait)
+      throw error
+    }
   }
 
   async resize(id: string, cols: number, rows: number): Promise<{ cols: number; rows: number }> {
@@ -548,15 +570,29 @@ export class SessionSupervisor {
     })
   }
 
-  async wait(id: string, condition: WaitCondition, timeoutSeconds: number): Promise<WaitResult> {
+  async wait(
+    id: string,
+    condition: WaitCondition,
+    timeoutSeconds: number,
+    reservedWait?: WaitReservation
+  ): Promise<WaitResult> {
     await this.flush()
     this.validateWait(condition, timeoutSeconds)
     const record = this.recordFor(id)
-    if (record.pendingCleanup || record.status === 'lost')
+    if (record.pendingCleanup || record.status === 'lost') {
+      if (reservedWait) this.registry.releaseWait(reservedWait)
       throw new DaemonError(`PTY session '${id}' is closed.`, 'session_closed')
+    }
     const matched = await this.waitMatch(record, condition)
-    if (matched) return this.finishWait(record, matched)
-    if (!activeStatus(record)) return this.finishWait(record, this.waitEnded(record, condition))
+    if (matched) {
+      if (reservedWait) this.registry.releaseWait(reservedWait)
+      return this.finishWait(record, matched)
+    }
+    if (!activeStatus(record)) {
+      if (reservedWait) this.registry.releaseWait(reservedWait)
+      return this.finishWait(record, this.waitEnded(record, condition))
+    }
+    const reservation = reservedWait ?? this.registry.reserveWait(record)
     return new Promise<WaitResult>((resolve) => {
       const timer = setTimeout(() => {
         pending.settle({
@@ -568,6 +604,7 @@ export class SessionSupervisor {
       }, timeoutSeconds * 1000)
       const pending: PendingWait = {
         condition,
+        reservation,
         timer,
         settled: false,
         settle: (result) => {
@@ -612,9 +649,11 @@ export class SessionSupervisor {
         `timeoutSeconds must be a positive integer up to ${MAX_EXEC_RUNTIME_SECONDS} for exec`
       )
     const args = options.args ?? []
+    await this.pruneExpiredTerminals()
     const now = new Date().toISOString()
     const id = `exec_${crypto.randomUUID()}`
     const environment = runtimeEnvironment(options.env, options.inheritEnv === true)
+    const outputLimitBytes = this.execOutputLimit(options.maxOutputBytes)
     const record: SessionRecord = {
       recordVersion: SESSION_RECORD_VERSION,
       id,
@@ -650,6 +689,7 @@ export class SessionSupervisor {
       nextSequence: 0,
       firstRetainedSequence: 0,
       outputBytes: 0,
+      outputLimitBytes,
       outputTruncated: false,
       lineCount: 0,
       outputHasPartialLine: false,
@@ -679,10 +719,7 @@ export class SessionSupervisor {
           redactionSecrets,
           sessionDirectory: join(this.storage.rootDirectory, 'sessions', id),
           timeoutSeconds,
-          maxOutputBytes: Math.min(
-            options.maxOutputBytes ?? this.maxOutputBytes,
-            this.maxOutputBytes
-          ),
+          maxOutputBytes: record.outputLimitBytes ?? outputLimitBytes,
           mode: 'exec',
         },
         async (authority) => {
@@ -1134,6 +1171,17 @@ export class SessionSupervisor {
     return this.router.owns(id, parentSessionId, projectDirectory, capabilityHash)
   }
 
+  quotaUsage(parentSessionId: string, projectDirectory: string, capabilityHash: string) {
+    return {
+      owner: this.registry.usageFor(parentSessionId, projectDirectory, capabilityHash),
+      global: this.registry.totalUsage(),
+    }
+  }
+
+  quotaLimits(): SessionLimits {
+    return this.registry.configuredLimits()
+  }
+
   async rawOutput(id: string): Promise<{
     raw: string
     byteLength: number
@@ -1467,6 +1515,26 @@ export class SessionSupervisor {
     return existing
   }
 
+  private execOutputLimit(requested: number | undefined): number {
+    if (requested === undefined) return this.maxOutputBytes
+    if (!Number.isSafeInteger(requested) || requested <= 0)
+      throw new Error('maxOutputBytes must be a positive integer.')
+    return Math.min(requested, this.maxOutputBytes)
+  }
+
+  private async pruneExpiredTerminals(): Promise<void> {
+    const cutoff = Date.now() - this.registry.configuredLimits().terminalRetentionSeconds * 1000
+    await Promise.all(
+      [...this.records.values()]
+        .filter((record) => {
+          if (record.pendingCleanup || !this.isTerminal(record)) return false
+          const timestamp = Date.parse(record.exitedAt ?? record.updatedAt)
+          return Number.isFinite(timestamp) && timestamp <= cutoff
+        })
+        .map((record) => this.cleanup(record.id))
+    )
+  }
+
   private validateWait(condition: WaitCondition, timeoutSeconds: number): void {
     if (
       !Number.isInteger(timeoutSeconds) ||
@@ -1574,6 +1642,7 @@ export class SessionSupervisor {
 
   private removeWait(id: string, wait: PendingWait): void {
     clearTimeout(wait.timer)
+    this.registry.releaseWait(wait.reservation)
     const pending = this.waits.get(id)
     if (!pending) return
     const remaining = pending.filter((candidate) => candidate !== wait)
