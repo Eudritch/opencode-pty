@@ -2,7 +2,7 @@
 description: Stage, verify, activate, or inspect the hot-swappable opencode-pty checkpoint.
 ---
 
-Use `shell_exec` with `bun run checkpoint $ARGUMENTS` from the repository root.
+Run `stage`, `activate`, and `status` with finite `shell_exec` calls to `bun run checkpoint $ARGUMENTS` from the repository root. Run `verify` with durable `pty_spawn` using `command: "bun"` and args `['run', 'checkpoint', 'verify', '<git-ref>']`; inspect it with `pty_read` or wait for exit with `pty_wait`. Do not hold a foreground shell while verification runs.
 
 Commands:
 
