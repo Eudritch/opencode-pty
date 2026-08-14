@@ -125,6 +125,34 @@ test('acquireStartLockRecovery throws instead of looping past its deadline', asy
   expect(Date.now() - started).toBeLessThan(4000)
 })
 
+test('acquireStartLockRecovery retries when a quarantined stale lock disappears', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-recovery-quarantine-race-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  await storage.initialize()
+  await writeFile(
+    join(root, 'daemon-start-recovery.lock'),
+    JSON.stringify({ token: 'dead', handoffToken: null, pid: 2147483647, processIdentity: 'dead' })
+  )
+  const internals = storage as unknown as {
+    acquireStartLockRecovery: () => Promise<boolean>
+    readStartLock: (path?: string) => Promise<unknown>
+  }
+  const readStartLock = internals.readStartLock
+  internals.readStartLock = async (path) => {
+    if (path && path !== join(root, 'daemon-start-recovery.lock')) {
+      await rm(path, { force: true })
+      return null
+    }
+    return readStartLock.call(storage, path)
+  }
+  try {
+    expect(await internals.acquireStartLockRecovery()).toBeTrue()
+  } finally {
+    internals.readStartLock = readStartLock
+  }
+})
+
 test('daemon main refuses a relative dataDirectory with a clear stderr message', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-main-validate-'))
   roots.push(root)
