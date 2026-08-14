@@ -25,6 +25,10 @@ const TOKEN_FINGERPRINT = /^[a-f0-9]{64}$/
 // Daemon-controlled fault/readiness injection knobs; they are stripped from session environments
 // and honored only from the daemon's own process environment.
 const NATIVE_WORKER_KNOB = /^OPENCODE_PTY_NATIVE_WORKER_/
+const SENSITIVE_ENVIRONMENT_KEY =
+  /(token|secret|password|credential|api[_-]?key|auth|cookie|(?:^|[_-])(?:ssh|tls)?[_-]?private[_-]?key(?:$|[_-])|(?:^|[_-])signing[_-]?key(?:$|[_-]))/i
+const MAX_REDACTION_SECRET_BYTES = 4096
+const WORKER_STDERR_TAIL_BYTES = 4096
 
 export interface WorkerDescriptor {
   pid: number
@@ -167,7 +171,11 @@ function verifiedPrestartNoChildReceipt(
 }
 
 function workerCommand(): string[] {
-  if (process.env.PTY_NATIVE_WORKER_PATH) return [process.env.PTY_NATIVE_WORKER_PATH]
+  if (process.env.PTY_NATIVE_WORKER_PATH) {
+    if (process.env.PTY_NATIVE_WORKER_DEV !== '1')
+      throw new Error('native_worker_unavailable: PTY_NATIVE_WORKER_PATH is development-only.')
+    return [process.env.PTY_NATIVE_WORKER_PATH]
+  }
   if (process.env.PTY_NATIVE_WORKER_DEV === '1') {
     return [
       'cargo',
@@ -204,7 +212,7 @@ function workerCommand(): string[] {
     }
   }
   throw new Error(
-    `native_worker_unavailable: install the matching optional worker package for ${process.platform}-${process.arch}, or set PTY_NATIVE_WORKER_PATH.`
+    `native_worker_unavailable: install the matching optional worker package for ${process.platform}-${process.arch}.`
   )
 }
 
@@ -217,8 +225,137 @@ export function workerLaunchOptions(command: string[]) {
     windowsHide: true,
     stdin: 'pipe' as const,
     stdout: 'pipe' as const,
-    stderr: 'inherit' as const,
+    stderr: 'pipe' as const,
   }
+}
+
+function redact(text: string, secrets: string[]): string {
+  for (const secret of secrets) {
+    if (secret.length >= 4) text = text.split(secret).join('[REDACTED]')
+  }
+  return text
+}
+
+function redactTail(tail: string, secrets: string[]): string {
+  for (const secret of secrets) {
+    if (tail.length >= 4 && tail.length < secret.length && secret.startsWith(tail))
+      return '[REDACTED]'
+  }
+  return redact(tail, secrets)
+}
+
+function redactStream(
+  data: string,
+  tail: { value: string },
+  secrets: string[],
+  finish: boolean
+): string {
+  const combined = tail.value + data
+  const characters = Array.from(combined)
+  let split = finish
+    ? characters.length
+    : Math.max(0, characters.length - Math.max(0, ...secrets.map((secret) => secret.length - 1)))
+  const initialSplit = split
+  if (finish) {
+    for (const secret of secrets.map((value) => Array.from(value))) {
+      for (let start = 0; start < characters.length; start += 1) {
+        const suffix = characters.length - start
+        const partial =
+          suffix >= 4 &&
+          suffix < secret.length &&
+          characters.slice(start).every((character, index) => character === secret[index])
+        const overlapsFullSecret =
+          characters.length >= secret.length &&
+          Array.from(
+            { length: characters.length - secret.length + 1 },
+            (_, fullStart) => fullStart
+          ).some(
+            (fullStart) =>
+              fullStart <= start &&
+              start < fullStart + secret.length &&
+              characters
+                .slice(fullStart, fullStart + secret.length)
+                .every((character, index) => character === secret[index])
+          )
+        if (partial && !overlapsFullSecret) split = Math.min(split, start)
+      }
+    }
+  } else {
+    for (const secret of secrets.map((value) => Array.from(value))) {
+      for (let start = 0; start < initialSplit; start += 1) {
+        const prefix = Math.min(characters.length - start, secret.length)
+        if (
+          start + secret.length > split &&
+          characters
+            .slice(start, start + prefix)
+            .every((character, index) => character === secret[index])
+        )
+          split = start
+      }
+    }
+  }
+  const safe = characters.slice(0, split).join('')
+  tail.value = characters.slice(split).join('')
+  const redacted = redact(safe, secrets)
+  return finish ? redacted + redactTail(tail.value, secrets) : redacted
+}
+
+function retainWorkerStderrTail(tail: string, chunk: string): string {
+  const output = Buffer.from(tail + chunk, 'utf8')
+  return output.byteLength <= WORKER_STDERR_TAIL_BYTES
+    ? output.toString('utf8')
+    : output.subarray(-WORKER_STDERR_TAIL_BYTES).toString('utf8')
+}
+
+async function captureWorkerStderr(
+  stream: ReadableStream<Uint8Array>,
+  secrets: string[],
+  onTail: (tail: string) => void
+): Promise<void> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  const redactionTail = { value: '' }
+  let tail = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      tail = retainWorkerStderrTail(
+        tail,
+        redactStream(decoder.decode(value, { stream: true }), redactionTail, secrets, false)
+      )
+      onTail(tail)
+    }
+    tail = retainWorkerStderrTail(
+      tail,
+      redactStream(decoder.decode(), redactionTail, secrets, true)
+    )
+    onTail(tail)
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function validateBootstrapSecrets(
+  bootstrap: Omit<WorkerBootstrap, 'workerControlToken' | 'workerId'>
+): void {
+  for (const [key, value] of Object.entries(bootstrap.env)) {
+    if (
+      SENSITIVE_ENVIRONMENT_KEY.test(key) &&
+      Buffer.byteLength(value, 'utf8') > MAX_REDACTION_SECRET_BYTES
+    )
+      throw new Error(
+        `Sensitive environment value for '${key}' exceeds ${MAX_REDACTION_SECRET_BYTES} UTF-8 bytes.`
+      )
+  }
+  if (
+    bootstrap.redactionSecrets.some(
+      (value) => Buffer.byteLength(value, 'utf8') > MAX_REDACTION_SECRET_BYTES
+    )
+  )
+    throw new Error(
+      `Sensitive environment value exceeds ${MAX_REDACTION_SECRET_BYTES} UTF-8 bytes.`
+    )
 }
 
 function linuxWorkerPackage(target: 'linux-x64-gnu' | 'linux-arm64-gnu'): string {
@@ -226,12 +363,10 @@ function linuxWorkerPackage(target: 'linux-x64-gnu' | 'linux-arm64-gnu'): string
   const output = `${Buffer.from(probe.stdout)}${Buffer.from(probe.stderr)}`.toLowerCase()
   if (output.includes('musl'))
     throw new Error(
-      `native_worker_unavailable: ${target} worker requires glibc; Alpine/musl is unsupported. Set PTY_NATIVE_WORKER_PATH to a compatible worker.`
+      `native_worker_unavailable: ${target} worker requires glibc; Alpine/musl is unsupported.`
     )
   if (!output.includes('glibc') && !output.includes('gnu libc'))
-    throw new Error(
-      'native_worker_unavailable: could not verify a glibc Linux runtime. Set PTY_NATIVE_WORKER_PATH to a compatible worker.'
-    )
+    throw new Error('native_worker_unavailable: could not verify a glibc Linux runtime.')
   return nativeWorkerPackageName(target)
 }
 
@@ -332,6 +467,7 @@ export class WorkerClient {
     bootstrap: Omit<WorkerBootstrap, 'workerControlToken' | 'workerId'>,
     persistPrestart?: (authority: WorkerPrestartAuthority) => Promise<void>
   ): Promise<PreparedWorker> {
+    validateBootstrapSecrets(bootstrap)
     const workerControlToken =
       crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '')
     const workerId = crypto.randomUUID()
@@ -341,6 +477,8 @@ export class WorkerClient {
     let payload: Buffer
     let command: string[]
     let child: ReturnType<typeof Bun.spawn>
+    let workerStderr = ''
+    let workerStderrDone: Promise<void> | undefined
     try {
       payload = Buffer.from(
         JSON.stringify({
@@ -371,6 +509,15 @@ export class WorkerClient {
       child = Bun.spawn({
         ...workerLaunchOptions(command),
       })
+      if (!(child.stderr instanceof ReadableStream))
+        throw new Error('native_worker_unavailable: worker stderr could not be captured.')
+      workerStderrDone = captureWorkerStderr(
+        child.stderr,
+        [...bootstrap.redactionSecrets, workerControlToken],
+        (tail) => {
+          workerStderr = tail
+        }
+      ).catch(() => undefined)
     } catch (error) {
       if (error instanceof WorkerStartError) throw error
       throw new WorkerStartError(
@@ -566,8 +713,12 @@ export class WorkerClient {
     } catch (error) {
       if (error instanceof WorkerStartError) throw error
       const outcome = await cleanup()
+      if (outcome.terminationConfirmed) await workerStderrDone
+      const diagnostic = workerStderr.trim()
       throw new WorkerStartError(
-        `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(outcome)}`,
+        `${error instanceof Error ? error.message : String(error)}; cleanup=${JSON.stringify(outcome)}${
+          diagnostic ? `; worker_stderr=${diagnostic}` : ''
+        }`,
         outcome,
         prestartReference
       )

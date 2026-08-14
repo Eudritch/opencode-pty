@@ -67,6 +67,7 @@ use windows_sys::Win32::{
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REDACTION_SECRET_BYTES: usize = 4096;
 const PROTOCOL_VERSION: u32 = 5;
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(windows)]
@@ -1370,6 +1371,33 @@ fn control(input: &mut impl Read, token: &str) -> Result<Control, String> {
     Ok(control)
 }
 
+fn sensitive_environment_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("credential")
+        || key.contains("api_key")
+        || key.contains("api-key")
+        || key.contains("auth")
+        || key.contains("cookie")
+        || key.contains("private_key")
+        || key.contains("private-key")
+        || key.contains("signing_key")
+        || key.contains("signing-key")
+}
+
+fn sensitive_values_within_limit(
+    environment: &BTreeMap<String, String>,
+    redaction_secrets: &[String],
+) -> bool {
+    environment.iter().all(|(key, value)| {
+        !sensitive_environment_key(key) || value.len() <= MAX_REDACTION_SECRET_BYTES
+    }) && redaction_secrets
+        .iter()
+        .all(|value| value.len() <= MAX_REDACTION_SECRET_BYTES)
+}
+
 fn redact(mut data: String, secrets: &[String]) -> String {
     for secret in secrets {
         if secret.len() >= 4 {
@@ -1407,17 +1435,44 @@ fn redact_stream(data: String, tail: &mut String, secrets: &[String], finish: bo
     let characters: Vec<_> = combined.char_indices().collect();
     let mut split = characters.len().saturating_sub(hold);
     let initial_split = split;
-    for secret in secrets {
-        let secret: Vec<_> = secret.chars().collect();
-        for start in 0..initial_split {
-            let prefix = (characters.len() - start).min(secret.len());
-            if start + secret.len() > split
-                && characters[start..start + prefix]
-                    .iter()
-                    .map(|(_, character)| *character)
-                    .eq(secret[..prefix].iter().copied())
-            {
-                split = start;
+    if finish {
+        for secret in secrets {
+            let secret: Vec<_> = secret.chars().collect();
+            for start in 0..characters.len() {
+                let suffix = characters.len() - start;
+                let partial = suffix >= 4
+                    && suffix < secret.len()
+                    && characters[start..]
+                        .iter()
+                        .map(|(_, character)| *character)
+                        .eq(secret[..suffix].iter().copied());
+                let overlaps_full_secret = characters.len() >= secret.len()
+                    && (0..=characters.len() - secret.len()).any(|full_start| {
+                        full_start <= start
+                            && start < full_start + secret.len()
+                            && characters[full_start..full_start + secret.len()]
+                                .iter()
+                                .map(|(_, character)| *character)
+                                .eq(secret.iter().copied())
+                    });
+                if partial && !overlaps_full_secret {
+                    split = split.min(start);
+                }
+            }
+        }
+    } else {
+        for secret in secrets {
+            let secret: Vec<_> = secret.chars().collect();
+            for start in 0..initial_split {
+                let prefix = (characters.len() - start).min(secret.len());
+                if start + secret.len() > split
+                    && characters[start..start + prefix]
+                        .iter()
+                        .map(|(_, character)| *character)
+                        .eq(secret[..prefix].iter().copied())
+                {
+                    split = start;
+                }
             }
         }
     }
@@ -3022,6 +3077,46 @@ fn snapshot(worker: &Arc<Worker>, include_exec_output: bool) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sensitive_environment_values_use_utf8_byte_limits() {
+        let mut environment = BTreeMap::from([("API_TOKEN".into(), "x".repeat(4096))]);
+        assert!(sensitive_values_within_limit(&environment, &[]));
+        environment.insert("API_TOKEN".into(), "x".repeat(4097));
+        assert!(!sensitive_values_within_limit(&environment, &[]));
+        environment.insert("API_TOKEN".into(), "😀".repeat(1024));
+        assert!(sensitive_values_within_limit(&environment, &[]));
+        environment.insert("API_TOKEN".into(), "😀".repeat(1025));
+        assert!(!sensitive_values_within_limit(&environment, &[]));
+        assert!(!sensitive_values_within_limit(
+            &BTreeMap::new(),
+            &["x".repeat(4097)]
+        ));
+    }
+
+    #[test]
+    fn redaction_keeps_a_complete_multibyte_secret_at_end_of_stream() {
+        let secret = "😀".repeat(1024);
+        let mut tail = String::new();
+        assert_eq!(
+            redact_stream(
+                secret.clone(),
+                &mut tail,
+                std::slice::from_ref(&secret),
+                false
+            ),
+            ""
+        );
+        assert_eq!(
+            redact_stream(
+                String::new(),
+                &mut tail,
+                std::slice::from_ref(&secret),
+                true
+            ),
+            "[REDACTED]"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_child_creation_hides_exec_without_overriding_conpty() {
@@ -4051,6 +4146,11 @@ fn main() -> Result<(), String> {
     }
     if bootstrap.worker_control_token.len() < 16 {
         return Err("invalid worker token".into());
+    }
+    if !sensitive_values_within_limit(&bootstrap.env, &bootstrap.redaction_secrets) {
+        return Err(format!(
+            "sensitive environment value exceeds {MAX_REDACTION_SECRET_BYTES} UTF-8 bytes"
+        ));
     }
     let session_directory = PathBuf::from(&bootstrap.session_directory);
     let output_directory = session_directory.join("output");

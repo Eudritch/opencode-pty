@@ -85,6 +85,7 @@ const nativeWorkerPath =
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
 if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_PATH ??= nativeWorkerPath
+if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_DEV ??= '1'
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -2372,6 +2373,49 @@ test('streaming redaction keeps split secrets out of PTY journals and exec strea
   expect((await supervisor.execOutput(exec.session.id))?.stdout).not.toContain('split-secret-value')
 })
 
+test('sensitive environment values are limited before session admission', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-sensitive-limit-'))
+  roots.push(root)
+  const storage = new DaemonStorage(root)
+  const supervisor = new SessionSupervisor(storage)
+  await supervisor.initialize()
+  await expect(
+    supervisor.nativeExec({
+      command: process.execPath,
+      args: ['-e', ''],
+      env: { API_TOKEN: 'x'.repeat(4097) },
+      parentSessionId: 'parent',
+      ...directOwner(root),
+      workdir: root,
+      timeoutSeconds: 2,
+    })
+  ).rejects.toThrow('Sensitive environment value')
+  expect(await storage.loadSessions()).toEqual([])
+})
+
+test('an exact 4096-byte sensitive value remains redacted', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-sensitive-boundary-'))
+  roots.push(root)
+  const supervisor = new SessionSupervisor(new DaemonStorage(root))
+  await supervisor.initialize()
+  const secret = '😀'.repeat(1024)
+  try {
+    const exec = await supervisor.nativeExec({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write(process.env.API_TOKEN)'],
+      env: { API_TOKEN: secret },
+      parentSessionId: 'parent',
+      ...directOwner(root),
+      workdir: root,
+      timeoutSeconds: 2,
+    })
+    expect(exec.stdout).toBe('[REDACTED]')
+    expect(exec.stdout).not.toContain(secret)
+  } finally {
+    await supervisor.shutdown()
+  }
+})
+
 test('Windows process identities require the queried PID and a creation time', () => {
   expect(parseWindowsProcessIdentity(42, 'windows:42:133713371337')).toBe('windows:42:133713371337')
   expect(parseWindowsProcessIdentity(42, 'windows:43:133713371337')).toBeNull()
@@ -4609,6 +4653,51 @@ test('pre-worker payload and worker-resolution failures report confirmed no-work
   }
 })
 
+test('worker executable overrides require explicit development mode', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-override-'))
+  roots.push(root)
+  const error = await withProcessEnv(
+    { PTY_NATIVE_WORKER_PATH: nativeWorkerPath, PTY_NATIVE_WORKER_DEV: '' },
+    () =>
+      NativeWorkerClient.prepare({
+        command: process.execPath,
+        args: ['-e', ''],
+        workdir: root,
+        env: runtimeEnvironment(undefined, false),
+        redactionSecrets: [],
+        sessionDirectory: join(root, 'session'),
+        timeoutSeconds: 2,
+        maxOutputBytes: 1024,
+        mode: 'exec',
+      }).catch((error) => error)
+  )
+  expect(error).toBeInstanceOf(WorkerStartError)
+  expect(error).toHaveProperty('message', expect.stringContaining('development-only'))
+  expect(await Bun.file(join(root, 'session', 'worker.json')).exists()).toBeFalse()
+})
+
+test('worker startup diagnostics are bounded and redact environment secrets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-pty-worker-stderr-'))
+  roots.push(root)
+  const secret = 'worker-stderr-secret'
+  const error = await withProcessEnv({ OPENCODE_PTY_NATIVE_WORKER_FAULT: 'descriptor_write' }, () =>
+    NativeWorkerClient.prepare({
+      command: process.execPath,
+      args: ['-e', ''],
+      workdir: root,
+      env: { ...runtimeEnvironment(undefined, false), API_TOKEN: secret },
+      redactionSecrets: [secret],
+      sessionDirectory: join(root, 'session'),
+      timeoutSeconds: 2,
+      maxOutputBytes: 1024,
+      mode: 'exec',
+    }).catch((error) => error)
+  )
+  expect(error).toBeInstanceOf(WorkerStartError)
+  expect(String(error)).toContain('worker_stderr=')
+  expect(String(error)).not.toContain(secret)
+})
+
 test('ready-timeout failures retain a verified reference for no-child recovery', async () => {
   const root = await mkdtemp(join(tmpdir(), 'opencode-pty-prestart-ready-timeout-'))
   roots.push(root)
@@ -5801,14 +5890,14 @@ test('daemon launcher detaches without a Windows console window', () => {
   })
 })
 
-test('Windows worker launcher isolates native workers without a console window', () => {
+test('worker launcher isolates native workers without a console window or inherited stderr', () => {
   expect(workerLaunchOptions(['worker.exe'])).toMatchObject({
     cmd: ['worker.exe'],
     detached: true,
     windowsHide: true,
     stdin: 'pipe',
     stdout: 'pipe',
-    stderr: 'inherit',
+    stderr: 'pipe',
   })
 })
 

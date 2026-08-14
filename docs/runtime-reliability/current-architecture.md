@@ -25,7 +25,7 @@ The three layers are justified by distinct trust and failure boundaries. Phase 2
 | Session router | Live worker references, owner-route checks, snapshot-version fences, persistence queue, and mutation lane | `src/daemon/session-router.ts` | No metadata quota logic. Its ordered queues retain the controller-lane and persistence-deadlock invariants. |
 | Journal reader | Output loading, line paging, literal search, and raw output | `src/daemon/journal-reader.ts` | Read-only output boundary; it cannot mutate session state or contact workers. |
 | Storage | Private directory, DACL/POSIX permissions, daemon descriptor/locks, V0/V1/V2 metadata decoding, inert unsupported-record handling, journal read/migration | `src/daemon/storage.ts` | V2 is the only writer; this remains the essential persistence boundary and also owns platform process-identity probing. |
-| Native worker | Prepared authenticated bootstrap, start-frame-gated spawn, terminal/pipe I/O, redaction, journal writing, timeout/stop, platform containment | `worker/src/main.rs`, `src/daemon/worker-client.ts` | The durable pre-activation reference checkpoint closes one lost-worker window; the mixed-platform engine remains hard to audit. |
+| Native worker | Prepared authenticated bootstrap, start-frame-gated spawn, terminal/pipe I/O, redaction, journal writing, timeout/stop, platform containment | `worker/src/main.rs`, `src/daemon/worker-client.ts` | Sensitive bootstrap values are capped at 4,096 UTF-8 bytes and worker stderr is bounded/redacted; the mixed-platform engine and synchronous native input path remain hard to audit. |
 | Native child | Actual command, shell, TTY behavior | OS | Must remain the sole process being described by PID and exit result. |
 
 ## Execution Modes

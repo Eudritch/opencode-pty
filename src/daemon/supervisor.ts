@@ -63,6 +63,7 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
 ])
 const SENSITIVE_ENVIRONMENT_KEY =
   /(token|secret|password|credential|api[_-]?key|auth|cookie|(?:^|[_-])(?:ssh|tls)?[_-]?private[_-]?key(?:$|[_-])|(?:^|[_-])signing[_-]?key(?:$|[_-]))/i
+export const MAX_REDACTION_SECRET_BYTES = 4096
 
 export interface ExecOptions extends SpawnOptions {
   maxOutputBytes?: number
@@ -155,6 +156,15 @@ export function runtimeEnvironment(
   ) as Record<string, string>
   // ponytail: command lookup gets only the daemon's PATH; callers cannot redirect an allowed bare command.
   if (trustedPath !== undefined) environment.PATH = trustedPath
+  for (const [key, value] of Object.entries(environment)) {
+    if (
+      SENSITIVE_ENVIRONMENT_KEY.test(key) &&
+      Buffer.byteLength(value, 'utf8') > MAX_REDACTION_SECRET_BYTES
+    )
+      throw new Error(
+        `Sensitive environment value for '${key}' exceeds ${MAX_REDACTION_SECRET_BYTES} UTF-8 bytes.`
+      )
+  }
   return environment
 }
 
@@ -705,9 +715,7 @@ export class SessionSupervisor {
       this.registry.releaseReservation(reservation)
       throw error
     }
-    const redactionSecrets = Object.entries(environment)
-      .filter(([key, value]) => SENSITIVE_ENVIRONMENT_KEY.test(key) && value.length >= 4)
-      .map(([, value]) => value)
+    const redactionSecrets = this.redactionSecrets(environment)
     let prepared: Awaited<ReturnType<typeof NativeWorkerClient.prepare>> | undefined
     try {
       prepared = await NativeWorkerClient.prepare(

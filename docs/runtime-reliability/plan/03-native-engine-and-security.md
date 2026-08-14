@@ -1,6 +1,6 @@
 # Phase 3: Narrow the Native Engine and Complete Operational Policy
 
-**Status:** Pending Phase 2
+**Status:** In progress
 
 ## Changes
 
@@ -24,6 +24,10 @@
 - Remove platform conditionals from shared lifecycle/persistence logic.
 - Remove duplicated journal/metadata retry classifications.
 - Remove raw worker stderr as an implicit observability channel.
+
+## Current Slice
+
+The bootstrap boundary now rejects sensitive environment values over 4,096 UTF-8 bytes before admission and again in the worker. Worker stderr is continuously drained into a bounded redacted tail rather than inherited by the host, and `PTY_NATIVE_WORKER_PATH` now requires explicit development mode. The worker redaction regression for a complete multibyte secret at EOF is covered. Journal retry, native input backpressure, `SessionChild`, and Windows batch-policy binding remain open.
 
 ## Invariants Afterward
 

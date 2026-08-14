@@ -32,6 +32,7 @@ const nativeWorkerPath =
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
 if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_PATH ??= nativeWorkerPath
+if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_DEV ??= '1'
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))

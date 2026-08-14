@@ -14,6 +14,7 @@ const nativeWorkerPath =
     'debug',
     `opencode-pty-worker${process.platform === 'win32' ? '.exe' : ''}`
   )
+if (existsSync(nativeWorkerPath)) process.env.PTY_NATIVE_WORKER_DEV ??= '1'
 
 type Descriptor = { endpoint: string; token: string }
 type Daemon = { child: ReturnType<typeof Bun.spawn>; descriptor: Descriptor }

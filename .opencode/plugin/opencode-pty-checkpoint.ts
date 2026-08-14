@@ -86,6 +86,8 @@ export const OpencodePtyCheckpoint = async (context: unknown, options: unknown =
     const entry = resolve(root, checkpoint.entry)
     const workerPath = resolve(root, checkpoint.workerPath)
     process.env.PTY_DAEMON_DIR = runtimeRoot
+    process.env.PTY_NATIVE_WORKER_DEV = '1'
+    process.env.PTY_NATIVE_WORKER_PATH = workerPath
     const module = await import(`${pathToFileURL(entry).href}?checkpoint=${checkpoint.revision}`)
     const factory = module.PTYPlugin ?? module.server ?? module.default
     if (typeof factory !== 'function')
@@ -96,7 +98,6 @@ export const OpencodePtyCheckpoint = async (context: unknown, options: unknown =
       throw new Error(
         'Checkpoint changes the static plugin contract; restart OpenCode to apply it.'
       )
-    process.env.PTY_NATIVE_WORKER_PATH = workerPath
     active = next
     activeContract = nextContract
     activeRevision = checkpoint.revision

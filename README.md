@@ -75,8 +75,8 @@ The TUI companion is pinned to the OpenCode plugin SDK 1.3.13 and OpenTUI 0.1.95
 | --- | --- | --- |
 | `PTY_DAEMON_DIR` | per-user state directory | Daemon descriptor, ownership secret, session metadata, and output; protected with the same restrictive DACL on Windows. |
 | `PTY_MAX_OUTPUT_BYTES` | `1000000` | Maximum retained output bytes per session. |
-| `PTY_NATIVE_WORKER_PATH` | unset | Explicit worker executable override. The default resolves the matching installed optional package. |
-| `PTY_NATIVE_WORKER_DEV` | unset | Set only in development to run `cargo run --manifest-path worker/Cargo.toml`; never a production fallback. |
+| `PTY_NATIVE_WORKER_PATH` | unset | Development-only explicit worker executable override; requires `PTY_NATIVE_WORKER_DEV=1`. |
+| `PTY_NATIVE_WORKER_DEV` | unset | Set to `1` only in development to permit the worker-path override or run `cargo run --manifest-path worker/Cargo.toml`; never a production fallback. |
 
 Output is an append-only, session-local UTF-8 chunk journal. Callbacks are coalesced into bounded 64 KiB UTF-8 segments and retained output is capped at the configured value (up to 64 MiB), so fragmented output cannot create unbounded files. Each chunk records its byte sequence range and timestamp. Retention removes whole oldest chunks, so `pty_read` reports `retained_from` and `truncated`; line offsets remain compatible, and durable byte sequences are available in output and RPC responses.
 
@@ -84,7 +84,7 @@ The daemon `diagnostics` RPC reports the native PTY/exec containment capability 
 
 ## Native Worker Packages
 
-Native workers are packaged as matching optional npm dependencies for `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64`, `win32-arm64`, `darwin-arm64`, and `darwin-x64`. The Windows worker requires Windows 10 version 1809 or later for ConPTY. Linux workers require glibc; Alpine/musl is rejected before execution unless `PTY_NATIVE_WORKER_PATH` supplies a compatible worker. `npm` installs only the package matching its `os` and `cpu`; the main `opencode-pty` tarball contains no worker binary. If the matching optional package was omitted or the platform is unsupported, native PTY and exec fail closed.
+Native workers are packaged as matching optional npm dependencies for `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64`, `win32-arm64`, `darwin-arm64`, and `darwin-x64`. The Windows worker requires Windows 10 version 1809 or later for ConPTY. Linux workers require glibc; Alpine/musl is rejected before execution. `npm` installs only the package matching its `os` and `cpu`; the main `opencode-pty` tarball contains no worker binary. If the matching optional package was omitted or the platform is unsupported, native PTY and exec fail closed.
 
 Release assembly accepts exactly those six worker archives. It validates archive name, package version, `os`/`cpu`, worker binary, SHA-256 checksum, release SHA, and GitHub workflow provenance before signing and before each publish/resume step. The manifest and its Cosign signature are verified with one protected public key source (`NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY` or `NATIVE_ARTIFACT_SIGNING_PUBLIC_KEY_FILE`); no public key is committed because no valid release key is present in this repository.
 
