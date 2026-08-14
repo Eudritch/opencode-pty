@@ -144,8 +144,12 @@ crashTest(
       expect(recovered?.status).toBe('running')
       expect((await readFile(marker, 'utf8')).trim().split('\n')).toEqual(['start'])
     } finally {
-      if (daemon && owner && id)
+      if (daemon && owner && id) {
         await rpc(daemon.descriptor, owner, 'stop', { id }).catch(() => undefined)
+        await rpc(daemon.descriptor, owner, 'execWait', { id, timeoutSeconds: 5 }).catch(
+          () => undefined
+        )
+      }
       if (daemon) await stopProcess(daemon.child).catch(() => undefined)
       await removeTemporary(root)
     }
